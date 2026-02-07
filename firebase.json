@@ -1,0 +1,37 @@
+{
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "walkmoney-1cdad",
+          "appId": "1:996207167634:android:89a14406d4f2403bb47e4b",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "walkmoney-1cdad",
+          "configurations": {
+            "android": "1:996207167634:android:89a14406d4f2403bb47e4b",
+            "ios": "1:996207167634:ios:e9c5984137099d53b47e4b",
+            "web": "1:996207167634:web:a34a2bab2c7ea97eb47e4b"
+          }
+        }
+      }
+    }
+  },
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "default",
+      "disallowLegacyRuntimeConfig": true,
+      "ignore": [
+        "node_modules",
+        ".git",
+        "firebase-debug.log",
+        "firebase-debug.*.log",
+        "*.local"
+      ]
+    }
+  ]
+}

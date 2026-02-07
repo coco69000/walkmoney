@@ -1,0 +1,47 @@
+{
+  "version": 8,
+  "name": "Protomaps API Style",
+  "sources": {
+    "protomaps-api-tiles": {
+      "type": "vector",
+      "tiles": [
+        "https://api.protomaps.com/tiles/v3/{z}/{x}/{y}.mvt?key=8d60f121865c66c8"
+      ],
+      "maxzoom": 14,
+      "attribution": "© <a href=\"https://openstreetmap.org/copyright\">OpenStreetMap</a> contributors, © <a href=\"https://protomaps.com\">Protomaps</a>"
+    }
+  },
+  "layers": [
+    {
+      "id": "background",
+      "type": "background",
+      "paint": {
+        "background-color": "#f8f4f0"
+      }
+    },
+    {
+      "id": "water",
+      "type": "fill",
+      "source": "protomaps-api-tiles",
+      "source-layer": "water",
+      "paint": {
+        "fill-color": "#abdbe3"
+      }
+    },
+    {
+      "id": "roads_major",
+      "type": "line",
+      "source": "protomaps-api-tiles",
+      "source-layer": "roads",
+      "filter": ["in", "pmap:kind", "major_road", "highway"],
+      "layout": { "line-join": "round", "line-cap": "round" },
+      "paint": {
+        "line-color": "#d08c60",
+        "line-width": {
+          "base": 1.2,
+          "stops": [[12, 0.75], [14, 2], [16, 6]]
+        }
+      }
+    }
+  ]
+}

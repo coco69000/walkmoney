@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "996207167634",
+    "project_id": "walkmoney-1cdad",
+    "storage_bucket": "walkmoney-1cdad.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:996207167634:android:89a14406d4f2403bb47e4b",
+        "android_client_info": {
+          "package_name": "com.parrel.walkmoney"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAynZJAIe4GT22kx3m639s1YLSpsuPVUGg"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
