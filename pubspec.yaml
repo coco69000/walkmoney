@@ -1,72 +1,79 @@
 name: walkmoney
 description: "A new Flutter project."
-publish_to: 'none' # Evite de publier accidentellement sur pub.dev
+publish_to: 'none'
 
-version: 1.0.0+1 # Version de l'application
+version: 1.0.0+1
 
 environment:
-  sdk: ">=3.0.0 <4.0.0" # Plage de compatibilité du SDK Flutter (assurez-vous d'avoir Flutter 3.x.x installé via `flutter upgrade`)
+  sdk: ">=3.0.0 <4.0.0"
 
 dependencies:
   flutter:
     sdk: flutter
 
-  # Icônes Cupertino pour iOS
+  # Icônes
   cupertino_icons: ^1.0.2
-
-  # Packages liés à Google Maps
-  google_maps_flutter: ^2.5.0          # Mis à jour : Version récente pour Google Maps SDK
-  google_places_for_flutter: ^1.0.1   # Mis à jour : Version légèrement plus récente que 1.0.0, mais qui devrait rester compatible avec http ^0.13.3
-  google_directions_api: ^0.9.1       # Rétrogradé : Pour résoudre le conflit de dépendance avec `http` et `google_places_for_flutter`.
-  google_maps_utils: ^2.0.0           # Mis à jour : Utilitaires pour les maps
-
-  # Gestion de la localisation
-  geolocator: ^11.0.0                 # Mis à jour : Version récente pour la géolocalisation
-
-  # Autres utilitaires et intégrations
-  get: ^4.6.6                         # Mis à jour : La dernière version de la branche 4.x pour GetX
-  flutter_dotenv: ^5.1.0              # Mis à jour : Pour charger les variables d'environnement (.env)
-  dio: ^5.0.0                         # Mis à jour : Client HTTP puissant
-  flutter_html: ^3.0.0-beta.2         # Mis à jour : Crucial pour les problèmes de `TextTheme` avec Flutter 3+
-  firebase_core: ^2.15.0              # Ok : Version actuelle de Firebase Core
-  cloud_firestore: ^4.17.2
-  firebase_auth: ^4.19.4
-  firebase_storage: ^11.7.4
-
-  image_picker: ^1.1.1
-  google_mlkit_text_recognition: ^0.11.0
-  url_launcher: ^6.2.6
-  http: ^0.13.4
-  path_provider: ^2.1.3
-  intl: ^0.19.0 # Inclut date_symbol_data_local
-  latlong2: ^0.9.1 # Pour les anciens modèles de données qui l'utilisent encore
-  maplibre_gl: ^0.22.0
+  safe_device: ^1.3.8
+  # Packages Google & Maps
+  google_maps_utils: ^2.0.0
+  google_navigation_flutter: ^0.8.1
+  google_places_for_flutter: ^1.0.1
+  google_directions_api: ^0.10.0
+  maplibre_gl: ^0.25.0
+  # Géolocalisation
+  geolocator: ^13.0.0
   flutter_compass: ^0.8.1
-  open_route_service: ^1.0.0
+  latlong2: ^0.9.1
   maps_toolkit: ^3.0.0
-  google_fonts: ^4.0.4
-  provider: ^6.1.5+1
+  flutter_background_service: ^5.0.0
+  flutter_local_notifications: ^17.0.0
+  shared_preferences: ^2.2.0
+  # Firebase
+  firebase_core: ^3.0.0
+  cloud_firestore: ^5.0.0
+  firebase_auth: ^5.0.0
+  wakelock_plus: ^1.4.0
+  firebase_storage: ^12.0.0
+  cloud_functions: ^5.0.0
+
+  # Réseau et API
+  dio: ^5.0.0
+  http: ^1.1.0
+  url_launcher: ^6.2.6
   cached_network_image: ^3.3.1
+  open_route_service: ^1.0.0
+
+  # Interface et UX
+  get: ^4.6.6
+  provider: ^6.1.5+1
+  google_fonts: ^4.0.4
+  flutter_html: ^3.0.0-beta.2
+  intl: ^0.19.0
+  image_picker: ^1.1.1
+  flutter_osm_plugin: ^1.4.3
+
+  # Outils techniques
+  flutter_dotenv: ^5.1.0
+  path_provider: ^2.1.3
+  google_mlkit_text_recognition: ^0.11.0
   flutter_stripe: ^10.1.0
-
-    # Pour appeler le backend qui gère la facturation automatique
-  cloud_functions: ^4.6.0
-
+  permission_handler: ^12.0.1
+  baseflow_plugin_template: ^2.2.1
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
-  flutter_lints: ^3.0.0 # Mise à jour : Règles de linting pour Flutter 3+
+  flutter_lints: ^3.0.0
 
-# Configuration spécifique à Flutter
+# Cette section force tous les packages à utiliser la version 1.1.0 de http
+dependency_overrides:
+  http: ^1.1.0
+
 flutter:
   uses-material-design: true
 
-  # Assets (fichiers d'images, .env, etc.)
   assets:
     - .env
     - assets/images/map_icon.png
     - assets/images/locate_me.png
     - assets/images/car.png
-    - assets/map_styles/protomaps_api_style.json
-    - assets/images/ # Permet de charger toutes les images du dossier assets/images/

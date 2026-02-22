@@ -1,69 +1,76 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.parrel.walkmoney">
 
-    <!-- Permissions de localisation -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
-    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION"/>
 
-    <!-- Services et énergie -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
 
-    <!-- Permission réseau -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" /> <application
+    android:label="walkmoney"
+    android:name="${applicationName}"
+    android:icon="@mipmap/ic_launcher"
+    android:usesCleartextTraffic="true"
+    android:theme="@style/NormalTheme">
 
-    <application
-        android:name="${applicationName}"
-        android:label="walkmoney"
-        android:icon="@mipmap/ic_launcher"
-        android:usesCleartextTraffic="true"
-        android:theme="@style/NormalTheme">
+    <meta-data
+        android:name="com.google.android.geo.API_KEY"
+        android:value="AIzaSyD-3rBIdJZ_N3bCPWGtVjKtk_iWd701mxI" />
 
-        <!-- Clé API Google Maps -->
+    <activity
+        android:name=".MainActivity"
+        android:exported="true"
+        android:launchMode="singleTop"
+        android:theme="@style/LaunchTheme"
+        android:hardwareAccelerated="true"
+        android:windowSoftInputMode="adjustResize"
+        android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode">
+
         <meta-data
-            android:name="com.google.android.geo.API_KEY"
-            android:value="AIzaSyD-3rBIdJZ_N3bCPWGtVjKtk_iWd701mxI" />
+            android:name="io.flutter.embedding.android.NormalTheme"
+            android:resource="@style/NormalTheme" />
 
-        <activity
-            android:name=".MainActivity"
-            android:exported="true"
-            android:launchMode="singleTop"
-            android:theme="@style/LaunchTheme"
-            android:hardwareAccelerated="true"
-            android:windowSoftInputMode="adjustResize"
-            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode">
+        <intent-filter>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent-filter>
+    </activity>
 
-            <!-- Permet à Flutter de passer du splash screen au thème normal -->
-            <meta-data
-                android:name="io.flutter.embedding.android.NormalTheme"
-                android:resource="@style/NormalTheme" />
+    <meta-data
+        android:name="flutterEmbedding"
+        android:value="2" />
 
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
+    <service
+        android:name="com.custom.flutter_osm_plugin.LocationService"
+        android:foregroundServiceType="location"
+        android:exported="false" />
 
-        <!-- Configuration Flutter -->
-        <meta-data
-            android:name="flutterEmbedding"
-            android:value="2" />
+    <service
+        android:name="id.flutter.flutter_background_service.BackgroundService"
+        android:foregroundServiceType="location"
+        android:exported="true" />
 
-    </application>
+    <!-- Widget des trajets favoris -->
+    <receiver android:name=".FavoriteRoutesWidgetProvider"
+        android:exported="true">
+        <intent-filter>
+            <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+        </intent-filter>
+        <meta-data android:name="android.appwidget.provider"
+            android:resource="@xml/favorite_routes_widget_info" />
+    </receiver>
 
-    <!-- Requêtes pour actions externes -->
+</application>
+
     <queries>
         <intent>
-            <action android:name="android.intent.action.PROCESS_TEXT" />
-            <data android:mimeType="text/plain" />
-        </intent>
-
-        <intent>
             <action android:name="android.intent.action.VIEW" />
-            <category android:name="android.intent.category.BROWSABLE" />
             <data android:scheme="https" />
         </intent>
     </queries>
-
 </manifest>

@@ -13,7 +13,7 @@ import 'package:walkmoney/main.dart';
 void main() {
   testWidgets('Counter increments smoke test', (WidgetTester tester) async {
     // Build our app and trigger a frame.
-    await tester.pumpWidget( const PedestrianGPSApp());
+    await tester.pumpWidget(  EcoNavApp());
 
     // Verify that our counter starts at 0.
     expect(find.text('0'), findsOneWidget);
