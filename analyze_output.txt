@@ -1,0 +1,512 @@
+﻿Analyzing walkmoney...                                          
+
+warning - The library 'package:google_maps_utils/google_maps_utils.dart' doesn't export a member with the shown name 'Point' - lib\main.dart:15:79 - undefined_shown_name
+   info - The imported package 'crypto' isn't a dependency of the importing package - lib\main.dart:17:8 - depend_on_referenced_packages
+   info - The imported package 'path' isn't a dependency of the importing package - lib\main.dart:36:8 - depend_on_referenced_packages
+warning - The value of the field '_currentExpectedTravelMode' isn't used - lib\main.dart:253:14 - unused_field
+   info - Statements in an if should be enclosed in a block - lib\main.dart:520:7 - curly_braces_in_flow_control_structures
+   info - Statements in an if should be enclosed in a block - lib\main.dart:522:7 - curly_braces_in_flow_control_structures
+   info - Statements in an if should be enclosed in a block - lib\main.dart:524:7 - curly_braces_in_flow_control_structures
+   info - Don't invoke 'print' in production code - lib\main.dart:609:7 - avoid_print
+warning - The value of the local variable 'transitStepCount' isn't used - lib\main.dart:632:11 - unused_local_variable
+   info - Don't invoke 'print' in production code - lib\main.dart:812:7 - avoid_print
+   info - The variable name 'd_rad' isn't a lowerCamelCase identifier - lib\main.dart:825:12 - non_constant_identifier_names
+   info - The variable name 'lat_rad' isn't a lowerCamelCase identifier - lib\main.dart:829:14 - non_constant_identifier_names
+   info - The variable name 'lng_rad' isn't a lowerCamelCase identifier - lib\main.dart:831:14 - non_constant_identifier_names
+   info - Empty catch block - lib\main.dart:1142:17 - empty_catches
+warning - Dead code - lib\main.dart:1234:26 - dead_code
+warning - The declaration '<unnamed>' isn't referenced - lib\main.dart:1255:7 - unused_element
+warning - The value of the field '_maxBurstDuration' isn't used - lib\main.dart:1293:25 - unused_field
+warning - The value of the field '_lastOnRouteTime' isn't used - lib\main.dart:1301:13 - unused_field
+warning - The value of the field '_currentStepIndex' isn't used - lib\main.dart:1312:7 - unused_field
+   info - Don't invoke 'print' in production code - lib\main.dart:1517:5 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:1637:13 - avoid_print
+warning - The value of the local variable 'maxSpeedWalk' isn't used - lib\main.dart:1728:12 - unused_local_variable
+   info - The 'if' statement could be replaced by a null-aware assignment - lib\main.dart:1739:9 - prefer_conditional_assignment
+   info - The 'if' statement could be replaced by a null-aware assignment - lib\main.dart:1775:9 - prefer_conditional_assignment
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:1898:16 - prefer_const_constructors
+   info - Use 'const' literals as arguments to constructors of '@immutable' classes - lib\main.dart:1898:30 - prefer_const_literals_to_create_immutables
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:1901:11 - prefer_const_constructors
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:1901:27 - prefer_const_constructors
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:1913:38 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:1935:39 - deprecated_member_use
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:2027:31 - prefer_const_constructors
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:2027:72 - prefer_const_constructors
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:2027:128 - prefer_const_constructors
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:2217:16 - prefer_const_constructors
+  error - 'stopNavigation' must have a method body because 'NavigationController' isn't abstract - lib\main.dart:2369:5 - concrete_class_with_abstract_member
+  error - Expected a class member - lib\main.dart:2372:5 - expected_class_member
+  error - Expected an identifier - lib\main.dart:2372:8 - missing_identifier
+  error - Expected to find ')' - lib\main.dart:2372:25 - expected_token
+  error - Undefined name 'duration' - lib\main.dart:2373:36 - undefined_identifier
+  error - Undefined name 'avgSpeed' - lib\main.dart:2373:46 - undefined_identifier
+  error - Expected a class member - lib\main.dart:2374:7 - expected_class_member
+  error - Expected an identifier - lib\main.dart:2374:12 - missing_identifier
+  error - Methods must have an explicit list of parameters - lib\main.dart:2374:12 - missing_method_parameters
+  error - Undefined name 'duration' - lib\main.dart:2375:30 - undefined_identifier
+  error - Undefined name 'avgSpeed' - lib\main.dart:2375:40 - undefined_identifier
+  error - Undefined name 'isChallengeTrip' - lib\main.dart:2375:63 - undefined_identifier
+  error - Undefined name 'activeChallenge' - lib\main.dart:2381:9 - undefined_identifier
+  error - Undefined name 'activeChallenge' - lib\main.dart:2383:27 - undefined_identifier
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:2393:45 - prefer_const_constructors
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:2406:20 - prefer_const_constructors
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:2428:42 - deprecated_member_use
+  error - Undefined name 'activeChallenge' - lib\main.dart:2473:9 - undefined_identifier
+  error - Undefined name 'activeChallenge' - lib\main.dart:2475:33 - undefined_identifier
+warning - The value of the local variable 'stayMinutes' isn't used - lib\main.dart:2476:11 - unused_local_variable
+  error - Undefined name 'activeChallenge' - lib\main.dart:2482:23 - undefined_identifier
+  error - Undefined name 'homeController' - lib\main.dart:2486:7 - undefined_identifier
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:2520:46 - prefer_const_constructors
+  error - Undefined name 'mounted' - lib\main.dart:2521:26 - undefined_identifier
+  error - Undefined name '_onChallengeReached' - lib\main.dart:2528:23 - undefined_identifier
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:2580:67 - deprecated_member_use
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:2599:23 - prefer_const_constructors
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:2601:32 - prefer_const_constructors
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:2611:19 - prefer_const_constructors
+  error - Undefined name 'homeController' - lib\main.dart:2635:22 - undefined_identifier
+  error - Undefined name 'homeController' - lib\main.dart:2636:9 - undefined_identifier
+  error - Undefined name 'activeChallenge' - lib\main.dart:2640:25 - undefined_identifier
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:2649:18 - prefer_const_constructors
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:2667:42 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:2669:61 - deprecated_member_use
+  error - Undefined name 'homeController' - lib\main.dart:2689:37 - undefined_identifier
+  error - Undefined name 'homeController' - lib\main.dart:2714:24 - undefined_identifier
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:2721:16 - prefer_const_constructors
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:2739:39 - deprecated_member_use
+  error - Undefined name 'activeChallenge' - lib\main.dart:2784:30 - undefined_identifier
+  error - Undefined name 'onStoreDestinationReached' - lib\main.dart:2786:9 - undefined_identifier
+  error - Undefined name 'onStoreDestinationReached' - lib\main.dart:2787:7 - undefined_identifier
+  error - Undefined name 'activeChallenge' - lib\main.dart:2788:16 - undefined_identifier
+  error - Undefined name '_onChallengeReached' - lib\main.dart:2788:43 - undefined_identifier
+  error - Undefined name '_onChallengeReached' - lib\main.dart:2789:7 - undefined_identifier
+  error - Undefined name 'activeChallenge' - lib\main.dart:2789:28 - undefined_identifier
+  error - Undefined name 'activeWorkCommuteType' - lib\main.dart:2790:16 - undefined_identifier
+  error - Undefined name '_onWorkReached' - lib\main.dart:2790:49 - undefined_identifier
+  error - Undefined name '_onWorkReached' - lib\main.dart:2791:7 - undefined_identifier
+  error - Undefined name 'activeWorkCommuteType' - lib\main.dart:2791:23 - undefined_identifier
+  error - Undefined name 'homeController' - lib\main.dart:2793:18 - undefined_identifier
+  error - Undefined name 'onNormalDestinationReached' - lib\main.dart:2794:11 - undefined_identifier
+  error - Undefined name 'onNormalDestinationReached' - lib\main.dart:2795:9 - undefined_identifier
+  error - Undefined name 'homeController' - lib\main.dart:2799:5 - undefined_identifier
+  error - Undefined name 'speedController' - lib\main.dart:2800:5 - undefined_identifier
+  error - Undefined name 'positionStream' - lib\main.dart:2816:5 - undefined_identifier
+  error - Undefined name '_lastPositionTime' - lib\main.dart:2817:5 - undefined_identifier
+  error - Undefined name '_lastSnappedPos' - lib\main.dart:2818:5 - undefined_identifier
+  error - Undefined name '_activeTripId' - lib\main.dart:2821:9 - undefined_identifier
+  error - The function '_endTripLog' isn't defined - lib\main.dart:2822:7 - undefined_function
+  error - Undefined name 'homeController' - lib\main.dart:2824:30 - undefined_identifier
+  error - Undefined name 'homeController' - lib\main.dart:2834:5 - undefined_identifier
+  error - Undefined name 'isCameraLocked' - lib\main.dart:2835:5 - undefined_identifier
+  error - Undefined name 'speedController' - lib\main.dart:2836:5 - undefined_identifier
+  error - Undefined name '_speedHistory' - lib\main.dart:2837:5 - undefined_identifier
+  error - Undefined name '_recentWalkingSpeeds' - lib\main.dart:2838:5 - undefined_identifier
+  error - Undefined name '_highSpeedBurstStartTime' - lib\main.dart:2839:5 - undefined_identifier
+  error - Undefined name '_isSwitchingModeDialogTrace' - lib\main.dart:2840:5 - undefined_identifier
+  error - Undefined name '_isDeviationDialogOpen' - lib\main.dart:2841:5 - undefined_identifier
+  error - Undefined name '_isScheduleDialogOpen' - lib\main.dart:2842:5 - undefined_identifier
+  error - Undefined name '_currentStepIndex' - lib\main.dart:2843:5 - undefined_identifier
+  error - Undefined name '_cumulatedDeviationMeters' - lib\main.dart:2844:5 - undefined_identifier
+   info - Don't invoke 'print' in production code - lib\main.dart:2846:5 - avoid_print
+  error - Expected a method, getter, setter or operator declaration - lib\main.dart:2848:1 - expected_executable
+   info - The constant name 'BeforeBoarding' isn't a lowerCamelCase identifier - lib\main.dart:2918:24 - constant_identifier_names
+   info - The constant name 'Onboard' isn't a lowerCamelCase identifier - lib\main.dart:2918:40 - constant_identifier_names
+   info - Parameter 'key' could be a super parameter - lib\main.dart:2924:3 - use_super_parameters
+   info - Use 'const' literals as arguments to constructors of '@immutable' classes - lib\main.dart:2953:30 - prefer_const_literals_to_create_immutables
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:2953:31 - prefer_const_constructors
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:3069:17 - prefer_const_constructors
+   info - Parameter 'key' could be a super parameter - lib\main.dart:3092:9 - use_super_parameters
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:3247:41 - deprecated_member_use
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:3671:22 - prefer_const_constructors
+   info - The constant name 'LOGIN_STREAK_BONUS_PER_PALIER' isn't a lowerCamelCase identifier - lib\main.dart:3683:14 - constant_identifier_names
+   info - The constant name 'LOGIN_STREAK_DAYS_PER_PALIER' isn't a lowerCamelCase identifier - lib\main.dart:3684:11 - constant_identifier_names
+   info - The constant name 'MAX_LOGIN_STREAK_BONUS_TOTAL' isn't a lowerCamelCase identifier - lib\main.dart:3685:14 - constant_identifier_names
+   info - Parameter 'key' could be a super parameter - lib\main.dart:3727:9 - use_super_parameters
+   info - Invalid use of a private type in a public API - lib\main.dart:3730:3 - library_private_types_in_public_api
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:3764:19 - use_build_context_synchronously
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:3765:26 - use_build_context_synchronously
+   info - Don't invoke 'print' in production code - lib\main.dart:3925:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:3938:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:3949:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:3964:11 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:3990:9 - avoid_print
+warning - The receiver can't be null, so the null-aware operator '?[' is unnecessary - lib\main.dart:3998:24 - invalid_null_aware_operator
+warning - The value of the local variable 'lastCompletedTimestamp' isn't used - lib\main.dart:4659:16 - unused_local_variable
+   info - Use the '??' operator rather than '?:' when testing for 'null' - lib\main.dart:4800:7 - prefer_if_null_operators
+warning - This default clause is covered by the previous cases - lib\main.dart:4846:7 - unreachable_switch_default
+   info - Parameter 'key' could be a super parameter - lib\main.dart:4954:9 - use_super_parameters
+   info - Invalid use of a private type in a public API - lib\main.dart:4957:3 - library_private_types_in_public_api
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:5102:28 - use_build_context_synchronously
+   info - 'activeColor' is deprecated and shouldn't be used. Use activeThumbColor instead. This feature was deprecated after v3.31.0-2.0.pre - lib\main.dart:5143:25 - deprecated_member_use
+   info - 'activeColor' is deprecated and shouldn't be used. Use activeThumbColor instead. This feature was deprecated after v3.31.0-2.0.pre - lib\main.dart:5174:21 - deprecated_member_use
+   info - 'activeColor' is deprecated and shouldn't be used. Use activeThumbColor instead. This feature was deprecated after v3.31.0-2.0.pre - lib\main.dart:5210:25 - deprecated_member_use
+   info - 'activeColor' is deprecated and shouldn't be used. Use activeThumbColor instead. This feature was deprecated after v3.31.0-2.0.pre - lib\main.dart:5222:25 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:5240:62 - deprecated_member_use
+   info - Parameter 'key' could be a super parameter - lib\main.dart:5328:9 - use_super_parameters
+   info - Invalid use of a private type in a public API - lib\main.dart:5331:3 - library_private_types_in_public_api
+   info - Empty catch block - lib\main.dart:5386:17 - empty_catches
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:5445:21 - use_build_context_synchronously
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:5447:28 - use_build_context_synchronously
+   info - 'activeColor' is deprecated and shouldn't be used. Use activeThumbColor instead. This feature was deprecated after v3.31.0-2.0.pre - lib\main.dart:5492:23 - deprecated_member_use
+   info - 'activeColor' is deprecated and shouldn't be used. Use activeThumbColor instead. This feature was deprecated after v3.31.0-2.0.pre - lib\main.dart:5542:21 - deprecated_member_use
+   info - 'activeColor' is deprecated and shouldn't be used. Use activeThumbColor instead. This feature was deprecated after v3.31.0-2.0.pre - lib\main.dart:5565:23 - deprecated_member_use
+   info - 'activeColor' is deprecated and shouldn't be used. Use activeThumbColor instead. This feature was deprecated after v3.31.0-2.0.pre - lib\main.dart:5574:23 - deprecated_member_use
+   info - Parameter 'key' could be a super parameter - lib\main.dart:5619:9 - use_super_parameters
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:5669:54 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:5708:47 - deprecated_member_use
+   info - Parameter 'key' could be a super parameter - lib\main.dart:5781:9 - use_super_parameters
+   info - Invalid use of a private type in a public API - lib\main.dart:5784:3 - library_private_types_in_public_api
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:5821:38 - use_build_context_synchronously
+   info - Unnecessary braces in a string interpolation - lib\main.dart:5864:38 - unnecessary_brace_in_string_interps
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:5928:50 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:5983:50 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:5985:69 - deprecated_member_use
+   info - The 'child' argument should be last in widget constructor invocations - lib\main.dart:6095:9 - sort_child_properties_last
+   info - The constant name 'ENABLE_SECURITY_CHECKS' isn't a lowerCamelCase identifier - lib\main.dart:6141:12 - constant_identifier_names
+   info - The constant name 'HOME_RADIUS_METERS' isn't a lowerCamelCase identifier - lib\main.dart:6152:13 - constant_identifier_names
+   info - The constant name 'NAV_CHECK_INTERVAL_SECONDS' isn't a lowerCamelCase identifier - lib\main.dart:6153:13 - constant_identifier_names
+   info - The constant name 'HOME_CHECK_INTERVAL_SECONDS' isn't a lowerCamelCase identifier - lib\main.dart:6154:13 - constant_identifier_names
+   info - The local variable '_lastNavPosition' starts with an underscore - lib\main.dart:6157:11 - no_leading_underscores_for_local_identifiers
+warning - The value of the local variable '_lastNavPosition' isn't used - lib\main.dart:6157:11 - unused_local_variable
+   info - The local variable '_lastNavTime' starts with an underscore - lib\main.dart:6158:13 - no_leading_underscores_for_local_identifiers
+warning - The value of the local variable '_lastNavTime' isn't used - lib\main.dart:6158:13 - unused_local_variable
+   info - Don't invoke 'print' in production code - lib\main.dart:6209:9 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:6212:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:6230:11 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:6253:9 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:6266:14 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:6288:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:6300:5 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:6314:5 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:6322:5 - avoid_print
+   info - Constructors for public widgets should have a named 'key' parameter - lib\main.dart:6454:7 - use_key_in_widget_constructors
+   info - 'background' is deprecated and shouldn't be used. Use surface instead. This feature was deprecated after v3.18.0-0.1.pre - lib\main.dart:6468:11 - deprecated_member_use
+   info - 'onBackground' is deprecated and shouldn't be used. Use onSurface instead. This feature was deprecated after v3.18.0-0.1.pre - lib\main.dart:6472:11 - deprecated_member_use
+   info - Constructors for public widgets should have a named 'key' parameter - lib\main.dart:6536:7 - use_key_in_widget_constructors
+   info - Constructors for public widgets should have a named 'key' parameter - lib\main.dart:6556:7 - use_key_in_widget_constructors
+   info - Invalid use of a private type in a public API - lib\main.dart:6558:3 - library_private_types_in_public_api
+   info - Don't invoke 'print' in production code - lib\main.dart:6620:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:6638:7 - avoid_print
+   info - Parameter 'key' could be a super parameter - lib\main.dart:6686:9 - use_super_parameters
+   info - Don't invoke 'print' in production code - lib\main.dart:6747:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:6776:7 - avoid_print
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:6870:57 - deprecated_member_use
+   info - Unnecessary use of string interpolation - lib\main.dart:6977:53 - unnecessary_string_interpolations
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:7029:33 - use_build_context_synchronously
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:7030:40 - use_build_context_synchronously
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:7046:33 - use_build_context_synchronously
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:7047:40 - use_build_context_synchronously
+warning - The declaration '_buildProfileStat' isn't referenced - lib\main.dart:7080:10 - unused_element
+   info - Constructors for public widgets should have a named 'key' parameter - lib\main.dart:7107:7 - use_key_in_widget_constructors
+   info - Invalid use of a private type in a public API - lib\main.dart:7109:3 - library_private_types_in_public_api
+warning - The value of the field '_speedController' isn't used - lib\main.dart:7122:24 - unused_field
+   info - Don't invoke 'print' in production code - lib\main.dart:7139:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:7201:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:7214:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:7283:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:7295:11 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:7299:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:7310:7 - avoid_print
+   info - Statements in an if should be enclosed in a block - lib\main.dart:7323:11 - curly_braces_in_flow_control_structures
+   info - Don't invoke 'print' in production code - lib\main.dart:7326:9 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:7331:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:7407:9 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:7409:9 - avoid_print
+   info - Statements in an if should be enclosed in a block - lib\main.dart:7438:31 - curly_braces_in_flow_control_structures
+   info - Statements in an if should be enclosed in a block - lib\main.dart:7439:36 - curly_braces_in_flow_control_structures
+   info - Statements in an if should be enclosed in a block - lib\main.dart:7440:36 - curly_braces_in_flow_control_structures
+   info - Statements in an if should be enclosed in a block - lib\main.dart:7441:36 - curly_braces_in_flow_control_structures
+   info - Statements in an if should be enclosed in a block - lib\main.dart:7442:12 - curly_braces_in_flow_control_structures
+   info - Don't invoke 'print' in production code - lib\main.dart:7459:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:7533:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:7624:7 - avoid_print
+   info - Unnecessary braces in a string interpolation - lib\main.dart:7635:42 - unnecessary_brace_in_string_interps
+   info - Don't invoke 'print' in production code - lib\main.dart:7644:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:7669:7 - avoid_print
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:7745:44 - deprecated_member_use
+   info - Parameter 'key' could be a super parameter - lib\main.dart:7848:9 - use_super_parameters
+   info - Invalid use of a private type in a public API - lib\main.dart:7851:3 - library_private_types_in_public_api
+   info - Parameter 'key' could be a super parameter - lib\main.dart:7953:9 - use_super_parameters
+   info - Parameter 'key' could be a super parameter - lib\main.dart:8063:9 - use_super_parameters
+   info - Invalid use of a private type in a public API - lib\main.dart:8075:3 - library_private_types_in_public_api
+warning - The value of the field '_localPoiError' isn't used - lib\main.dart:8081:11 - unused_field
+   info - Don't invoke 'print' in production code - lib\main.dart:8160:5 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:8178:9 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:8181:7 - avoid_print
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:8256:39 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:8258:58 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:8296:55 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:8296:88 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:8314:42 - deprecated_member_use
+  error - A try block must be followed by an 'on', 'catch', or 'finally' clause - lib\main.dart:8420:5 - missing_catch_or_finally
+warning - Dead code - lib\main.dart:8454:7 - dead_code
+   info - Use 'const' for final variables initialized to a constant value - lib\main.dart:8479:7 - prefer_const_declarations
+   info - The local variable '_random' starts with an underscore - lib\main.dart:8480:13 - no_leading_underscores_for_local_identifiers
+warning - The '!' will have no effect because the receiver can't be null - lib\main.dart:8593:76 - unnecessary_non_null_assertion
+   info - Don't invoke 'print' in production code - lib\main.dart:8616:7 - avoid_print
+   info - Empty catch block - lib\main.dart:8734:17 - empty_catches
+warning - The value of the local variable 'maxChanges' isn't used - lib\main.dart:8739:15 - unused_local_variable
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:8785:47 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:8789:46 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:8790:48 - deprecated_member_use
+   info - Parameter 'key' could be a super parameter - lib\main.dart:9056:9 - use_super_parameters
+   info - 'groupValue' is deprecated and shouldn't be used. Use a RadioGroup ancestor to manage group value instead. This feature was deprecated after v3.32.0-0.0.pre - lib\main.dart:9210:23 - deprecated_member_use
+   info - 'onChanged' is deprecated and shouldn't be used. Use RadioGroup to handle value change instead. This feature was deprecated after v3.32.0-0.0.pre - lib\main.dart:9211:23 - deprecated_member_use
+   info - The 'child' argument should be last in widget constructor invocations - lib\main.dart:9228:15 - sort_child_properties_last
+warning - The declaration '_showProofSubmissionDialog' isn't referenced - lib\main.dart:9243:16 - unused_element
+warning - The declaration '_processProofImage' isn't referenced - lib\main.dart:9247:32 - unused_element
+warning - The declaration '_uploadProofImage' isn't referenced - lib\main.dart:9253:18 - unused_element
+   info - Don't invoke 'print' in production code - lib\main.dart:9263:7 - avoid_print
+  error - Expected an identifier - lib\main.dart:9338:31 - missing_identifier
+  error - Expected an identifier - lib\main.dart:9347:24 - missing_identifier
+  error - Expected an identifier - lib\main.dart:9355:25 - missing_identifier
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:9360:7 - use_build_context_synchronously
+  error - Expected an identifier - lib\main.dart:9385:63 - missing_identifier
+  error - Expected an identifier - lib\main.dart:9386:101 - missing_identifier
+  error - The named parameter 'isBonus' isn't defined - lib\main.dart:9391:76 - undefined_named_parameter
+  error - The named parameter 'isBonus' isn't defined - lib\main.dart:9392:85 - undefined_named_parameter
+  error - The named parameter 'isBonus' isn't defined - lib\main.dart:9393:74 - undefined_named_parameter
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:9398:63 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:9478:52 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:9478:85 - deprecated_member_use
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:9555:35 - use_build_context_synchronously
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:9559:59 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:9742:53 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:9743:50 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:9776:51 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:9778:70 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:9877:22 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:9879:41 - deprecated_member_use
+   info - Parameter 'key' could be a super parameter - lib\main.dart:9932:9 - use_super_parameters
+   info - Invalid use of a private type in a public API - lib\main.dart:9950:3 - library_private_types_in_public_api
+warning - The value of the field '_upperControlsBarHeight' isn't used - lib\main.dart:9968:10 - unused_field
+   info - The private field _validateWalkingLegs could be 'final' - lib\main.dart:9976:8 - prefer_final_fields
+   info - The private field _currentRouteData could be 'final' - lib\main.dart:9980:24 - prefer_final_fields
+   info - The private field _activeStoreTripCashback could be 'final' - lib\main.dart:9987:7 - prefer_final_fields
+warning - The value of the field '_activeStoreTripCashback' isn't used - lib\main.dart:9987:7 - unused_field
+   info - Statements in an if should be enclosed in a block - lib\main.dart:10292:24 - curly_braces_in_flow_control_structures
+   info - Statements in an if should be enclosed in a block - lib\main.dart:10293:30 - curly_braces_in_flow_control_structures
+   info - Statements in an if should be enclosed in a block - lib\main.dart:10294:30 - curly_braces_in_flow_control_structures
+   info - Statements in an if should be enclosed in a block - lib\main.dart:10295:12 - curly_braces_in_flow_control_structures
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:10361:41 - deprecated_member_use
+warning - This default clause is covered by the previous cases - lib\main.dart:10417:7 - unreachable_switch_default
+   info - Don't invoke 'print' in production code - lib\main.dart:10510:7 - avoid_print
+   info - The constant name 'FE_VOITURE_KM' isn't a lowerCamelCase identifier - lib\main.dart:10646:20 - constant_identifier_names
+   info - The constant name 'BUS_NB_PASSAGERS' isn't a lowerCamelCase identifier - lib\main.dart:10647:20 - constant_identifier_names
+   info - The constant name 'BUS_CONSO_KM' isn't a lowerCamelCase identifier - lib\main.dart:10648:20 - constant_identifier_names
+   info - The constant name 'BUS_CONSO_MINUTE' isn't a lowerCamelCase identifier - lib\main.dart:10649:20 - constant_identifier_names
+   info - The constant name 'FE_RAIL_KM' isn't a lowerCamelCase identifier - lib\main.dart:10650:20 - constant_identifier_names
+   info - The constant name 'CONVERSION_CO2_POINTS' isn't a lowerCamelCase identifier - lib\main.dart:10651:20 - constant_identifier_names
+   info - Don't invoke 'print' in production code - lib\main.dart:10696:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:10760:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:10783:7 - avoid_print
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:10820:7 - use_build_context_synchronously
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:10900:54 - prefer_const_constructors
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:10901:22 - prefer_const_constructors
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:11136:43 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:11296:40 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:11297:41 - deprecated_member_use
+   info - Statements in an if should be enclosed in a block - lib\main.dart:11472:7 - curly_braces_in_flow_control_structures
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:11495:32 - deprecated_member_use
+   info - Statements in an if should be enclosed in a block - lib\main.dart:11512:45 - curly_braces_in_flow_control_structures
+   info - The local variable '_isClaimingReward' starts with an underscore - lib\main.dart:11520:14 - no_leading_underscores_for_local_identifiers
+   info - The local variable '_hasClaimedLocally' starts with an underscore - lib\main.dart:11521:14 - no_leading_underscores_for_local_identifiers
+warning - The value of the local variable '_hasClaimedLocally' isn't used - lib\main.dart:11521:14 - unused_local_variable
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:11589:67 - deprecated_member_use
+   info - Use a 'SizedBox' to add whitespace to a layout - lib\main.dart:11865:12 - sized_box_for_whitespace
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:11926:42 - deprecated_member_use
+warning - This default clause is covered by the previous cases - lib\main.dart:12148:11 - unreachable_switch_default
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:12175:44 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:12178:46 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:12444:36 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:12446:55 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:12512:33 - deprecated_member_use
+warning - The declaration '_parseChallengeReward' isn't referenced - lib\main.dart:12548:7 - unused_element
+   info - Statements in an if should be enclosed in a block - lib\main.dart:12557:7 - curly_braces_in_flow_control_structures
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:12650:40 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:12652:59 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:12672:37 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:13051:27 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:13091:31 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:13095:37 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:13138:39 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:13160:31 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:13164:37 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:13197:41 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:13221:39 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:13282:35 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:13329:33 - deprecated_member_use
+   info - Unnecessary use of 'toList' in a spread - lib\main.dart:13359:84 - unnecessary_to_list_in_spreads
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:13408:25 - prefer_const_constructors
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:13422:25 - prefer_const_constructors
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:13497:42 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:13499:61 - deprecated_member_use
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:13501:28 - prefer_const_constructors
+   info - Use 'const' literals as arguments to constructors of '@immutable' classes - lib\main.dart:13502:33 - prefer_const_literals_to_create_immutables
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:13503:25 - prefer_const_constructors
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:13520:43 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:13522:62 - deprecated_member_use
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:13524:28 - prefer_const_constructors
+   info - Use 'const' literals as arguments to constructors of '@immutable' classes - lib\main.dart:13525:33 - prefer_const_literals_to_create_immutables
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:13526:25 - prefer_const_constructors
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:13543:44 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:13545:63 - deprecated_member_use
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:13547:28 - prefer_const_constructors
+   info - Use 'const' literals as arguments to constructors of '@immutable' classes - lib\main.dart:13548:33 - prefer_const_literals_to_create_immutables
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:13549:25 - prefer_const_constructors
+warning - The declaration '_calculateRouteReward' isn't referenced - lib\main.dart:13564:15 - unused_element
+warning - The value of the local variable 'startPosition' isn't used - lib\main.dart:13567:17 - unused_local_variable
+   info - Don't invoke 'print' in production code - lib\main.dart:13602:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:13649:9 - avoid_print
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:13698:38 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:13700:57 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:13768:38 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:13770:57 - deprecated_member_use
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:13774:21 - prefer_const_constructors
+warning - The declaration '_getModeLabel' isn't referenced - lib\main.dart:14006:10 - unused_element
+warning - This default clause is covered by the previous cases - lib\main.dart:14014:7 - unreachable_switch_default
+   info - Don't invoke 'print' in production code - lib\main.dart:14028:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:14039:9 - avoid_print
+warning - This default clause is covered by the previous cases - lib\main.dart:14052:7 - unreachable_switch_default
+   info - Parameter 'key' could be a super parameter - lib\main.dart:14075:9 - use_super_parameters
+   info - Invalid use of a private type in a public API - lib\main.dart:14086:3 - library_private_types_in_public_api
+   info - 'desiredAccuracy' is deprecated and shouldn't be used. use settings parameter with AndroidSettings, AppleSettings, WebSettings, or LocationSettings - lib\main.dart:14107:56 - deprecated_member_use
+   info - Don't invoke 'print' in production code - lib\main.dart:14110:7 - avoid_print
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:14111:68 - prefer_const_constructors
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:14248:57 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:14275:64 - deprecated_member_use
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:14365:73 - prefer_const_constructors
+   info - Parameter 'key' could be a super parameter - lib\main.dart:14393:9 - use_super_parameters
+   info - Invalid use of a private type in a public API - lib\main.dart:14406:3 - library_private_types_in_public_api
+warning - The value of the field '_isLoading' isn't used - lib\main.dart:14410:8 - unused_field
+   info - The private field _isProcessingPurchase could be 'final' - lib\main.dart:14411:8 - prefer_final_fields
+warning - The value of the field '_isProcessingPurchase' isn't used - lib\main.dart:14411:8 - unused_field
+warning - The value of the field '_error' isn't used - lib\main.dart:14412:11 - unused_field
+   info - The private field _selectedTravelType could be 'final' - lib\main.dart:14414:14 - prefer_final_fields
+warning - The value of the field '_durationText' isn't used - lib\main.dart:14415:11 - unused_field
+warning - The value of the local variable 'isSpecialMode' isn't used - lib\main.dart:14493:10 - unused_local_variable
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:14621:19 - use_build_context_synchronously
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:14666:28 - use_build_context_synchronously
+   info - Statements in an if should be enclosed in a block - lib\main.dart:14671:9 - curly_braces_in_flow_control_structures
+   info - Statements in an if should be enclosed in a block - lib\main.dart:14673:9 - curly_braces_in_flow_control_structures
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:14675:28 - use_build_context_synchronously
+   info - Don't invoke 'print' in production code - lib\main.dart:14706:7 - avoid_print
+   info - The constant name 'W_DIST' isn't a lowerCamelCase identifier - lib\main.dart:14760:20 - constant_identifier_names
+   info - The constant name 'W_DUREE' isn't a lowerCamelCase identifier - lib\main.dart:14761:20 - constant_identifier_names
+   info - Statements in an if should be enclosed in a block - lib\main.dart:14771:9 - curly_braces_in_flow_control_structures
+   info - Statements in an if should be enclosed in a block - lib\main.dart:14791:11 - curly_braces_in_flow_control_structures
+   info - Statements in an if should be enclosed in a block - lib\main.dart:14796:20 - curly_braces_in_flow_control_structures
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:15024:30 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:15089:42 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:15091:61 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:15140:63 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:15267:37 - deprecated_member_use
+warning - The '!' will have no effect because the receiver can't be null - lib\main.dart:15497:28 - unnecessary_non_null_assertion
+warning - The '!' will have no effect because the receiver can't be null - lib\main.dart:15498:44 - unnecessary_non_null_assertion
+warning - The '!' will have no effect because the receiver can't be null - lib\main.dart:15505:50 - unnecessary_non_null_assertion
+warning - The '!' will have no effect because the receiver can't be null - lib\main.dart:15510:31 - unnecessary_non_null_assertion
+warning - The '!' will have no effect because the receiver can't be null - lib\main.dart:15510:82 - unnecessary_non_null_assertion
+warning - The '!' will have no effect because the receiver can't be null - lib\main.dart:15510:135 - unnecessary_non_null_assertion
+warning - The '!' will have no effect because the receiver can't be null - lib\main.dart:15511:31 - unnecessary_non_null_assertion
+warning - The '!' will have no effect because the receiver can't be null - lib\main.dart:15511:83 - unnecessary_non_null_assertion
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:15649:37 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:15841:41 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:15843:60 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:15868:55 - deprecated_member_use
+   info - Constructors in '@immutable' classes should be declared as 'const' - lib\main.dart:15907:3 - prefer_const_constructors_in_immutables
+   info - Parameter 'key' could be a super parameter - lib\main.dart:15907:3 - use_super_parameters
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:16023:52 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:16023:82 - deprecated_member_use
+   info - Parameter 'key' could be a super parameter - lib\main.dart:16047:9 - use_super_parameters
+   info - Don't invoke 'print' in production code - lib\main.dart:16082:7 - avoid_print
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:16137:42 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:16139:61 - deprecated_member_use
+   info - 'desiredAccuracy' is deprecated and shouldn't be used. use settings parameter with AndroidSettings, AppleSettings, WebSettings, or LocationSettings - lib\main.dart:16167:25 - deprecated_member_use
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:16259:23 - use_build_context_synchronously
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:16260:30 - use_build_context_synchronously
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:16262:30 - use_build_context_synchronously
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:16295:52 - deprecated_member_use
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:16318:40 - use_build_context_synchronously
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:16387:122 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:16394:122 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:16405:120 - deprecated_member_use
+   info - Unnecessary use of string interpolation - lib\main.dart:16417:36 - unnecessary_string_interpolations
+  error - Expected to find ']' - lib\main.dart:16547:7 - expected_token
+  error - Expected to find ')' - lib\main.dart:16548:6 - expected_token
+warning - Unnecessary cast - lib\main.dart:16663:50 - unnecessary_cast
+   info - Unnecessary use of string interpolation - lib\main.dart:16702:42 - unnecessary_string_interpolations
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:16783:41 - use_build_context_synchronously
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:16784:48 - use_build_context_synchronously
+  error - Expected to find ';' - lib\main.dart:16901:9 - expected_token
+  error - Expected to find ')' - lib\main.dart:16902:3 - expected_token
+warning - The value of the local variable 'lameForCurrentLevel' isn't used - lib\main.dart:16993:11 - unused_local_variable
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:17008:26 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:17009:24 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:17013:48 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:17127:35 - deprecated_member_use
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:17131:22 - prefer_const_constructors
+   info - Use 'const' literals as arguments to constructors of '@immutable' classes - lib\main.dart:17132:27 - prefer_const_literals_to_create_immutables
+warning - The declaration '_PremiumBenefit' isn't referenced - lib\main.dart:17186:7 - unused_element
+   info - Parameter 'key' could be a super parameter - lib\main.dart:17190:9 - use_super_parameters
+   info - Don't invoke 'print' in production code - lib\main.dart:17305:9 - avoid_print
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:17329:134 - prefer_const_constructors
+   info - The private field _totalSdgCollectedDisplay could be 'final' - lib\main.dart:17407:10 - prefer_final_fields
+   info - Don't invoke 'print' in production code - lib\main.dart:17445:9 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:17468:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:17551:7 - avoid_print
+   info - Statements in an if should be enclosed in a block - lib\main.dart:17580:19 - curly_braces_in_flow_control_structures
+   info - Statements in an if should be enclosed in a block - lib\main.dart:17630:29 - curly_braces_in_flow_control_structures
+warning - The declaration '_buildConvertirTab' isn't referenced - lib\main.dart:17720:10 - unused_element
+   info - Unnecessary use of 'toList' in a spread - lib\main.dart:17761:93 - unnecessary_to_list_in_spreads
+   info - Don't invoke 'print' in production code - lib\main.dart:17768:5 - avoid_print
+warning - The declaration '_showPromoCodeDialog' isn't referenced - lib\main.dart:17803:8 - unused_element
+warning - The declaration '_showConfirmationDialog' isn't referenced - lib\main.dart:17838:8 - unused_element
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:17868:43 - deprecated_member_use
+warning - The receiver can't be 'null' because of short-circuiting, so the null-aware operator '?.' can't be used - lib\main.dart:17915:75 - invalid_null_aware_operator
+   info - Unnecessary use of 'toList' in a spread - lib\main.dart:17984:78 - unnecessary_to_list_in_spreads
+warning - The declaration '_buildBonsPlansTab' isn't referenced - lib\main.dart:18156:10 - unused_element
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:18279:30 - use_build_context_synchronously
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:18315:134 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:18317:100 - deprecated_member_use
+   info - Invalid use of a private type in a public API - lib\main.dart:18431:3 - library_private_types_in_public_api
+   info - Don't invoke 'print' in production code - lib\main.dart:18538:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:18664:7 - avoid_print
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:18736:63 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:18823:41 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:18883:45 - deprecated_member_use
+   info - Invalid use of a private type in a public API - lib\main.dart:18909:3 - library_private_types_in_public_api
+   info - Statements in an if should be enclosed in a block - lib\main.dart:18983:22 - curly_braces_in_flow_control_structures
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:18997:7 - use_build_context_synchronously
+   info - Unnecessary braces in a string interpolation - lib\main.dart:19022:48 - unnecessary_brace_in_string_interps
+   info - Unnecessary braces in a string interpolation - lib\main.dart:19022:98 - unnecessary_brace_in_string_interps
+   info - Don't invoke 'print' in production code - lib\main.dart:19062:9 - avoid_print
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:19111:63 - deprecated_member_use
+   info - Unnecessary braces in a string interpolation - lib\main.dart:19152:38 - unnecessary_brace_in_string_interps
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:19170:45 - deprecated_member_use
+   info - Invalid use of a private type in a public API - lib\main.dart:19193:3 - library_private_types_in_public_api
+   info - Don't invoke 'print' in production code - lib\main.dart:19223:7 - avoid_print
+   info - Statements in an if should be enclosed in a block - lib\main.dart:19300:32 - curly_braces_in_flow_control_structures
+warning - The value of the local variable 'currentLamePoints' isn't used - lib\main.dart:19332:36 - unused_local_variable
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:19344:78 - use_build_context_synchronously
+   info - Don't use 'BuildContext's across async gaps, guarded by an unrelated 'mounted' check - lib\main.dart:19385:34 - use_build_context_synchronously
+   info - Don't use 'BuildContext's across async gaps, guarded by an unrelated 'mounted' check - lib\main.dart:19386:42 - use_build_context_synchronously
+   info - Don't use 'BuildContext's across async gaps, guarded by an unrelated 'mounted' check - lib\main.dart:19394:34 - use_build_context_synchronously
+   info - Don't invoke 'print' in production code - lib\main.dart:19395:21 - avoid_print
+   info - Don't use 'BuildContext's across async gaps, guarded by an unrelated 'mounted' check - lib\main.dart:19396:42 - use_build_context_synchronously
+   info - Parameter 'key' could be a super parameter - lib\main.dart:19457:9 - use_super_parameters
+   info - Parameter 'key' could be a super parameter - lib\main.dart:19497:9 - use_super_parameters
+   info - Don't invoke 'print' in production code - lib\main.dart:19530:19 - avoid_print
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:19531:26 - prefer_const_constructors
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:19532:28 - prefer_const_constructors
+   info - Use 'const' with the constructor to improve performance - lib\main.dart:19534:30 - prefer_const_constructors
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:19597:54 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:19605:48 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:19607:67 - deprecated_member_use
+
+flutter : 501 issues found. (ran in 127.9s)
+Au caractère Ligne:1 : 1
++ flutter analyze 2>&1 | Out-File -Encoding UTF8 analyze_output.txt; Ge ...
++ ~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (501 issues found. (ran in 127.9s  
+  ):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 

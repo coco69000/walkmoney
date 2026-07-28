@@ -65,7 +65,9 @@ class MainActivity: FlutterFragmentActivity() {
                 "route_index" to (intent.getIntExtra("route_index", -1)),
                 "route_name" to (intent.getStringExtra("route_name") ?: ""),
                 "route_destination" to (intent.getStringExtra("route_destination") ?: ""),
-                "travel_mode" to (intent.getStringExtra("travel_mode") ?: "walk")
+                "travel_mode" to (intent.getStringExtra("travel_mode") ?: "walk"),
+                "lat" to intent.getDoubleExtra("lat", 0.0),
+                "lng" to intent.getDoubleExtra("lng", 0.0)
             )
         } else if (intent?.action == "SHOW_ROUTE_OPTIONS") {
             return mapOf(

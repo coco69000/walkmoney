@@ -24,6 +24,22 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>WalkMoney a besoin de votre position pour valider vos défis et calculer votre vitesse.</string>
+	<key>NSLocationAlwaysUsageDescription</key>
+	<string>WalkMoney nécessite de suivre votre position en arrière-plan pendant vos trajets pour détecter les triches et valider vos défis même écran éteint.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>WalkMoney nécessite de suivre votre position en arrière-plan pendant vos trajets pour détecter les triches et valider vos défis même écran éteint.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>location</string>
+		<string>fetch</string>
+		<string>processing</string>
+	</array>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>dev.flutter.background.refresh</string>
+	</array>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
 	<key>UIMainStoryboardFile</key>

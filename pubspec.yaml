@@ -46,7 +46,7 @@ dependencies:
   # Interface et UX
   get: ^4.6.6
   provider: ^6.1.5+1
-  google_fonts: ^4.0.4
+  google_fonts: ^8.0.2  # Pin exact version to avoid 4.0.5 const-eval bug with FontWeight map
   flutter_html: ^3.0.0-beta.2
   intl: ^0.19.0
   image_picker: ^1.1.1
@@ -59,6 +59,7 @@ dependencies:
   flutter_stripe: ^10.1.0
   permission_handler: ^12.0.1
   baseflow_plugin_template: ^2.2.1
+  google_generative_ai: ^0.4.7
 
 dev_dependencies:
   flutter_test:
@@ -77,3 +78,4 @@ flutter:
     - assets/images/map_icon.png
     - assets/images/locate_me.png
     - assets/images/car.png
+    - assets/images/
