@@ -12,17 +12,37 @@ service cloud.firestore {
                          'total_lame_earned', 
                          'is_vip', 
                          'consecutive_logins',
-                         'ad_points'
+                         'ad_points',
+                         'store_boosts'
                        ]);
                        
       allow create: if request.auth != null && request.auth.uid == userId;
       allow delete: if request.auth != null && request.auth.uid == userId;
     }
-    
-    // Sous-collection historique des lames : Seul le serveur Admin SDK peut écrire, lecture réservée au propriétaire
+
+    // Sous-collections sous /users/{userId}
     match /users/{userId}/lame_history/{document=**} {
       allow read: if request.auth != null && request.auth.uid == userId;
       allow write: if false;
+    }
+
+    match /users/{userId}/trip_logs/{docId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+
+    match /users/{userId}/cashback_history/{docId} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+      allow write: if false;
+    }
+
+    // Statistiques des utilisateurs (ex: cycle de rafraîchissement des défis)
+    match /user_stats/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+
+    // Journaux d'activité utilisateur (top-level)
+    match /user_activity_logs/{docId} {
+      allow read, create: if request.auth != null;
     }
 
     // Agrégat du classement public (Généré par Cloud Function, aucune donnée sensible)
@@ -31,7 +51,12 @@ service cloud.firestore {
       allow write: if false;
     }
 
-    // Autres collections publiques / d'actions
+    // Défis généraux et défis utilisateur
+    match /challenges/{docId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+
     match /user_challenges/{docId} {
       allow read, write: if request.auth != null;
     }
@@ -53,6 +78,22 @@ service cloud.firestore {
     match /rewards/{rewardId} {
       allow read: if request.auth != null;
       allow write: if false;
+    }
+
+    // Concours
+    match /contests/{contestId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+
+    match /contest_entries/{entryId} {
+      allow read, write: if request.auth != null;
+    }
+
+    // Dons aux campagnes
+    match /campaign_donations/{donationId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null;
     }
   }
 }

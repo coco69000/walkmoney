@@ -1,11 +1,12 @@
 const functions = require('firebase-functions');
 const admin = require('firebase-admin');
+const { onSchedule } = require('firebase-functions/v2/scheduler');
 admin.initializeApp();
 
 // CLÉ SECRÈTE STRIPE (Récupération sécurisée via Secret Manager / Config Firebase / Environment Variables)
-const stripeSecretKey = process.env.STRIPE_SECRET_KEY || (functions.config().stripe && functions.config().stripe.secret);
+const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
 if (!stripeSecretKey) {
-    console.warn("⚠️ [ATTENTION] La clé secrète Stripe n'est pas configurée (process.env.STRIPE_SECRET_KEY ou functions.config().stripe.secret).");
+    console.warn("⚠️ [ATTENTION] La clé secrète Stripe n'est pas configurée (process.env.STRIPE_SECRET_KEY).");
 }
 const stripe = stripeSecretKey ? require('stripe')(stripeSecretKey) : null;
 
@@ -168,7 +169,7 @@ const PROCESSOR_ID = 'bf5524b33f20120c';
 const LOCATION = 'eu'; // Region: EU
 
 async function verifyReceiptWithGeminiServer(extractedText, storeName) {
-    const apiKey = process.env.GEMINI_API_KEY || functions.config().gemini?.key;
+    const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
         console.warn("⚠️ GEMINI_API_KEY serveur absente. Reçu refusé par précaution.");
         return { valid: false, reason: 'Clé d\'analyse IA non configurée sur le serveur.' };
@@ -348,6 +349,10 @@ exports.validateTrip = functions.https.onCall(async (data, context) => {
     const durationSeconds = Number(data.durationSeconds || 0);
     const travelMode = data.travelMode || 'walking';
 
+    if (!isSpecialBonus && distanceMeters <= 0) {
+        throw new functions.https.HttpsError('invalid-argument', 'Distance de trajet invalide.');
+    }
+
     if (distanceMeters > 0 && durationSeconds > 0 && !isSpecialBonus) {
         const speedKmh = (distanceMeters / 1000) / (durationSeconds / 3600);
         const maxPhysicalSpeed = travelMode === 'bicycling' ? 70.0 : (travelMode === 'transit' ? 140.0 : 35.0);
@@ -381,9 +386,19 @@ exports.validateTrip = functions.https.onCall(async (data, context) => {
                 const lastTripTime = userDoc.data().last_trip_timestamp;
                 const now = admin.firestore.Timestamp.now();
 
-                if (lastTripTime && (now.toMillis() - lastTripTime.toMillis() < 10 * 60 * 1000)) {
-                    const remainingSec = Math.ceil((10 * 60 * 1000 - (now.toMillis() - lastTripTime.toMillis())) / 1000);
-                    throw new functions.https.HttpsError('resource-exhausted', `Vous allez trop vite ! Veuillez attendre ${remainingSec}s avant de valider un autre trajet.`);
+                if (lastTripTime) {
+                    const elapsedMs = now.toMillis() - lastTripTime.toMillis();
+                    if (elapsedMs < 10 * 60 * 1000) {
+                        const remainingSec = Math.ceil((10 * 60 * 1000 - elapsedMs) / 1000);
+                        throw new functions.https.HttpsError('resource-exhausted', `Vous allez trop vite ! Veuillez attendre ${remainingSec}s avant de valider un autre trajet.`);
+                    }
+
+                    // Anti-triche horloge : la durée du trajet ne peut pas dépasser le temps réel écoulé depuis la dernière validation (+ 120s tolérance)
+                    const elapsedSec = elapsedMs / 1000;
+                    if (durationSeconds > elapsedSec + 120) {
+                        console.warn(`⚠️ [ANTI-TRICHE SERVEUR] Durée déclarée (${durationSeconds}s) supérieure au temps réel écoulé (${elapsedSec.toFixed(0)}s) pour ${userId}`);
+                        throw new functions.https.HttpsError('permission-denied', `Durée de trajet incohérente avec le temps écoulé réel.`);
+                    }
                 }
             }
 
@@ -481,6 +496,17 @@ exports.purchaseShopItem = functions.https.onCall(async (data, context) => {
             transaction.update(userRef, {
                 lame_points: newBalance,
                 updated_at: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            // Enregistrement de l'offre réclamée côté serveur (anti-triche)
+            const claimedRef = admin.firestore().collection('user_claimed_offers').doc();
+            transaction.set(claimedRef, {
+                user_id: userId,
+                user_email_contact: context.auth.token.email || 'inconnu',
+                reward_id: itemId,
+                details: { claimed_for_lame: actualCost, offer_title: itemTitle },
+                claimed_at: admin.firestore.FieldValue.serverTimestamp(),
+                status: 'approved'
             });
 
             const historyRef = userRef.collection('lame_history').doc();
@@ -623,6 +649,16 @@ exports.purchaseRaffleTicket = functions.https.onCall(async (data, context) => {
                 }
             }
 
+            if (contestData.status && contestData.status !== 'open') {
+                throw new functions.https.HttpsError('failed-precondition', 'Le concours n\'est pas ouvert.');
+            }
+
+            const rawEndDate = contestData.end_date || contestData.endDate || contestData.details_json?.end_date;
+            const endDate = rawEndDate ? (rawEndDate.toDate ? rawEndDate.toDate() : new Date(rawEndDate)) : null;
+            if (endDate && new Date() > endDate) {
+                throw new functions.https.HttpsError('failed-precondition', 'Ce concours est terminé.');
+            }
+
             const ticketCostLame = Math.round(
                 contestData?.details_json?.ticket_cost_eco ||
                 contestData?.detailsJson?.ticket_cost_eco ||
@@ -740,6 +776,12 @@ exports.placeBid = functions.https.onCall(async (data, context) => {
                 throw new functions.https.HttpsError('failed-precondition', 'L\'enchère n\'est pas ouverte.');
             }
 
+            const rawEndDate = contestData.end_date || contestData.endDate || contestData.details_json?.end_date;
+            const endDate = rawEndDate ? (rawEndDate.toDate ? rawEndDate.toDate() : new Date(rawEndDate)) : null;
+            if (endDate && new Date() > endDate) {
+                throw new functions.https.HttpsError('failed-precondition', 'Cette enchère est terminée.');
+            }
+
             const minNextBid = currentHighestBid > 0 ? currentHighestBid + 1.0 : minBid;
             if (bidAmount < minNextBid) {
                 throw new functions.https.HttpsError('failed-precondition', `L'enchère doit être d'au moins ${minNextBid} Lames.`);
@@ -764,6 +806,13 @@ exports.placeBid = functions.https.onCall(async (data, context) => {
                 transaction.update(oldBidderRef, {
                     lame_points: admin.firestore.FieldValue.increment(currentHighestBid),
                     updated_at: admin.firestore.FieldValue.serverTimestamp()
+                });
+
+                const refundHistoryRef = oldBidderRef.collection('lame_history').doc();
+                transaction.set(refundHistoryRef, {
+                    amount: currentHighestBid,
+                    source: `Remboursement Enchère (Surenchéri)`,
+                    timestamp: admin.firestore.FieldValue.serverTimestamp()
                 });
             }
 
@@ -815,7 +864,7 @@ exports.placeBid = functions.https.onCall(async (data, context) => {
 // ════════════════════════════════════════════════════════════════════════════
 // --- FONCTION 8 : OPTIMISATION CLASSEMENT (SCHEDULED 1H -> 1 READ FIRESTORE) ---
 // ════════════════════════════════════════════════════════════════════════════
-exports.updateDailyLeaderboard = functions.pubsub.schedule('every 1 hours').onRun(async (context) => {
+exports.updateDailyLeaderboard = onSchedule('every 1 hours', async (event) => {
     console.log("🚀 [SCHEDULED] Agrégation du Top 100 dans leaderboards/daily_top");
 
     try {
@@ -893,4 +942,291 @@ exports.deleteUserAccount = functions.https.onCall(async (data, context) => {
         if (error instanceof functions.https.HttpsError) throw error;
         throw new functions.https.HttpsError('internal', error.message);
     }
+});
+
+// ===========================================================================
+// 🛡️ NOUVEAU : ANTI-TRICHE POUR LES PUBS, BOOSTS ET DONS
+// ===========================================================================
+
+// --- 1. Regarder une pub générale (Ad Points) ---
+exports.addAdPoint = functions.https.onCall(async (data, context) => {
+    if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'Non autorisé');
+    
+    const userRef = admin.firestore().collection('users').doc(context.auth.uid);
+    
+    return admin.firestore().runTransaction(async (transaction) => {
+        const userDoc = await transaction.get(userRef);
+        const currentPoints = userDoc.data().ad_points || 0;
+        
+        if (currentPoints >= 50) {
+            throw new functions.https.HttpsError('resource-exhausted', 'Max Ad Points atteints.');
+        }
+        
+        const newPoints = currentPoints + 1;
+        transaction.update(userRef, {
+            ad_points: newPoints,
+            last_ad_point_decay_time: admin.firestore.FieldValue.serverTimestamp(),
+            updated_at: admin.firestore.FieldValue.serverTimestamp()
+        });
+        
+        return { newAdPoints: newPoints };
+    });
+});
+
+// --- 2. Regarder une pub pour un magasin (Boost Cashback) ---
+exports.addStoreBoost = functions.https.onCall(async (data, context) => {
+    if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'Non autorisé');
+    
+    const storeId = data.storeId;
+    if (!storeId) throw new functions.https.HttpsError('invalid-argument', 'Store ID manquant');
+
+    const userRef = admin.firestore().collection('users').doc(context.auth.uid);
+    const storeRef = admin.firestore().collection('stores').doc(storeId);
+
+    return admin.firestore().runTransaction(async (transaction) => {
+        const userDoc = await transaction.get(userRef);
+        const storeDoc = await transaction.get(storeRef);
+
+        const isVip = userDoc.data().is_vip === true;
+        const storeHasBoost = storeDoc.exists && storeDoc.data().is_premium_ad_boost_enabled === true;
+        const cashbackRate = storeDoc.exists ? (storeDoc.data().cashback_rate || 0.05) : 0.05;
+
+        const effectivelySuperPremium = isVip && storeHasBoost;
+        const effectivelyPremium = isVip || storeHasBoost;
+
+        const storeBoosts = userDoc.data().store_boosts || {};
+        const currentBoost = storeBoosts[storeId]?.amount || 0.0;
+
+        let gain = 0.01;
+        if (currentBoost >= 1.0) {
+            gain = effectivelySuperPremium ? 0.8 : (effectivelyPremium ? 0.4 : 0.2);
+        } else {
+            gain = effectivelySuperPremium ? 0.04 : (effectivelyPremium ? 0.02 : 0.01);
+        }
+
+        let maxCap = Math.max(cashbackRate * 100.0, 1.0);
+        let newAmount = Math.min(currentBoost + gain, maxCap);
+
+        transaction.set(userRef, {
+            store_boosts: { 
+                [storeId]: { 
+                    amount: newAmount, 
+                    last_update: admin.firestore.FieldValue.serverTimestamp() 
+                } 
+            }
+        }, { merge: true });
+
+        return { 
+            newAmount: newAmount, 
+            gain: gain,
+            maxReached: newAmount === maxCap, 
+            effectivelySuperPremium: effectivelySuperPremium 
+        };
+    });
+});
+
+// --- 3. Dépenser des lames (Dons, Arbres, Virements) ---
+exports.processDonation = functions.https.onCall(async (data, context) => {
+    if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'Non autorisé');
+    
+    const { amount, offerId, offerTitle, email, isInstantApproval } = data;
+    
+    const userId = context.auth.uid;
+    const userRef = admin.firestore().collection('users').doc(userId);
+    const claimedRef = admin.firestore().collection('user_claimed_offers').doc();
+
+    return admin.firestore().runTransaction(async (transaction) => {
+        const userDoc = await transaction.get(userRef);
+        if (!userDoc.exists) {
+            throw new functions.https.HttpsError('not-found', 'Profil utilisateur introuvable.');
+        }
+
+        let cost = parseFloat(amount);
+
+        if (offerId) {
+            const rewardRef = admin.firestore().collection('rewards').doc(offerId);
+            const rewardDoc = await transaction.get(rewardRef);
+            if (rewardDoc.exists) {
+                const rData = rewardDoc.data();
+                const fetchedCost = rData.eco_cost ?? rData.ecoCost ?? rData.cost_lame ?? rData.costLame ?? rData.cost;
+                if (fetchedCost !== undefined && fetchedCost !== null && !isNaN(parseFloat(fetchedCost))) {
+                    cost = parseFloat(fetchedCost);
+                }
+
+                // Si c'est une campagne solidaires (avec details_json), enregistrer le don sur la campagne
+                if (rData.details_json) {
+                    const currentDetails = rData.details_json || {};
+                    const currentAmt = Number(currentDetails.current_amount_eco || 0);
+                    const currentDonors = Number(currentDetails.current_donors || 0);
+                    currentDetails.current_amount_eco = currentAmt + cost;
+                    currentDetails.current_donors = currentDonors + 1;
+
+                    transaction.update(rewardRef, {
+                        details_json: currentDetails,
+                        updated_at: admin.firestore.FieldValue.serverTimestamp()
+                    });
+                }
+            }
+        }
+
+        if (isNaN(cost) || cost <= 0) {
+            throw new functions.https.HttpsError('invalid-argument', 'Montant invalide. Triche détectée.');
+        }
+
+        const currentLame = userDoc.data().lame_points || 0;
+
+        if (currentLame < cost) {
+            throw new functions.https.HttpsError('failed-precondition', 'Fonds insuffisants.');
+        }
+
+        // Déduction des points
+        transaction.update(userRef, { 
+            lame_points: admin.firestore.FieldValue.increment(-cost),
+            updated_at: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        // Enregistrement de la demande
+        transaction.set(claimedRef, {
+            user_id: userId,
+            user_email_contact: email || 'inconnu',
+            reward_id: offerId || 'donation',
+            details: { claimed_for_lame: cost, offer_title: offerTitle || 'Offre / Don' },
+            claimed_at: admin.firestore.FieldValue.serverTimestamp(),
+            status: isInstantApproval ? 'approved' : 'pending',
+        });
+        
+        // Historique
+        const historyRef = userRef.collection('lame_history').doc();
+        transaction.set(historyRef, {
+            amount: -cost,
+            source: `Dépense : ${offerTitle || 'Offre'}`,
+            timestamp: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        return { success: true, newBalance: currentLame - cost };
+    });
+});
+
+// --- 4. Valider un Ticket de Caisse et Calculer le Cashback ---
+exports.claimCashback = functions.https.onCall(async (data, context) => {
+    if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'Non autorisé');
+
+    const { storeId, amountSpent, rawText } = data;
+    let amount = parseFloat(amountSpent);
+
+    if (!storeId || isNaN(amount) || amount <= 0) {
+        throw new functions.https.HttpsError('invalid-argument', 'Données de ticket invalides.');
+    }
+
+    // Plafond de sécurité anti-triche : max 100€ par ticket
+    if (amount > 100.0) {
+        amount = 100.0;
+    }
+
+    const userId = context.auth.uid;
+    const userRef = admin.firestore().collection('users').doc(userId);
+    const storeRef = admin.firestore().collection('stores').doc(storeId);
+
+    return admin.firestore().runTransaction(async (transaction) => {
+        const userDoc = await transaction.get(userRef);
+        const storeDoc = await transaction.get(storeRef);
+
+        if (!userDoc.exists || !storeDoc.exists) {
+            throw new functions.https.HttpsError('not-found', 'Utilisateur ou magasin introuvable.');
+        }
+
+        const userData = userDoc.data();
+        const storeData = storeDoc.data();
+
+        // 1. Calcul des taux (Le serveur récupère les vraies données)
+        let baseRate = (storeData.cashback_rate || 0.05) * 100.0;
+        if (storeData.is_visibility_boost_enabled) baseRate += 1.0;
+
+        const storeBoosts = userData.store_boosts || {};
+        const boostAddon = storeBoosts[storeId]?.amount || 0.0;
+
+        // 2. Calcul de la fidélité
+        let loyaltyDiscount = 0.0;
+        let loyaltyTierLabel = "";
+        const loyaltyProgress = userData.loyalty_progress || {};
+        const storeProgress = loyaltyProgress[storeId] || { visits: 0, spend: 0 };
+        
+        const rules = storeData.loyalty_rules || [];
+        for (const rule of rules) {
+            const reached = rule.type === 'visit' ? storeProgress.visits >= rule.threshold : storeProgress.spend >= rule.threshold;
+            if (reached && rule.rewardPercent > loyaltyDiscount) {
+                loyaltyDiscount = rule.rewardPercent;
+                loyaltyTierLabel = rule.type === 'visit' ? `Palier ${rule.threshold} visites` : `Palier ${rule.threshold}€`;
+            }
+        }
+
+        const totalRate = baseRate + boostAddon + loyaltyDiscount;
+        const cashbackAmount = amount * (totalRate / 100.0);
+
+        // 3. Calcul du Bonus de Lames en fonction du Niveau
+        const totalLameEarned = userData.total_lame_earned || 0;
+        let currentLevel = 1;
+        let lameNeeded = 500;
+        let totalForLevel = 0;
+        while (totalLameEarned >= totalForLevel + lameNeeded && currentLevel < 50) {
+            totalForLevel += lameNeeded;
+            currentLevel++;
+            lameNeeded *= 2;
+        }
+        const levelMultiplier = 1.0 + (currentLevel * 0.01);
+        const lameBonus = Math.round((cashbackAmount * 10) * levelMultiplier);
+
+        // --- 4. ÉCRITURES SÉCURISÉES ---
+        
+        // Mise à jour de l'utilisateur
+        transaction.update(userRef, {
+            lame_points: admin.firestore.FieldValue.increment(lameBonus),
+            total_lame_earned: admin.firestore.FieldValue.increment(lameBonus),
+            [`loyalty_progress.${storeId}.visits`]: admin.firestore.FieldValue.increment(1),
+            [`loyalty_progress.${storeId}.spend`]: admin.firestore.FieldValue.increment(amount)
+        });
+
+        // Historique des Lames
+        if (lameBonus > 0) {
+            const historyRef = userRef.collection('lame_history').doc();
+            transaction.set(historyRef, {
+                amount: lameBonus,
+                source: `Cashback ${storeData.name || 'Magasin'}`,
+                timestamp: admin.firestore.FieldValue.serverTimestamp()
+            });
+        }
+
+        // Historique du Cashback
+        const cbHistoryRef = userRef.collection('cashback_history').doc();
+        transaction.set(cbHistoryRef, {
+            store_id: storeId,
+            store_name: storeData.name || 'Magasin',
+            amount_spent: amount,
+            cashback_amount: cashbackAmount,
+            cashback_rate_applied: totalRate,
+            lame_points_earned: lameBonus,
+            loyalty_tier_applied: loyaltyTierLabel || null,
+            receipt_text_raw: rawText || '',
+            timestamp: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        // Transaction Commerçant & Stats
+        const storeTxRef = storeRef.collection('store_transactions').doc();
+        transaction.set(storeTxRef, {
+            user_id: userId,
+            username: userData.username || 'Anonyme',
+            amount_spent: amount,
+            cashback_given: cashbackAmount,
+            rate_applied: totalRate,
+            loyalty_tier: loyaltyTierLabel || null,
+            timestamp: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        transaction.update(storeRef, {
+            totalAmountSpentByUser: admin.firestore.FieldValue.increment(amount),
+            totalCashbackGiven: admin.firestore.FieldValue.increment(cashbackAmount)
+        });
+
+        return { cashbackAmount, lameBonus, totalRate };
+    });
 });

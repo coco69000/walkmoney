@@ -35,6 +35,7 @@ dependencies:
   wakelock_plus: ^1.4.0
   firebase_storage: ^12.0.0
   cloud_functions: ^5.0.0
+  firebase_app_check: ^0.3.0
 
   # Réseau et API
   dio: ^5.0.0
@@ -60,6 +61,7 @@ dependencies:
   permission_handler: ^12.0.1
   baseflow_plugin_template: ^2.2.1
   google_generative_ai: ^0.4.7
+  talker_flutter: ^5.1.19
 
 dev_dependencies:
   flutter_test:

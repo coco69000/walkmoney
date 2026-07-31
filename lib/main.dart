@@ -19,6 +19,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_app_check/firebase_app_check.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
@@ -58,6 +59,7 @@ import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart'; // IMPORTANT POUR LA NOTIF
 import 'package:safe_device/safe_device.dart'; // <--- AJOUTER CET IMPORT
 import 'package:google_generative_ai/google_generative_ai.dart';
+import 'package:talker_flutter/talker_flutter.dart';
 import 'auth_screen.dart';
 
 class OsrmService {
@@ -437,6 +439,8 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
   // Route Principale (Solide - Bus/Voiture)
   static const String routeSourceId = "route-source";
   static const String routeLayerId = "route-layer";
+  static const String passedRouteSourceId = "passed-route-source";
+  static const String passedRouteLayerId = "passed-route-layer";
 
   // Route Marche (Pointillés - Rejoindre l'arrêt)
   static const String walkingRouteSourceId = "walking-route-source";
@@ -587,9 +591,101 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
     }
   }
 
+  // NOUVELLE FONCTION : Arrondit les angles du tracé GPS
+  List<LatLng> smoothPolyline(List<LatLng> path, {int iterations = 3}) {
+    if (path.length < 3) return path;
+    List<LatLng> currentPath = path;
+
+    for (int i = 0; i < iterations; i++) {
+      List<LatLng> newPath = [];
+      newPath.add(currentPath.first);
+
+      for (int j = 0; j < currentPath.length - 1; j++) {
+        LatLng p0 = currentPath[j];
+        LatLng p1 = currentPath[j + 1];
+
+        // Calcul des points à 25% et 75% du segment pour couper l'angle
+        double qx = 0.75 * p0.longitude + 0.25 * p1.longitude;
+        double qy = 0.75 * p0.latitude + 0.25 * p1.latitude;
+
+        double rx = 0.25 * p0.longitude + 0.75 * p1.longitude;
+        double ry = 0.25 * p0.latitude + 0.75 * p1.latitude;
+
+        newPath.add(LatLng(qy, qx));
+        newPath.add(LatLng(ry, rx));
+      }
+      newPath.add(currentPath.last);
+      currentPath = newPath;
+    }
+    return currentPath;
+  }
+
+  void _splitAndDrawRoute(LatLng currentPos) async {
+    if (polylineCoordinates.isEmpty) return;
+
+    int closestIndex = 0;
+    double minDistance = double.infinity;
+
+    // Trouver le point de la route le plus proche de la flèche
+    for (int i = 0; i < polylineCoordinates.length; i++) {
+      double dist = Geolocator.distanceBetween(
+          currentPos.latitude, currentPos.longitude,
+          polylineCoordinates[i].latitude, polylineCoordinates[i].longitude);
+      if (dist < minDistance) {
+        minDistance = dist;
+        closestIndex = i;
+      }
+    }
+
+    // --- ROUTE PASSÉE (Derrière la flèche) ---
+    List<List<double>> passedCoords = [];
+    for (int i = 0; i <= closestIndex; i++) {
+      passedCoords.add([polylineCoordinates[i].longitude, polylineCoordinates[i].latitude]);
+    }
+    passedCoords.add([currentPos.longitude, currentPos.latitude]); // Jonction
+
+    // --- ROUTE FUTURE (Devant la flèche) ---
+    List<List<double>> futureCoords = [];
+    futureCoords.add([currentPos.longitude, currentPos.latitude]); // Jonction
+    for (int i = closestIndex + 1; i < polylineCoordinates.length; i++) {
+      futureCoords.add([polylineCoordinates[i].longitude, polylineCoordinates[i].latitude]);
+    }
+
+    // SÉCURITÉ : MapLibre a besoin d'au moins 2 points pour tracer une ligne
+    // Cela corrige l'erreur "Invalid geometry in line layer"
+    
+    if (passedCoords.length >= 2) {
+      await _setSafeGeoJsonSource(passedRouteSourceId, {
+        "type": "FeatureCollection",
+        "features": [{"type": "Feature", "geometry": {"type": "LineString", "coordinates": passedCoords}}]
+      });
+    }
+
+    if (futureCoords.length >= 2) {
+      await _setSafeGeoJsonSource(routeSourceId, {
+        "type": "FeatureCollection",
+        "features": [
+          {
+            "type": "Feature",
+            "geometry": {"type": "LineString", "coordinates": futureCoords},
+            "properties": {"color": "#3d5afe"} // Bleu
+          }
+        ]
+      });
+    } else {
+      // Si on est arrivé au bout, on vide la ligne bleue
+      await _setSafeGeoJsonSource(routeSourceId, {
+        "type": "FeatureCollection",
+        "features": []
+      });
+    }
+  }
+
 // --- NOUVELLE MÉTHODE : Mise à jour en temps réel ---
   void updateRemainingDistanceAndTime(LatLng currentPos) {
     if (polylineCoordinates.isEmpty) return;
+
+    _splitAndDrawRoute(currentPos);
 
     int closestIndex = 0;
     double minDistance = double.infinity;
@@ -697,6 +793,31 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
         debugPrint("⚠️ Source $radiusSourceId: $e");
       }
 
+      // --- DANS onStyleLoaded ---
+      try {
+        await mapController.addSource(
+            passedRouteSourceId,
+            const GeojsonSourceProperties(
+                data: {"type": "FeatureCollection", "features": []}));
+      } catch (e) {
+        debugPrint("⚠️ Source $passedRouteSourceId: $e");
+      }
+
+      // Layer Route Parcourue (Gris, semi-transparent)
+      try {
+        await mapController.addLayer(
+            passedRouteSourceId,
+            passedRouteLayerId,
+            const LineLayerProperties(
+                lineColor: "#A9A9A9", // Gris
+                lineWidth: 6.0,
+                lineOpacity: 0.4, // Opacité plus faible
+                lineCap: "round",
+                lineJoin: "round"));
+      } catch (e) {
+        debugPrint("⚠️ Layer $passedRouteLayerId: $e");
+      }
+
       // Layer Route Bus (Ligne pleine)
       try {
         await mapController.addLayer(
@@ -790,7 +911,8 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
   }) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       try {
-        if (Get.overlayContext != null) {
+        final ctx = Get.overlayContext ?? Get.context;
+        if (ctx != null && Overlay.maybeOf(ctx) != null) {
           Get.snackbar(
             title,
             message,
@@ -1157,35 +1279,60 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
     _movementController!.forward();
   }
 
+  // NOUVEAU : Fonction mathématique pour lisser la rotation (évite que la carte tourne d'un coup sec)
+  // On calcule le chemin le plus court pour tourner (ex: passer de 350° à 10° sans faire un tour complet)
+  double _lerpBearing(double current, double target, double t) {
+    double diff = target - current;
+    while (diff > 180) diff -= 360;
+    while (diff < -180) diff += 360;
+    return current + diff * t;
+  }
+
   // 🚀 LANCE LA BOUCLE D'ANIMATION 60 FPS
   void startFluidNavigation() {
     _fluidTimer?.cancel();
-    // 50 millisecondes = 20 FPS constants. Le marqueur ne s'arrêtera JAMAIS.
-    _fluidTimer = Timer.periodic(const Duration(milliseconds: 50), (timer) {
+
+    // Initialisation douce du cap
+    if (kinematicFilter.lastRealPos != null) {
+      _lastBearing = kinematicFilter.lastRealPos!.heading;
+    }
+
+    // 16 millisecondes = 60 FPS constants.
+    _fluidTimer = Timer.periodic(const Duration(milliseconds: 16), (timer) {
       if (mapStatus.value != Constants.onDestination) return;
 
-      // 1. Le filtre devine l'avancée de la voiture
+      // 1. Le filtre donne la position fluide (déjà parfaitement alignée sur la route)
       LatLng? predictedPos = kinematicFilter.predictNextPosition();
 
       if (predictedPos != null && kinematicFilter.lastRealPos != null) {
-        // 2. MAGIE DES VIRAGES : On force le point à épouser la ligne bleue OSRM
-        LatLng snappedPos = snapToRoute(predictedPos);
+        // SUPPRESSION DE snapToRoute ICI :
+        // Le KinematicFilter gère déjà l'alignement. L'enlever d'ici libère énormément le processeur
+        // et supprime les micro-saccades de la caméra.
 
-        // 3. Mise à jour de l'UI à l'écran
-        _updateDriverMarker(snappedPos, kinematicFilter.lastRealPos!.heading);
+        // 2. LISSAGE DE LA ROTATION (CAP)
+        // Le GPS donne une direction 1x par seconde. On l'interpole à 10% par frame
+        // pour que la carte et le marqueur tournent en douceur.
+        double targetHeading = kinematicFilter.lastRealPos!.heading;
+        _lastBearing = _lerpBearing(_lastBearing, targetHeading, 0.10);
 
-        // 4. On enregistre pour le recentrage
-        _currentAnimatedPos = snappedPos;
-        _lastBearing = kinematicFilter.lastRealPos!.heading;
+        // 3. Mise à jour du marqueur sur la carte avec le cap lissé
+        _updateDriverMarker(predictedPos, _lastBearing);
 
-        // 5. On fait avancer la caméra
+        // NOUVEAU : On grise la route derrière la flèche en temps réel !
+        _splitAndDrawRoute(predictedPos);
+
+        // 4. On enregistre pour le recentrage manuel
+        _currentAnimatedPos = predictedPos;
+
+        // 5. Mise à jour de la caméra
         if (isNavigationCameraLocked.value && !isAnimating.value) {
           mapController.moveCamera(CameraUpdate.newCameraPosition(
               CameraPosition(
-                  target: snappedPos,
+                  target: predictedPos,
                   zoom: 18.0,
-                  bearing: kinematicFilter.lastRealPos!.heading,
-                  tilt: 50)));
+                  bearing:
+                      _lastBearing, // On utilise le cap fluide, pas celui du GPS brut !
+                  tilt: 50.0))); // Légère inclinaison pour l'effet GPS 3D
         }
       }
     });
@@ -1213,23 +1360,35 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
     await _setSafeGeoJsonSource(driverSourceId, feature);
   }
 
-  // --- LOGIQUE SNAPPING ---
-  // Contient le point le plus proche sur la route ainsi que la distance à ce point.
-  // Voir la classe `_RouteSnapResult` déclarée au niveau du fichier.
-  _RouteSnapResult _getNearestRoutePoint(LatLng gpsPos) {
+  // --- LOGIQUE SNAPPING AMÉLIORÉE (PÉNALITÉ D'ANGLE) ---
+  _RouteSnapResult _getNearestRoutePoint(LatLng gpsPos, {double? currentHeading}) {
     if (polylineCoordinates.isEmpty) return _RouteSnapResult(gpsPos, 0.0);
 
     LatLng closest = polylineCoordinates.first;
     double minDist = double.infinity;
 
-    // Optimisation : ne chercher que dans un rayon raisonnable ou sur un subset si la route est longue
-    // Ici version simple
     for (int i = 0; i < polylineCoordinates.length - 1; i++) {
       LatLng p1 = polylineCoordinates[i];
       LatLng p2 = polylineCoordinates[i + 1];
       LatLng proj = _project(gpsPos, p1, p2);
+
       double d = Geolocator.distanceBetween(
           gpsPos.latitude, gpsPos.longitude, proj.latitude, proj.longitude);
+
+      // Pénalité d'angle pour éviter d'accrocher une rue perpendiculaire ou retour demi-tour
+      if (currentHeading != null && currentHeading >= 0) {
+        double segmentBearing = Geolocator.bearingBetween(
+            p1.latitude, p1.longitude, p2.latitude, p2.longitude);
+        if (segmentBearing < 0) segmentBearing += 360;
+
+        double diff = (segmentBearing - currentHeading).abs();
+        if (diff > 180) diff = 360 - diff;
+
+        if (diff > 60 && diff < 300) {
+          d += 80.0; // 🛑 Pénalité renforcée pour les routes opposées/parallèles
+        }
+      }
+
       if (d < minDist) {
         minDist = d;
         closest = proj;
@@ -1239,11 +1398,10 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
     return _RouteSnapResult(closest, minDist);
   }
 
-  /// Snap to the route only when the user is close enough.
-  /// If the user is far from the route, we keep the real GPS position so the marker shows the deviation.
-  LatLng snapToRoute(LatLng gpsPos) {
-    final snap = _getNearestRoutePoint(gpsPos);
-    return snap.distance < 30 ? snap.point : gpsPos;
+  /// Aimant renforcé à 45m
+  LatLng snapToRoute(LatLng gpsPos, {double? currentHeading}) {
+    final snap = _getNearestRoutePoint(gpsPos, currentHeading: currentHeading);
+    return snap.distance < 45.0 ? snap.point : gpsPos; // 🛑 Aimant augmenté à 45 mètres
   }
 
   LatLng _project(LatLng p, LatLng a, LatLng b) {
@@ -1481,12 +1639,18 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
         int hours = mins ~/ 60;
         timeLeft.value = hours > 0 ? "${hours}h ${mins % 60}min" : "$mins min";
 
-        // Traitement de la géométrie (Polyline)
+        // --- DANS drawRoute ---
         List coords = routeData['geometry']['coordinates'];
+        List<LatLng> rawCoords = [];
+
         for (var c in coords) {
-          // OSRM renvoie [long, lat], on stocke LatLng(lat, long)
-          polylineCoordinates.add(LatLng(c[1], c[0]));
+          rawCoords.add(LatLng(c[1], c[0]));
         }
+
+        // APPLIQUE LE LISSAGE ICI AVANT DE SAUVEGARDER
+        polylineCoordinates.assignAll(smoothPolyline(rawCoords));
+
+        kinematicFilter.updateRoute(polylineCoordinates);
 
         // Dessin sur la carte (Source GeoJSON)
         final feature = {
@@ -1640,7 +1804,7 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
     }
 
     // --- AJOUT SÉCURITÉ MOCK LOCATION ---
-    const bool securityEnabled = false;
+    const bool securityEnabled = !kDebugMode;
 
     if (securityEnabled) {
       if (permission == LocationPermission.always ||
@@ -1675,6 +1839,10 @@ class NavigationController extends GetxController {
   bool _isDeviationDialogOpen = false;
   DateTime? _lastAutoRecalculateTime;
   UserProfile? _activeUserProfile;
+
+  // 🚀 NOUVEAU : Variables pour lisser les routes parallèles et croisements
+  final List<LatLng> _recentGpsBuffer = [];
+  int _consecutiveOffRouteCount = 0;
 
   // NOUVEAU : Verrou de sécurité pour limiter le recalcul à 1 seule fois
   bool _hasUsedManualRecalculate = false;
@@ -2241,8 +2409,38 @@ class NavigationController extends GetxController {
 
     positionStream = Geolocator.getPositionStream(locationSettings: settings)
         .listen((Position position) {
-      // 🚀 1. DONNER LA VRAIE POSITION AU FILTRE !
-      homeController.kinematicFilter.updateRealPosition(position);
+      LatLng rawPos = LatLng(position.latitude, position.longitude);
+
+      // ---------------------------------------------------------
+      // 🚀 1. LISSAGE SUR 10 POINTS (POUR ÉVITER LES ROUTES PARALLÈLES ET SAUTS GPS)
+      // ---------------------------------------------------------
+      _recentGpsBuffer.add(rawPos);
+      if (_recentGpsBuffer.length > 10) {
+        _recentGpsBuffer.removeAt(0); // On garde uniquement les 10 dernières secondes
+      }
+
+      double sumLat = 0;
+      double sumLng = 0;
+      for (var p in _recentGpsBuffer) {
+        sumLat += p.latitude;
+        sumLng += p.longitude;
+      }
+
+      // Point ultra-stable, insensible aux sauts du GPS
+      LatLng smoothedPos = LatLng(sumLat / _recentGpsBuffer.length, sumLng / _recentGpsBuffer.length);
+
+      // ---------------------------------------------------------
+      // 🚀 2. SNAPPING ET FILTRE AVEC POSITION LISSÉE ET LE CAP (HEADING)
+      // ---------------------------------------------------------
+      final snapResult = homeController._getNearestRoutePoint(smoothedPos, currentHeading: position.heading);
+      double distanceFromRoute = snapResult.distance;
+
+      // On s'accroche à la route si on est à moins de 45m
+      LatLng snappedPos = distanceFromRoute < 45.0 ? snapResult.point : smoothedPos;
+
+      // On donne la position snapée pour l'alignement visuel fluide
+      homeController.kinematicFilter
+          .updateRealPosition(position, snappedPos: snappedPos);
 
       // ─── GARDE-FOU: Ne pas exécuter si on cherche déjà une route ───
       if (homeController.gettingRoute.value) return;
@@ -2250,12 +2448,8 @@ class NavigationController extends GetxController {
       final now = DateTime.now();
       speedController.updateSpeed(position);
 
-      LatLng rawPos = LatLng(position.latitude, position.longitude);
-      // CORRIGÉ : On utilise la vitesse lissée du SpeedController
       double currentSpeedKmh = speedController.currentSpeed.value;
       if (currentSpeedKmh < 0) currentSpeedKmh = 0;
-
-      // CORRIGÉ : On enregistre la vitesse pour le récapitulatif final (tous les modes)
       _speedHistory.add(currentSpeedKmh);
 
       if (homeController.currentTravelMode.value != TravelMode.transit &&
@@ -2264,65 +2458,69 @@ class NavigationController extends GetxController {
         if (stopNow) return;
       }
 
-      final snapResult = homeController._getNearestRoutePoint(rawPos);
-      LatLng snappedPos =
-          snapResult.distance < 30.0 ? snapResult.point : rawPos;
-      double distanceDeviation = snapResult.distance;
-
-      // Initialiser _lastOnRoutePosition au premier point GPS si pas encore init
+      // Initialiser _lastOnRoutePosition au premier point si pas encore init
       if (_lastOnRoutePosition == null) {
         _lastOnRoutePosition = snappedPos;
         _lastOnRouteTime = DateTime.now();
-        debugPrint(
-            "✅ Déviation: Point de référence initialisé à ${snappedPos.latitude}, ${snappedPos.longitude}");
       }
 
+      // ---------------------------------------------------------
+      // 🚀 3. LOGIQUE DE RECALCUL INTELLIGENTE (DÉVIATION CONFIRMÉE 10s)
+      // ---------------------------------------------------------
       var mode = homeController.currentTravelMode.value;
       bool isWalkOrBike =
           mode == TravelMode.walking || mode == TravelMode.bicycling;
 
       if (isWalkOrBike && !_isDeviationDialogOpen) {
-        if (distanceDeviation > 30.0) {
-          LatLng referencePoint = _lastOnRoutePosition ?? snappedPos;
-          double distSinceLastOnRoute = Geolocator.distanceBetween(
-            rawPos.latitude,
-            rawPos.longitude,
-            referencePoint.latitude,
-            referencePoint.longitude,
-          );
-          if (distSinceLastOnRoute > _cumulatedDeviationMeters) {
-            _cumulatedDeviationMeters = distSinceLastOnRoute;
+        bool isPremium = _activeUserProfile?.isVip ?? false;
+        double deviationLimitMeters = isPremium ? 6000.0 : 3000.0;
+
+        // On vérifie si la position LISSÉE est hors de la route
+        if (distanceFromRoute > 45.0) {
+          _consecutiveOffRouteCount++; // +1 seconde hors de la route
+
+          if (_lastOnRoutePosition != null) {
+            double distSinceLastOnRoute = Geolocator.distanceBetween(
+              smoothedPos.latitude,
+              smoothedPos.longitude,
+              _lastOnRoutePosition!.latitude,
+              _lastOnRoutePosition!.longitude,
+            );
+            if (distSinceLastOnRoute > _cumulatedDeviationMeters) {
+              _cumulatedDeviationMeters = distSinceLastOnRoute;
+            }
           }
         } else {
+          // Bien sur la route -> réinitialiser le compteur de déviation (effet GPS temporaire absorbé)
+          _consecutiveOffRouteCount = 0;
           _lastOnRoutePosition = snappedPos;
           _lastOnRouteTime = DateTime.now();
           _cumulatedDeviationMeters = 0.0;
         }
 
         // RÈGLE DE LA MORT SUBITE
-        if (_hasUsedManualRecalculate && _cumulatedDeviationMeters > 50.0) {
-          print("🚨 DEUXIÈME DÉVIATION DÉTECTÉE (> 50m). ARRÊT IMMÉDIAT.");
+        if (_hasUsedManualRecalculate && _consecutiveOffRouteCount > 8 && _cumulatedDeviationMeters > 50.0) {
+          print("🚨 DEUXIÈME DÉVIATION DÉTECTÉE. ARRÊT IMMÉDIAT.");
           _triggerDeviationFailure();
           return;
         }
 
-        bool isPremium = _activeUserProfile?.isVip ?? false;
-        double deviationLimitMeters = isPremium ? 6000.0 : 3000.0;
-        double autoRecalculateLimitMeters = isWalkOrBike ? 50.0 : 100.0;
-
-        if (_cumulatedDeviationMeters >= autoRecalculateLimitMeters &&
+        // RECALCUL AUTOMATIQUE : Seulement après 10 SECONDES consécutives d'écart avéré
+        if (_consecutiveOffRouteCount >= 10 &&
             !_isDeviationDialogOpen &&
             !_hasUsedManualRecalculate) {
           bool canAutoRecalculate = _lastAutoRecalculateTime == null ||
-              DateTime.now().difference(_lastAutoRecalculateTime!).inSeconds >=
-                  10;
+              DateTime.now().difference(_lastAutoRecalculateTime!).inSeconds >= 10;
 
           if (canAutoRecalculate) {
             print(
-                "🚨 DÉVIATION MAJEURE DÉTECTÉE : ${(_cumulatedDeviationMeters / 1000).toStringAsFixed(2)}km - RECALCUL AUTOMATIQUE");
+                "🚨 DÉVIATION CONFIRMÉE (10s) : RECALCUL DEPUIS LA MOYENNE GPS");
             _isDeviationDialogOpen = true;
-            _recalculateToLastOnRoutePoint(rawPos).then((_) {
+
+            // Utilisation de smoothedPos pour la recherche de la nouvelle route
+            _recalculateToLastOnRoutePoint(smoothedPos).then((_) {
               _isDeviationDialogOpen = false;
+              _consecutiveOffRouteCount = 0;
             }).catchError((e) {
               debugPrint("❌ Erreur recalcul déviation: $e");
               _isDeviationDialogOpen = false;
@@ -2334,13 +2532,13 @@ class NavigationController extends GetxController {
         if (_cumulatedDeviationMeters >= deviationLimitMeters &&
             !_hasUsedManualRecalculate) {
           _showDeviationPopup(
-              _cumulatedDeviationMeters, deviationLimitMeters, rawPos);
+              _cumulatedDeviationMeters, deviationLimitMeters, smoothedPos);
           return;
         }
       }
 
       homeController.updateRemainingDistanceAndTime(snappedPos);
-      _updateInstruction(rawPos);
+      _updateInstruction(smoothedPos);
       _logTripPosition(rawPos, currentSpeedKmh, position.heading);
 
       if (_targetBusStopLocation != null) {
@@ -2599,29 +2797,31 @@ class NavigationController extends GetxController {
 
     stopNavigation();
 
-    Get.dialog(
-      AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Row(children: [
-          Icon(Icons.cancel_outlined, color: Colors.red, size: 28),
-          SizedBox(width: 10),
-          Text("Trajet annulé", style: TextStyle(color: Colors.red)),
-        ]),
-        content: const Text(
-          "Vous avez quitté l'itinéraire de secours de plus de 50 mètres.\n\n"
-          "Pour des raisons d'équité vis-à-vis des autres utilisateurs, votre trajet a été définitivement annulé.",
-          style: TextStyle(fontSize: 14),
-        ),
-        actions: [
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-            onPressed: () => _closeGetDialog(),
-            child: const Text("Compris", style: TextStyle(color: Colors.white)),
+    Future.delayed(const Duration(milliseconds: 300), () {
+      Get.dialog(
+        AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: const Row(children: [
+            Icon(Icons.cancel_outlined, color: Colors.red, size: 28),
+            SizedBox(width: 10),
+            Text("Trajet annulé", style: TextStyle(color: Colors.red)),
+          ]),
+          content: const Text(
+            "Vous avez quitté l'itinéraire de secours de plus de 50 mètres.\n\n"
+            "Pour des raisons d'équité vis-à-vis des autres utilisateurs, votre trajet a été définitivement annulé.",
+            style: TextStyle(fontSize: 14),
           ),
-        ],
-      ),
-      barrierDismissible: false,
-    );
+          actions: [
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+              onPressed: () => _closeGetDialog(),
+              child: const Text("Compris", style: TextStyle(color: Colors.white)),
+            ),
+          ],
+        ),
+        barrierDismissible: false,
+      );
+    });
   }
 
   void _collectHighSpeedSample(double speed) {
@@ -2669,44 +2869,42 @@ class NavigationController extends GetxController {
 
   /// Déclenche l'annulation pour utilisation de voiture (triche grave)
   void _triggerCarDetected() {
-    // Guard anti-doublon
-    if (Get.isDialogOpen ?? false) return;
+    // On ferme d'abord toute autre fenêtre qui pourrait bloquer l'écran
+    _closeGetDialog();
 
-    // ── Firebase log de triche + notification ─────────────────────────────
-    _endTripLog(
-        status: 'cheat_detected', cheatReason: 'vehicle_speed_violation');
-    _showNotification(
-      '⚠️ Triche détectée',
-      'Vitesse de véhicule motorisé détectée. Trajet annulé.',
-      id: 2,
-    );
-    // ──────────────────────────────────────────────────────────────────────
-
+    // Firebase log de triche + notification
+    _endTripLog(status: 'cheat_detected', cheatReason: 'vehicle_speed_violation');
+    _showNotification('⚠️ Triche détectée', 'Vitesse de véhicule motorisé détectée. Trajet annulé.', id: 2);
+    
     stopNavigation();
     speedController.cheatStatus.value = CheatModeStatus.exceededSpeedCheating;
-    Get.dialog(
-      AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Row(children: [
-          Icon(Icons.directions_car, color: Colors.red, size: 28),
-          SizedBox(width: 10),
-          Text("Trajet annulé", style: TextStyle(color: Colors.red)),
-        ]),
-        content: const Text(
-          "Une vitesse compatible avec un véhicule motorisé a été détectée.\n\n"
-          "Le trajet a été annulé. Seuls la marche et le vélo sont autorisés pour gagner des Lames.",
-          style: TextStyle(fontSize: 14),
-        ),
-        actions: [
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-            onPressed: () => _closeGetDialog(),
-            child: const Text("Compris", style: TextStyle(color: Colors.white)),
+    
+    // On attend un instant pour éviter un conflit d'animation UI
+    Future.delayed(const Duration(milliseconds: 300), () {
+      Get.dialog(
+        AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: const Row(children: [
+            Icon(Icons.directions_car, color: Colors.red, size: 28),
+            SizedBox(width: 10),
+            Text("Trajet annulé", style: TextStyle(color: Colors.red)),
+          ]),
+          content: const Text(
+            "Une vitesse compatible avec un véhicule motorisé a été détectée.\n\n"
+            "Le trajet a été annulé. Seuls la marche et le vélo sont autorisés pour gagner des Lames.",
+            style: TextStyle(fontSize: 14),
           ),
-        ],
-      ),
-      barrierDismissible: false,
-    );
+          actions: [
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+              onPressed: () => _closeGetDialog(),
+              child: const Text("Compris", style: TextStyle(color: Colors.white)),
+            ),
+          ],
+        ),
+        barrierDismissible: false,
+      );
+    });
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -2849,16 +3047,14 @@ class NavigationController extends GetxController {
   }
 
   void _showStayChallengeCompletionDialog() {
-    if (Get.isDialogOpen ?? false) return;
-
+    _closeGetDialog(); // Sécurité nettoyage
     Get.dialog(
       AlertDialog(
         title: const Text('Défi terminé'),
-        content: const Text(
-            '🎉 Félicitations ! Vous avez validé votre défi de zone. Bravo !'),
+        content: const Text('🎉 Félicitations ! Vous avez validé votre défi de zone. Bravo !'),
         actions: [
           TextButton(
-            onPressed: () => Get.back(),
+            onPressed: () => _closeGetDialog(),
             child: const Text('OK'),
           ),
         ],
@@ -2868,8 +3064,7 @@ class NavigationController extends GetxController {
   }
 
   void _showCriticalModal(String title, String message) {
-    if (Get.isDialogOpen ?? false) return;
-
+    _closeGetDialog(); // Sécurité nettoyage
     Get.dialog(
       AlertDialog(
         title: Text(title),
@@ -3378,11 +3573,21 @@ class NavigationController extends GetxController {
   }
 
   void _closeGetDialog() {
+    // 1. Nettoyer les notifications/snackbars éventuels
     if (Get.isSnackbarOpen) {
-      Get.closeCurrentSnackbar();
+      Get.closeAllSnackbars();
     }
-    if (Get.isDialogOpen ?? false) {
-      Get.back();
+    
+    // 2. Forcer la fermeture du dialogue en utilisant le Navigator natif de Flutter
+    // Cela résout le bug où les boutons "Compris" ou "Annuler" ne fonctionnaient pas !
+    try {
+      if (Get.overlayContext != null) {
+        Navigator.of(Get.overlayContext!).pop();
+      } else {
+        Get.back();
+      }
+    } catch (e) {
+      debugPrint("Erreur fermeture pop-up forcée : $e");
     }
   }
 
@@ -6671,89 +6876,108 @@ Future<bool> _onIosBackground(ServiceInstance service) async {
   return true;
 }
 
+final talker = TalkerFlutter.init();
+
 void main() async {
-  // 1. Initialisation des bindings (Obligatoire avant tout appel natif)
-  WidgetsFlutterBinding.ensureInitialized();
+  runZonedGuarded(() async {
+    // 1. Initialisation des bindings (Obligatoire avant tout appel natif)
+    WidgetsFlutterBinding.ensureInitialized();
 
-  // Désactiver le téléchargement runtime des polices Google Fonts (évite l'erreur AssetManifest.json)
-  GoogleFonts.config.allowRuntimeFetching = true;
+    // Capture des crashs UI (Flutter)
+    FlutterError.onError =
+        (details) => talker.handle(details.exception, details.stack);
 
-  // --- CORRECTION CRITIQUE : Charger le fichier .env ---
-  try {
-    await dotenv.load(fileName: ".env");
-    debugPrint("✅ DotEnv chargé avec succès");
-  } catch (e) {
-    debugPrint(
-        "⚠️ Erreur chargement .env (Vérifiez qu'il est dans les assets) : $e");
-  }
-  // ----------------------------------------------------
+    // Désactiver le téléchargement runtime des polices Google Fonts (évite l'erreur AssetManifest.json)
+    GoogleFonts.config.allowRuntimeFetching = true;
 
-  // 2. Bloquer l'orientation portrait
-  await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
-
-  // 3. Initialiser Firebase
-  try {
-    await Firebase.initializeApp(
-      options: DefaultFirebaseOptions.currentPlatform,
-    );
-    debugPrint("✅ Firebase initialisé");
-  } catch (e) {
-    debugPrint("❌ Erreur Firebase : $e");
-  }
-
-  // 4. Initialiser la locale (fr_FR)
-  await initializeDateFormatting('fr_FR', null);
-
-  // 5. Initialisation STRIPE
-  try {
-    String? stripeKey = dotenv.env['STRIPE_PUBLISHABLE_KEY'];
-    if (stripeKey != null && stripeKey.isNotEmpty) {
-      Stripe.publishableKey = stripeKey;
-      await Stripe.instance.applySettings();
-      debugPrint("✅ Stripe initialisé");
-    } else {
-      debugPrint(
-          "⚠️ Clé STRIPE_PUBLISHABLE_KEY non configurée dans le fichier .env");
-    }
-  } catch (e) {
-    debugPrint("❌ Erreur Stripe : $e");
-  }
-
-  // 6. Vérification Sécurité (Root / Jailbreak)
-  // (Utilise votre constante globale définie plus haut)
-  if (ENABLE_SECURITY_CHECKS) {
+    // --- CORRECTION CRITIQUE : Charger le fichier .env ---
     try {
-      bool isJailBroken = await SafeDevice.isJailBroken;
-      if (isJailBroken) {
-        runApp(const SecurityBlockedScreen(
-            reason: "Appareil Rooté ou Jailbreaké détecté."));
-        return; // On arrête l'app ici
+      await dotenv.load(fileName: ".env");
+      talker.info("✅ DotEnv chargé avec succès");
+    } catch (e, st) {
+      talker.handle(e, st, "⚠️ Erreur chargement .env");
+    }
+
+    // 2. Bloquer l'orientation portrait
+    await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+
+    // 3. Initialiser Firebase
+    try {
+      await Firebase.initializeApp(
+        options: DefaultFirebaseOptions.currentPlatform,
+      );
+      talker.info("✅ Firebase initialisé");
+
+      // ==========================================
+      // AJOUT CRUCIAL : INITIALISATION APP CHECK
+      // ==========================================
+      await FirebaseAppCheck.instance.activate(
+        androidProvider: kDebugMode ? AndroidProvider.debug : AndroidProvider.playIntegrity,
+        appleProvider: kDebugMode ? AppleProvider.debug : AppleProvider.deviceCheck,
+      );
+      talker.info("✅ Firebase App Check activé");
+      // ==========================================
+
+    } catch (e, st) {
+      talker.handle(e, st, "❌ Erreur Firebase ou App Check");
+    }
+
+    // 4. Initialiser la locale (fr_FR)
+    await initializeDateFormatting('fr_FR', null);
+
+    // 5. Initialisation STRIPE
+    try {
+      String? stripeKey = dotenv.env['STRIPE_PUBLISHABLE_KEY'];
+      if (stripeKey != null && stripeKey.isNotEmpty) {
+        Stripe.publishableKey = stripeKey;
+        await Stripe.instance.applySettings();
+        talker.info("✅ Stripe initialisé");
+      } else {
+        talker.warning(
+            "⚠️ Clé STRIPE_PUBLISHABLE_KEY non configurée dans le fichier .env");
       }
-    } catch (e) {
-      debugPrint("Erreur check sécurité (ignorée) : $e");
+    } catch (e, st) {
+      talker.handle(e, st, "❌ Erreur Stripe");
     }
-  }
 
-  // 7. Injection des dépendances GetX
-  Get.put(HomeController());
-  Get.put(SpeedController());
-  Get.put(NavigationController());
-  Get.put(UserStatsController());
-  Get.put(LeaderboardController());
-  Get.put(MainTabController());
-
-  // 8. Démarrer le service de fond (détection domicile en arrière-plan)
-  if (!kIsWeb && (Platform.isAndroid || Platform.isIOS)) {
-    try {
-      await _initBackgroundService();
-      debugPrint("✅ Service background initialisé");
-    } catch (e) {
-      debugPrint("⚠️ Service background non démarré: $e");
+    // 6. Vérification Sécurité (Root / Jailbreak)
+    if (ENABLE_SECURITY_CHECKS) {
+      try {
+        bool isJailBroken = await SafeDevice.isJailBroken;
+        if (isJailBroken) {
+          runApp(const SecurityBlockedScreen(
+              reason: "Appareil Rooté ou Jailbreaké détecté."));
+          return; // On arrête l'app ici
+        }
+      } catch (e, st) {
+        talker.handle(e, st, "Erreur check sécurité (ignorée)");
+      }
     }
-  }
 
-  // 9. Lancement de l'application
-  runApp(EcoNavApp());
+    // 7. Injection des dépendances GetX
+    Get.put(HomeController());
+    Get.put(SpeedController());
+    Get.put(NavigationController());
+    Get.put(UserStatsController());
+    Get.put(LeaderboardController());
+    Get.put(MainTabController());
+
+    // 8. Démarrer le service de fond (détection domicile en arrière-plan)
+    if (!kIsWeb && (Platform.isAndroid || Platform.isIOS)) {
+      try {
+        await _initBackgroundService();
+        talker.info("✅ Service background initialisé");
+      } catch (e, st) {
+        talker.handle(e, st, "⚠️ Service background non démarré");
+      }
+    }
+
+    // 9. Lancement de l'application
+    runApp(EcoNavApp());
+  }, (Object error, StackTrace stack) {
+    // CAPTURE LES CRASHS GLOBAUX ICI
+    talker.handle(error, stack, 'Uncaught Exception / CRASH');
+  });
 }
 
 class EcoNavApp extends StatelessWidget {
@@ -6761,6 +6985,7 @@ class EcoNavApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return GetMaterialApp(
       title: 'EcoNav',
+      navigatorObservers: [TalkerRouteObserver(talker)],
       translations: AppTranslations(),
       locale: Get.deviceLocale,
       fallbackLocale: const Locale('fr', 'FR'),
@@ -7899,6 +8124,7 @@ class _MainScreenControllerState extends State<MainScreenController>
   }
 
   Future<void> _fetchEcoStores() async {
+    print("🔄 [MAIN] Récupération des magasins depuis Firestore...");
     try {
       final querySnapshot = await _firestore.collection('stores').get();
       if (mounted) {
@@ -7906,11 +8132,11 @@ class _MainScreenControllerState extends State<MainScreenController>
           _ecoStores = querySnapshot.docs
               .map((doc) => EcoStore.fromFirestore(doc))
               .toList();
-          print("Fetched ${_ecoStores.length} eco-stores.");
+          print("✅ [MAIN] Succès : ${_ecoStores.length} magasins récupérés.");
         });
       }
     } catch (e) {
-      print("Error fetching eco stores: $e");
+      print("🔴 [MAIN] ERREUR FIRESTORE (Magasins) : $e");
     }
   }
 
@@ -8749,19 +8975,26 @@ class _DefisScreenState extends State<DefisScreen> {
     super.dispose();
   }
 
-// Initialise la date de fin du cycle actuel
+  // Initialise la date de fin du cycle actuel
   Future<void> _initChallengeCycle() async {
-    final userDoc = await _firestore
-        .collection('user_stats')
-        .doc(widget.currentUserId)
-        .get();
-// Par défaut, une date passée pour forcer le refresh si pas de donnée
+    // Par défaut, une date passée pour forcer le refresh si pas de donnée
     DateTime lastRefresh = DateTime.now().subtract(const Duration(days: 30));
 
-    if (userDoc.exists &&
-        userDoc.data()!.containsKey('last_challenges_refresh')) {
-      lastRefresh =
-          (userDoc.data()!['last_challenges_refresh'] as Timestamp).toDate();
+    try {
+      final userDoc = await _firestore
+          .collection('user_stats')
+          .doc(widget.currentUserId)
+          .get();
+
+      if (userDoc.exists &&
+          userDoc.data() != null &&
+          userDoc.data()!.containsKey('last_challenges_refresh')) {
+        lastRefresh =
+            (userDoc.data()!['last_challenges_refresh'] as Timestamp).toDate();
+      }
+    } catch (e, stackTrace) {
+      print("⚠️ Erreur lors de la récupération de user_stats (Firebase): $e");
+      // On empêche le crash en utilisant la date par défaut
     }
 
     if (mounted) {
@@ -9314,7 +9547,10 @@ class _DefisScreenState extends State<DefisScreen> {
   }
 
   Future<void> _fetchLocalPoisAsChallenges({bool forceRefresh = false}) async {
-    if (_isLoadingLocalPois) return;
+    if (_isLoadingLocalPois) {
+      print("⚠️ [DÉFIS] Annulation: Chargement POI déjà en cours.");
+      return;
+    }
     if (!mounted) return;
 
     if (forceRefresh) {
@@ -9327,6 +9563,8 @@ class _DefisScreenState extends State<DefisScreen> {
       _isLoadingLocalPois = true;
       _localPoiError = null;
     });
+
+    print("🔄 [DÉFIS] Début de _fetchLocalPoisAsChallenges (forceRefresh: $forceRefresh)");
 
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -9397,7 +9635,8 @@ class _DefisScreenState extends State<DefisScreen> {
       // =====================================================================
       // 2. GÉNÉRATION DE NOUVEAUX DÉFIS VIA GOOGLE PLACES API
       // =====================================================================
-      Position position = await widget.homeController.getMyCurrentLocation();
+      print("📡 [DÉFIS] Appel à Google Places / Overpass...");
+      Position position = await widget.homeController.getMyCurrentLocation().timeout(const Duration(seconds: 5));
       final double lat =
           _customChallengeLocation?.latitude ?? position.latitude;
       final double lng =
@@ -9584,11 +9823,12 @@ class _DefisScreenState extends State<DefisScreen> {
         });
       }
     } catch (e) {
-      print("Erreur POI: $e");
+      print("🔴 [DÉFIS] ERREUR CRITIQUE POI: $e");
       if (mounted)
         setState(
             () => _localPoiError = "Impossible de charger les défis locaux.");
     } finally {
+      print("✅ [DÉFIS] Fin de _fetchLocalPoisAsChallenges. Désactivation du loader.");
       if (mounted) setState(() => _isLoadingLocalPois = false);
     }
   }
@@ -9850,6 +10090,21 @@ class _DefisScreenState extends State<DefisScreen> {
                   .orderBy('created_at', descending: true)
                   .snapshots(),
               builder: (context, challengeListSnapshot) {
+                // 🔴 AJOUT : GESTION DE L'ERREUR DE PERMISSION FIRESTORE
+                if (challengeListSnapshot.hasError) {
+                  print("🔴 ERREUR FIRESTORE (Défis) : ${challengeListSnapshot.error}");
+                  return Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(20.0),
+                      child: Text(
+                        "Erreur de base de données :\n${challengeListSnapshot.error}",
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(color: Colors.red, fontWeight: FontWeight.bold),
+                      ),
+                    ),
+                  );
+                }
+
                 // Loader initial si on attend Firebase ET les POI locaux
                 if (challengeListSnapshot.connectionState ==
                         ConnectionState.waiting &&
@@ -9870,6 +10125,11 @@ class _DefisScreenState extends State<DefisScreen> {
                         .where('user_id', isEqualTo: widget.currentUserId)
                         .snapshots(),
                     builder: (context, userProgressSnapshot) {
+                      // 🔴 AJOUT : GESTION ERREUR PROGRESSION
+                      if (userProgressSnapshot.hasError) {
+                        print("🔴 ERREUR FIRESTORE (Progression) : ${userProgressSnapshot.error}");
+                      }
+
                       // Création d'une Map pour accès rapide à la progression
                       final Map<String, DocumentSnapshot> userProgressMap = {};
                       if (userProgressSnapshot.hasData) {
@@ -12350,19 +12610,27 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
       return;
     }
 
-    int oldAdPoints = widget.userProfile.adPoints;
-    int newAdPoints = (oldAdPoints + 1).clamp(0, 50);
-    bool justUnlockedBoost = oldAdPoints < 10 && newAdPoints >= 10;
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (c) => const Center(child: CircularProgressIndicator()),
+    );
 
     try {
-      await _firestore.collection('users').doc(widget.userProfile.id).update({
-        'ad_points': newAdPoints,
-        'last_ad_point_decay_time': FieldValue.serverTimestamp(),
-      });
-      widget.onProfileModified();
+      // APPEL SÉCURISÉ AU SERVEUR
+      final callable = FirebaseFunctions.instance.httpsCallable('addAdPoint');
+      final result = await callable.call();
+
+      if (Get.isDialogOpen ?? false) Get.back(); // Ferme le loader
+
+      int newAdPoints = result.data['newAdPoints'];
+      bool justUnlockedBoost =
+          widget.userProfile.adPoints < 10 && newAdPoints >= 10;
+
+      widget.onProfileModified(); // Met à jour l'UI
+
       if (mounted) {
         if (justUnlockedBoost) {
-          // Notification spéciale quand on atteint 10 ADP
           ScaffoldMessenger.of(context).showSnackBar(SnackBar(
             content: Row(
               children: const [
@@ -12370,7 +12638,7 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
                 SizedBox(width: 8),
                 Expanded(
                   child: Text(
-                    "🎉 10 Ad Points atteints ! Multiplicateur x1.2 activé sur tous vos trajets !",
+                    "🎉 10 Ad Points atteints ! Multiplicateur x1.2 activé !",
                     style: TextStyle(fontWeight: FontWeight.bold),
                   ),
                 ),
@@ -12381,16 +12649,16 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
           ));
         } else {
           ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-            content: Text(
-                "+1 AD Point ! Vous en avez $newAdPoints/50.${newAdPoints < 10 ? ' (${10 - newAdPoints} avant le multiplicateur x1.2)' : ' ⚡ x1.2 actif !'}"),
+            content: Text("+1 AD Point ! Vous en avez $newAdPoints/50."),
             backgroundColor: primaryGreen,
           ));
         }
       }
     } catch (e) {
+      if (Get.isDialogOpen ?? false) Get.back();
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("Erreur: $e"), backgroundColor: Colors.red));
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text("Erreur serveur: $e"), backgroundColor: Colors.red));
       }
     }
   }
@@ -13193,42 +13461,33 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
                                 ? () async {
                                     setDialogState(() {
                                       _isClaimingReward = true;
-                                      _hasClaimedLocally = true;
+                                      _hasClaimedLocally =
+                                          true; // Empêche le spam visuel
                                     });
+
                                     try {
-                                      WriteBatch batch = _firestore.batch();
-                                      DocumentReference userRef = _firestore
-                                          .collection('users')
-                                          .doc(widget.userProfile.id);
-                                      batch.update(userRef, {
-                                        'lame_points': FieldValue.increment(1),
-                                        'total_lame_earned':
-                                            FieldValue.increment(1),
-                                        'last_daily_reward_collected_date':
-                                            Timestamp.now(),
-                                        'updated_at':
-                                            FieldValue.serverTimestamp()
-                                      });
+                                      // On appelle la fonction sécurisée qui existe DÉJÀ dans votre backend
+                                      final callable = FirebaseFunctions
+                                          .instance
+                                          .httpsCallable('claimDailyReward');
+                                      final result = await callable.call();
 
-                                      DocumentReference historyRef = userRef
-                                          .collection('lame_history')
-                                          .doc();
-                                      batch.set(historyRef, {
-                                        'amount': 1,
-                                        'source': 'Récompense Quotidienne',
-                                        'timestamp':
-                                            FieldValue.serverTimestamp(),
-                                      });
+                                      widget
+                                          .onProfileModified(); // Met à jour le profil dans l'UI
 
-                                      await batch.commit();
-
-                                      widget.onProfileModified();
                                       setDialogState(() {
                                         _isClaimingReward = false;
                                       });
-                                      _showSnackBar(
-                                          "Récompense récupérée (+1 Lame)!",
-                                          backgroundColor: primaryGreen);
+
+                                      if (result.data['updated'] == true) {
+                                        _showSnackBar(
+                                            "Récompense récupérée (+1 Lame)!",
+                                            backgroundColor: primaryGreen);
+                                      } else {
+                                        _showSnackBar(
+                                            "Déjà récupérée aujourd'hui !",
+                                            backgroundColor: Colors.orange);
+                                      }
                                     } catch (e) {
                                       setDialogState(() {
                                         _isClaimingReward = false;
@@ -15864,20 +16123,27 @@ class _StoresScreenState extends State<StoresScreen> {
   }
 
   Future<void> _initLocationAndData() async {
+    print("📍 [MAGASINS] Début de la recherche de localisation...");
     try {
+      // ⏱️ AJOUT : Un timeout de 5 secondes pour éviter le chargement infini si le GPS bloque
       Position p = await Geolocator.getCurrentPosition(
-          desiredAccuracy: LocationAccuracy.medium);
+          desiredAccuracy: LocationAccuracy.medium
+      ).timeout(const Duration(seconds: 5));
+      
       _userPosition = latlong.LatLng(p.latitude, p.longitude);
+      print("📍 [MAGASINS] Position trouvée : ${_userPosition!.latitude}, ${_userPosition!.longitude}");
+      
     } catch (e) {
-      print("Erreur localisation StoresScreen: $e");
-      _userPosition = widget.userProfile.homeAddressCoordinates ??
-          latlong.LatLng(45.75, 4.85);
+      print("🔴 [MAGASINS] Erreur ou Timeout localisation: $e");
+      // Fallback sur le domicile si le GPS échoue
+      _userPosition = widget.userProfile.homeAddressCoordinates ?? latlong.LatLng(45.75, 4.85);
     } finally {
       if (mounted) {
         setState(() {
           _isLoadingLoc = false;
         });
         _applySortAndFilter();
+        print("✅ [MAGASINS] Fin du chargement. Magasins affichés : ${_sortedStores.length}");
       }
     }
   }
@@ -16533,98 +16799,51 @@ class _StoreCardState extends State<StoreCard> {
   }
 
   Future<void> _watchAdForBoost() async {
-// 1. Simulation Visionnage Pub (remplacer par AdMob si nécessaire)
     showDialog(
       context: context,
       barrierDismissible: false,
       builder: (c) => const Center(child: CircularProgressIndicator()),
     );
+    // Simulation Visionnage Pub (remplacer par AdMob si nécessaire)
     await Future.delayed(const Duration(seconds: 2));
-    if (Get.isDialogOpen ?? false)
-      Get.back(); // Fermer loader de manière sécurisée
-
-// 2. Calcul du Gain "Intelligent"
-    bool userIsActuallyPremium = widget.userProfile.isVip;
-    bool storeHasBoostEnabled = widget.store.isPremiumAdBoostEnabled;
-
-// Logique demandée :
-// - Si StoreBoost ON et User Standard -> User devient Premium pour ce store
-// - Si StoreBoost ON et User Premium -> User devient Super Premium (x2)
-// - Si StoreBoost OFF : User garde son statut normal
-
-    bool effectivelyPremium = userIsActuallyPremium || storeHasBoostEnabled;
-    bool effectivelySuperPremium =
-        userIsActuallyPremium && storeHasBoostEnabled;
-
-// Gain de base pour une pub standard
-    double gain = 0.01;
-
-// Application des multiplicateurs
-    if (effectivelySuperPremium) {
-      gain = 0.04; // Super Premium (Double du Premium standard 0.02)
-    } else if (effectivelyPremium) {
-      gain = 0.02; // Premium Standard (Double du standard 0.01)
-    }
-
-// Gestion du mode "Spécial" (si le boost est déjà > 1.0)
-// Règle : Les gains explosent pour maintenir un haut niveau
-    if (_currentBoostVal >= 1.0) {
-      if (effectivelySuperPremium) {
-        gain = 0.8; // Enorme boost
-      } else if (effectivelyPremium) {
-        gain = 0.4;
-      } else {
-        gain = 0.2;
-      }
-    }
-
-    double newAmount = _currentBoostVal + gain;
-
-// Max Cap (Double du cashback de base du store, min 1.0)
-    double maxCap = widget.store.cashbackRate * 100.0;
-    if (maxCap < 1.0) maxCap = 1.0;
-
-    if (newAmount > maxCap) {
-      newAmount = maxCap;
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text("Maximum atteint ! Maintenez ce niveau.")));
-    } else {
-      String statusMsg = "";
-      if (effectivelySuperPremium)
-        statusMsg = " (SUPER PREMIUM !)";
-      else if (storeHasBoostEnabled && !userIsActuallyPremium)
-        statusMsg = " (Offert par le magasin)";
-
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content:
-              Text("Boost activé ! +${gain.toStringAsFixed(2)}%$statusMsg"),
-          backgroundColor:
-              effectivelySuperPremium ? Colors.amber[800] : Colors.green));
-    }
-
-// 3. Mise à jour Firestore (Map Specifique pour ce magasin)
-    Map<String, dynamic> updateData = {
-      'amount': newAmount,
-      'last_update': FieldValue.serverTimestamp(),
-    };
 
     try {
-// On utilise set avec merge pour créer l'entrée si elle n'existe pas sans écraser le reste
-      await FirebaseFirestore.instance
-          .collection('users')
-          .doc(widget.userProfile.id)
-          .set({
-        'store_boosts': {widget.store.id: updateData}
-      }, SetOptions(merge: true));
+      // APPEL SÉCURISÉ AU SERVEUR
+      final callable =
+          FirebaseFunctions.instance.httpsCallable('addStoreBoost');
+      final result = await callable.call({'storeId': widget.store.id});
 
-// 4. Update Local Immédiat pour l'UI
+      if (Get.isDialogOpen ?? false) Get.back(); // Ferme le loader
+
+      final data = result.data;
+      double newAmount = (data['newAmount'] as num).toDouble();
+      double gain = (data['gain'] as num).toDouble();
+      bool isMax = data['maxReached'] == true;
+      bool isSuper = data['effectivelySuperPremium'] == true;
+
+      // Update Local Immédiat pour l'UI
       setState(() {
         _localBoostAmount = newAmount;
         _localLastUpdate = DateTime.now();
       });
-      _recalcBoostDisplay(); // Met à jour le timer de perte
+      _recalcBoostDisplay();
+
+      if (isMax) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text("Maximum atteint ! Maintenez ce niveau."),
+            backgroundColor: Colors.orange));
+      } else {
+        String statusMsg = isSuper ? " (SUPER PREMIUM !)" : "";
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content:
+                Text("Boost activé ! +${gain.toStringAsFixed(2)}%$statusMsg"),
+            backgroundColor: isSuper ? Colors.amber[800] : Colors.green));
+      }
     } catch (e) {
+      if (Get.isDialogOpen ?? false) Get.back();
       print("Erreur sauvegarde boost: $e");
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text("Erreur serveur: $e"), backgroundColor: Colors.red));
     }
   }
 
@@ -17605,13 +17824,13 @@ class _StoreCardState extends State<StoreCard> {
       builder: (ctx) => AlertDialog(
         title: const Text("Montant non détecté"),
         content: Column(mainAxisSize: MainAxisSize.min, children: [
-          const Text("Saisissez le montant total de l'achat :"),
+          const Text("Saisissez le montant total de l'achat (maximum 10.00 € en saisie manuelle) :"),
           const SizedBox(height: 16),
           TextField(
             controller: ctrl,
             keyboardType: const TextInputType.numberWithOptions(decimal: true),
             decoration: const InputDecoration(
-              labelText: "Montant (€)",
+              labelText: "Montant (€) - Max 10.00 €",
               prefixIcon: Icon(Icons.euro),
               border: OutlineInputBorder(),
             ),
@@ -17625,6 +17844,12 @@ class _StoreCardState extends State<StoreCard> {
             onPressed: () {
               final v = double.tryParse(ctrl.text.replaceAll(',', '.'));
               if (v != null && v > 0) {
+                if (v > 10.0) {
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                      content: Text("La saisie manuelle est limitée à 10.00 € maximum par sécurité anti-triche."),
+                      backgroundColor: Colors.orange));
+                  return;
+                }
                 Navigator.pop(ctx);
                 _showCashbackPopup(v, rawText);
               }
@@ -17809,85 +18034,50 @@ class _StoreCardState extends State<StoreCard> {
 
   Future<void> _saveCashback(
       double amountSpent,
-      double cashbackAmount,
-      int lameBonus,
-      double rateApplied,
+      double _ignoreCashbackLocal, // Ignoré car calculé par le serveur
+      int _ignoreLameLocal, // Ignoré car calculé par le serveur
+      double _ignoreRateLocal, // Ignoré car calculé par le serveur
       String rawText,
-      String loyaltyTier) async {
+      String _ignoreTierLocal) async {
+    // Afficher un loader pendant la vérification serveur
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (c) => const Center(child: CircularProgressIndicator()),
+    );
+
     try {
-      final uid = widget.userProfile.id;
-      final storeId = widget.store.id;
-      final now = Timestamp.now();
-      final batch = FirebaseFirestore.instance.batch();
-
-      // 1. Historique cashback utilisateur
-      batch.set(
-        FirebaseFirestore.instance
-            .collection('users')
-            .doc(uid)
-            .collection('cashback_history')
-            .doc(),
-        {
-          'store_id': storeId,
-          'store_name': widget.store.name,
-          'amount_spent': amountSpent,
-          'cashback_amount': cashbackAmount,
-          'cashback_rate_applied': rateApplied,
-          'lame_points_earned': lameBonus,
-          'loyalty_tier_applied': loyaltyTier.isEmpty ? null : loyaltyTier,
-          'receipt_text_raw': rawText,
-          'timestamp': now,
-        },
-      );
-
-      // 2. Transaction dans le magasin (espace commerçant)
-      batch.set(
-        FirebaseFirestore.instance
-            .collection('stores')
-            .doc(storeId)
-            .collection('store_transactions')
-            .doc(),
-        {
-          'user_id': uid,
-          'username': widget.userProfile.username,
-          'amount_spent': amountSpent,
-          'cashback_given': cashbackAmount,
-          'rate_applied': rateApplied,
-          'loyalty_tier': loyaltyTier.isEmpty ? null : loyaltyTier,
-          'timestamp': now,
-        },
-      );
-
-      // 3. Stats globales magasin
-      batch.update(
-          FirebaseFirestore.instance.collection('stores').doc(storeId), {
-        'totalAmountSpentByUser': FieldValue.increment(amountSpent),
-        'totalCashbackGiven': FieldValue.increment(cashbackAmount),
+      // Appel au serveur
+      final callable =
+          FirebaseFunctions.instance.httpsCallable('claimCashback');
+      final result = await callable.call({
+        'storeId': widget.store.id,
+        'amountSpent': amountSpent,
+        'rawText': rawText,
       });
 
-      // 4. Fidélité utilisateur
-      batch.update(FirebaseFirestore.instance.collection('users').doc(uid), {
-        'loyalty_progress.$storeId.visits': FieldValue.increment(1),
-        'loyalty_progress.$storeId.spend': FieldValue.increment(amountSpent),
-      });
+      if (Get.isDialogOpen ?? false) Get.back(); // Fermer le loader
 
-      await batch.commit();
-
-      if (lameBonus > 0)
-        widget.onAddLame(lameBonus, source: "Cashback ${widget.store.name}");
+      // Récupérer les vrais gains calculés par le serveur
+      final data = result.data;
+      final cbAmount = (data['cashbackAmount'] as num).toDouble();
+      final lameBonus = (data['lameBonus'] as num).toInt();
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
           content: Text(
-              "✅ Cashback ${cashbackAmount.toStringAsFixed(2)}€ enregistré !${lameBonus > 0 ? ' +$lameBonus Lames' : ''}"),
+              "✅ Cashback ${cbAmount.toStringAsFixed(2)}€ validé !${lameBonus > 0 ? ' +$lameBonus Lames' : ''}"),
           backgroundColor: Colors.green,
           duration: const Duration(seconds: 4),
         ));
       }
     } catch (e) {
+      if (Get.isDialogOpen ?? false) Get.back();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Erreur: $e"), backgroundColor: Colors.red),
+          SnackBar(
+              content: Text("Erreur de validation: $e"),
+              backgroundColor: Colors.red),
         );
       }
     }
@@ -18678,6 +18868,18 @@ class ProfileBottomSheet extends StatelessWidget {
                 onTap: () {
                   Navigator.pop(ctx);
                   _deleteAccountGdpr(context);
+                },
+              ),
+              // AJOUT DU BOUTON POUR VOIR LES LOGS SUR LE TÉLÉPHONE
+              ListTile(
+                leading:
+                    const Icon(Icons.bug_report_rounded, color: Colors.purple),
+                title: const Text("Console de Debug & Crashs"),
+                subtitle: const Text("Voir les logs internes de l'application"),
+                onTap: () {
+                  Navigator.pop(ctx); // Ferme les settings
+                  Get.to(
+                      () => TalkerScreen(talker: talker)); // Ouvre la console
                 },
               ),
               ListTile(
@@ -20319,17 +20521,7 @@ class _RewardScreenState extends State<RewardScreen>
   Future<bool> _spendLamePoints(double amount, String offerIdContext,
       String offerTitleContext, String email,
       {bool isInstantApproval = false}) async {
-    final currentUser = FirebaseAuth.instance.currentUser;
-
-    // 1. Vérifications de base
-    if (currentUser == null) {
-      if (mounted)
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-            content: Text("Erreur: Utilisateur non connecté."),
-            backgroundColor: Colors.red));
-      return false;
-    }
-
+    // Vérification de base côté client
     if (widget.userProfile.lamePoints < amount) {
       if (mounted)
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
@@ -20338,47 +20530,19 @@ class _RewardScreenState extends State<RewardScreen>
       return false;
     }
 
-    final userRef = firestore.collection('users').doc(currentUser.uid);
-
-    // Création d'une nouvelle référence pour l'historique des demandes
-    final claimedOfferRef = firestore.collection('user_claimed_offers').doc();
-
     try {
-      await firestore.runTransaction((transaction) async {
-        // 2. Débiter les points de l'utilisateur
-        transaction
-            .update(userRef, {'lame_points': FieldValue.increment(-amount)});
-
-        // 3. Enregistrer la demande dans l'historique avec le statut
-        transaction.set(claimedOfferRef, {
-          'user_id': currentUser.uid,
-          'user_email_contact': email,
-          'reward_id': offerIdContext,
-          'details': {
-            'claimed_for_lame': amount,
-            'offer_title': offerTitleContext
-          },
-          'claimed_at': FieldValue.serverTimestamp(),
-
-          // --- AJOUT CLÉ POUR LE SUIVI ---
-          'status': isInstantApproval
-              ? 'approved'
-              : 'pending', // Dons = validé immédiatement, autres = en attente
-          // -----------------------------
-
-          // Champs pour l'envoi d'email (facultatif selon votre config backend)
-          'to': 'corentinparrel2@gmail.com',
-          'message': {
-            'subject': 'Nouvelle demande de récompense EcoNav !',
-            'text':
-                'L\'utilisateur $email a réclamé la récompense "$offerTitleContext" pour $amount Lames. ID Utilisateur: ${currentUser.uid}',
-            'html':
-                '<h1>Nouvelle Récompense Réclamée</h1><p><b>Utilisateur:</b> $email</p><p><b>Récompense:</b> $offerTitleContext</p><p><b>Coût:</b> $amount Lames</p><p><b>ID User:</b> ${currentUser.uid}</p>',
-          }
-        });
+      // APPEL SÉCURISÉ AU SERVEUR
+      final callable =
+          FirebaseFunctions.instance.httpsCallable('processDonation');
+      await callable.call({
+        'amount': amount,
+        'offerId': offerIdContext,
+        'offerTitle': offerTitleContext,
+        'email': email,
+        'isInstantApproval': isInstantApproval,
       });
 
-      // 4. Mettre à jour l'interface locale via le callback parent
+      // Mettre à jour l'interface locale via le callback parent
       await widget.onPurchase(amount.toInt());
       return true;
     } catch (error) {
@@ -20675,6 +20839,12 @@ class _RewardScreenState extends State<RewardScreen>
               MaterialPageRoute(
                   builder: (_) => CampaignDetailPage(offer: offer)))
           .then((_) => _fetchOffersFromFirestore());
+      return;
+    }
+
+    if (offer.offerType == OfferType.promoCode &&
+        offer.detailsJson?.containsKey('code') == true) {
+      _showPromoCodeDialog(offer.title, offer.detailsJson!['code']);
       return;
     }
 
@@ -22487,92 +22657,24 @@ class _CampaignDetailPageState extends State<CampaignDetailPage> {
                 );
 
                 try {
-                  await _firestore.runTransaction((transaction) async {
-                    final campaignRef =
-                        _firestore.collection('rewards').doc(widget.offer.id);
-                    final userRef =
-                        _firestore.collection('users').doc(currentUserId);
+                  final callable =
+                      FirebaseFunctions.instance.httpsCallable('processDonation');
+                  await callable.call({
+                    'amount': amount,
+                    'offerId': widget.offer.id,
+                    'offerTitle': "Don : ${widget.offer.title}",
+                    'email': currentUser.email ?? 'inconnu',
+                    'isInstantApproval': true,
+                  });
 
-                    // Lectures (doivent être faites avant les écritures)
-                    final campaignDoc = await transaction.get(campaignRef);
-                    final userDoc = await transaction.get(userRef);
+                  final userStatsProvider = Get.find<UserStatsController>();
+                  userStatsProvider.addLame(-amount.toDouble());
 
-                    if (!campaignDoc.exists || campaignDoc.data() == null) {
-                      throw Exception("Campagne non trouvée.");
-                    }
-                    if (!userDoc.exists || userDoc.data() == null) {
-                      throw Exception("Profil utilisateur introuvable.");
-                    }
-
-                    final currentCampaignDetails = campaignDoc
-                            .data()!['details_json'] as Map<String, dynamic>? ??
-                        {};
-
-                    // Vérification du solde lame_points
-                    final double currentLamePoints =
-                        (userDoc.data()!['lame_points'] as num?)?.toDouble() ??
-                            0.0;
-                    if (currentLamePoints < amount) {
-                      throw Exception(
-                          "Fonds insuffisants ($currentLamePoints Lames disponibles).");
-                    }
-
-                    // --- ECRITURES ---
-
-                    // 1. Mise à jour du solde utilisateur (lame_points)
-                    transaction.update(userRef, {
-                      'lame_points': FieldValue.increment(-amount.toDouble()),
-                      'updated_at': FieldValue.serverTimestamp(),
-                    });
-
-                    // Mise à jour locale (Provider) - Attention, c'est hors transaction mais nécessaire pour l'UI
-                    final userStatsProvider = Get.find<UserStatsController>();
-                    userStatsProvider.addLame(-amount.toDouble());
-
-                    // 2. Mise à jour de la campagne
-                    int newCurrentAmount =
-                        (currentCampaignDetails['current_amount_eco'] as num?)
-                                ?.toInt() ??
-                            0;
-                    newCurrentAmount += amount;
-                    int newDonors =
-                        (currentCampaignDetails['current_donors'] as num?)
-                                ?.toInt() ??
-                            0;
-                    newDonors++;
-
-                    currentCampaignDetails['current_amount_eco'] =
-                        newCurrentAmount;
-                    currentCampaignDetails['current_donors'] = newDonors;
-
-                    transaction.update(campaignRef, {
-                      'details_json': currentCampaignDetails,
-                      'updated_at': FieldValue.serverTimestamp(),
-                    });
-
-                    // 3. Enregistrement technique du don
-                    _firestore.collection('campaign_donations').add({
-                      'campaign_id': widget.offer.id,
-                      'user_id': currentUserId,
-                      'amount_eco': amount.toDouble(),
-                      'created_at': FieldValue.serverTimestamp(),
-                    });
-
-                    // 4. --- AJOUT POUR LA CLOCHE DE NOTIFICATION ---
-                    final notificationRef =
-                        _firestore.collection('user_claimed_offers').doc();
-                    transaction.set(notificationRef, {
-                      'user_id': currentUserId,
-                      'reward_id': widget.offer.id,
-                      'details': {
-                        'offer_title': "Don : ${widget.offer.title}",
-                        'claimed_for_lame': amount.toDouble(),
-                      },
-                      'claimed_at': FieldValue.serverTimestamp(),
-                      'status':
-                          'approved', // Un don est validé immédiatement (Reçu)
-                    });
-                    // ------------------------------------------------
+                  _firestore.collection('campaign_donations').add({
+                    'campaign_id': widget.offer.id,
+                    'user_id': currentUserId,
+                    'amount_eco': amount.toDouble(),
+                    'created_at': FieldValue.serverTimestamp(),
                   });
 
                   if (mounted) {
@@ -22587,11 +22689,10 @@ class _CampaignDetailPageState extends State<CampaignDetailPage> {
                   }
                 } catch (e) {
                   if (mounted) {
-                    Navigator.of(context).pop();
-                    print("Erreur de transaction Firestore (donation): $e");
+                    Navigator.of(context).pop(); // Fermer le loader
+                    print("Erreur don campagne: $e");
                     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                        content:
-                            Text("Erreur : ${e.toString().split("\n").first}"),
+                        content: Text("Erreur lors du don: ${e.toString().split("\n").first}"),
                         backgroundColor: Colors.red));
                   }
                 }
@@ -23011,74 +23112,228 @@ class _NotificationHistorySheetState extends State<NotificationHistorySheet> {
 }
 
 // ===========================================================================
-// 🚀 FILTRE DE PRÉDICTION KINÉMATIQUE (Dead Reckoning + Lissage)
+// 🚀 FILTRE KINÉMATIQUE V3 : VERROU D'INDEX & SUIVI STRICT DES VIRAGES
 // ===========================================================================
 class KinematicFilter {
-  LatLng? simulatedPos;
+  LatLng? simulatedPos; // La Flèche VISIBLE
+  LatLng? targetPos;    // Le Point C (Déduction physique)
+
   Position? lastRealPos;
+  Position? previousRealPos;
   DateTime? _lastPredictTime;
 
-  void updateRealPosition(Position realPos) {
-    if (simulatedPos == null) {
-      simulatedPos = LatLng(realPos.latitude, realPos.longitude);
-    } else {
-      // LISSAGE ANTI-SAUT : On fusionne doucement l'ancienne position avec la nouvelle
-      // (Lerp 40%) pour que la voiture glisse vers sa vraie position sans se téléporter.
-      simulatedPos = _lerpPosition(
-        simulatedPos!,
-        LatLng(realPos.latitude, realPos.longitude),
-        0.4,
-      );
-    }
-    lastRealPos = realPos;
-    _lastPredictTime = DateTime.now();
+  List<LatLng> currentRoute = [];
+  int _lastRouteIndex = 0; // 🛑 VERROU SÉQUENTIEL : Empêche de sauter sur les voies parallèles
+
+  double _calculatedSpeedMps = 0.0; 
+  double _acceleration = 0.0;        
+
+  void updateRoute(List<LatLng> route) {
+    currentRoute = route;
+    _lastRouteIndex = 0; // Réinitialisation au début de l'itinéraire
   }
 
-  LatLng? predictNextPosition() {
-    if (lastRealPos == null || simulatedPos == null || _lastPredictTime == null)
-      return null;
-
+  void updateRealPosition(Position currentPos, {LatLng? snappedPos}) {
     DateTime now = DateTime.now();
-    int msPassed = now.difference(_lastPredictTime!).inMilliseconds;
-    _lastPredictTime = now; // Reset du chrono pour la prochaine frame
+    LatLng pointB = snappedPos ?? LatLng(currentPos.latitude, currentPos.longitude);
 
-    // --- CORRECTION CRITIQUE ANTI-DÉRIVE ---
-    // Si on n'a pas reçu de "vraie" position GPS depuis plus de 3 secondes,
-    // on considère que l'utilisateur s'est arrêté ou a perdu le signal. On coupe le moteur.
-    if (now.difference(lastRealPos!.timestamp).inSeconds > 3) {
-      return simulatedPos; // La flèche s'arrête net.
+    double vInst = currentPos.speed; 
+    double vAvg = 0.0;               
+    double dtAB = 1.0;
+    double distAB = 0.0;
+
+    // 1. CALCUL DE LA VITESSE MOYENNE ET DISTANCE A -> B
+    if (previousRealPos != null) {
+      distAB = Geolocator.distanceBetween(
+        previousRealPos!.latitude, previousRealPos!.longitude,
+        currentPos.latitude, currentPos.longitude,
+      );
+      dtAB = currentPos.timestamp.difference(previousRealPos!.timestamp).inMilliseconds / 1000.0;
+      if (dtAB <= 0) dtAB = 1.0;
+      vAvg = distAB / dtAB;
     }
 
-    double speedMps = lastRealPos!.speed;
+    if (vInst < 0 || currentPos.speedAccuracy > 3.0) {
+      vInst = vAvg;
+    }
 
-    // Si on roule à moins de 2km/h, on s'arrête (pour ne pas dériver)
-    if (speedMps < 0.5) return simulatedPos;
+    // Filtre lissage piéton (< 10.8 km/h)
+    if (vInst < 3.0) {
+      vInst = (_calculatedSpeedMps * 0.65) + (vInst * 0.35);
+      if (distAB < 0.5 && vInst < 1.2) {
+        vInst = 0.0;
+        vAvg = 0.0;
+      }
+    }
 
-    // Distance = Vitesse * Temps
-    double distanceMeters = speedMps * (msPassed / 1000.0);
+    if (vInst < 0.10) vInst = 0.0;
+    if (vAvg < 0.10) vAvg = 0.0;
 
-    // On calcule le prochain point (tout droit selon le cap)
-    var newLocation = toolkit.SphericalUtil.computeOffset(
-      toolkit.LatLng(simulatedPos!.latitude, simulatedPos!.longitude),
-      distanceMeters,
-      lastRealPos!.heading,
-    );
+    // 2. ACCÉLÉRATION BRIDÉE
+    double accel = (dtAB > 0) ? (2.0 * (vInst - vAvg) / dtAB) : 0.0;
+    if (vInst < 2.5) {
+      accel = accel.clamp(-2.0, 1.2);
+    } else {
+      accel = accel.clamp(-9.0, 4.5);
+    }
 
-    simulatedPos = LatLng(newLocation.latitude, newLocation.longitude);
+    _calculatedSpeedMps = vInst;
+    _acceleration = accel;
+
+    // 3. PROJECTION DÉDUITE DU POINT C
+    double tLookahead = (vInst < 2.5) ? 0.6 : 1.0; 
+    double distanceBC = (vInst * tLookahead) + (0.5 * accel * tLookahead * tLookahead);
+    if (distanceBC < 0) distanceBC = 0.0;
+
+    if (accel < -0.5 && vInst > 0) {
+      double maxStoppingDistance = (vInst * vInst) / (2 * accel.abs());
+      if (distanceBC > maxStoppingDistance) {
+        distanceBC = maxStoppingDistance;
+      }
+    }
+
+    // 🛑 PROJECTION STRICTE SUR LE TRACÉ (Suivi des virages)
+    LatLng pointC = _advanceAlongRouteStrict(pointB, distanceBC, currentPos.heading);
+
+    targetPos = pointC;
+
+    if (simulatedPos == null) {
+      simulatedPos = pointB;
+    } else {
+      if (_isBehindSimulated(simulatedPos!, pointC, currentPos.heading)) {
+        simulatedPos = pointB; 
+      } else {
+        // Recadrage doux sans couper les virages
+        double lerpFactor = (_calculatedSpeedMps < 2.5) ? 0.10 : 0.25;
+        simulatedPos = _advanceAlongRouteStrict(simulatedPos!, Geolocator.distanceBetween(
+          simulatedPos!.latitude, simulatedPos!.longitude, pointB.latitude, pointB.longitude
+        ) * lerpFactor, currentPos.heading);
+      }
+    }
+
+    previousRealPos = lastRealPos;
+    lastRealPos = currentPos;
+    _lastPredictTime = now;
+  }
+
+  /// Animation 60 FPS qui suit les virages mètre par mètre sans couper les angles
+  LatLng? predictNextPosition() {
+    if (lastRealPos == null || simulatedPos == null || targetPos == null || _lastPredictTime == null) return null;
+
+    DateTime now = DateTime.now();
+    double dt = now.difference(_lastPredictTime!).inMilliseconds / 1000.0;
+    _lastPredictTime = now;
+
+    if (now.difference(lastRealPos!.timestamp).inSeconds > 3) {
+      _calculatedSpeedMps = 0.0;
+      return simulatedPos;
+    }
+
+    _calculatedSpeedMps += (_acceleration * dt);
+    if (_calculatedSpeedMps < 0) _calculatedSpeedMps = 0.0;
+
+    if (_calculatedSpeedMps > 0.03) {
+      double stepDistance = _calculatedSpeedMps * dt;
+
+      // 🛑 DÉPLACEMENT STRICT LE LONG DE LA POLYLINE (Ne coupe plus les virages !)
+      targetPos = _advanceAlongRouteStrict(targetPos!, stepDistance, lastRealPos!.heading);
+      simulatedPos = _advanceAlongRouteStrict(simulatedPos!, stepDistance, lastRealPos!.heading);
+    }
+
     return simulatedPos;
   }
 
-  // Interpolation Linéaire (Lerp) pour la fluidité
+  // --- 🛑 MOTEUR DE DÉPLACEMENT LE LONG DE LA POLYLINE (VIRAGES PARFAITS & VERROU D'INDEX) ---
+  LatLng _advanceAlongRouteStrict(LatLng startPos, double distanceMeters, double fallbackHeading) {
+    if (currentRoute.length < 2 || distanceMeters <= 0.0) {
+      return _computeOffsetLine(startPos, distanceMeters, fallbackHeading);
+    }
+
+    // 1. Recherche du segment le plus proche VERROUILLÉE autour de l'index actuel
+    int searchStart = _lastRouteIndex;
+    int searchEnd = (searchStart + 5).clamp(0, currentRoute.length - 1); // 🛑 Max 5 segments devant
+
+    int closestIndex = searchStart;
+    double minDistance = double.infinity;
+
+    for (int i = searchStart; i <= searchEnd; i++) {
+      if (i >= currentRoute.length - 1) break;
+      double d = Geolocator.distanceBetween(
+        startPos.latitude, startPos.longitude,
+        currentRoute[i].latitude, currentRoute[i].longitude,
+      );
+      if (d < minDistance) {
+        minDistance = d;
+        closestIndex = i;
+      }
+    }
+
+    // Mise à jour de l'index verrouillé (Progression uniquement vers l'avant)
+    _lastRouteIndex = closestIndex;
+
+    // 2. Avancement mètre par mètre en suivant CHAQUE SOMMET du virage
+    double distanceRemaining = distanceMeters;
+    LatLng currentPos = startPos;
+
+    for (int i = closestIndex; i < currentRoute.length - 1; i++) {
+      LatLng nextPoint = currentRoute[i + 1];
+      double distToNext = Geolocator.distanceBetween(
+        currentPos.latitude, currentPos.longitude,
+        nextPoint.latitude, nextPoint.longitude,
+      );
+
+      if (distanceRemaining <= distToNext) {
+        double fraction = distToNext > 0 ? (distanceRemaining / distToNext) : 0;
+        return _lerpPosition(currentPos, nextPoint, fraction);
+      } else {
+        distanceRemaining -= distToNext;
+        currentPos = nextPoint; // 🛑 Arrivé au sommet du virage, pivote vers le suivant !
+      }
+    }
+
+    return currentRoute.last;
+  }
+
+  bool _isBehindSimulated(LatLng currentSim, LatLng candidate, double heading) {
+    double bearingToCandidate = Geolocator.bearingBetween(
+      currentSim.latitude, currentSim.longitude,
+      candidate.latitude, candidate.longitude,
+    );
+    if (bearingToCandidate < 0) bearingToCandidate += 360;
+
+    double diff = (bearingToCandidate - heading).abs();
+    if (diff > 180) diff = 360 - diff;
+
+    return diff > 90.0;
+  }
+
   LatLng _lerpPosition(LatLng a, LatLng b, double t) {
+    if (t <= 0) return a;
+    if (t >= 1) return b;
     return LatLng(
       a.latitude + (b.latitude - a.latitude) * t,
       a.longitude + (b.longitude - a.longitude) * t,
     );
   }
 
+  LatLng _computeOffsetLine(LatLng from, double distance, double heading) {
+    var p = toolkit.SphericalUtil.computeOffset(
+      toolkit.LatLng(from.latitude, from.longitude),
+      distance,
+      heading,
+    );
+    return LatLng(p.latitude, p.longitude);
+  }
+
   void reset() {
     simulatedPos = null;
+    targetPos = null;
     lastRealPos = null;
+    previousRealPos = null;
     _lastPredictTime = null;
+    _calculatedSpeedMps = 0.0;
+    _acceleration = 0.0;
+    _lastRouteIndex = 0;
   }
 }
+

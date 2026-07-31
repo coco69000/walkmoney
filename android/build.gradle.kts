@@ -1,5 +1,5 @@
 buildscript {
-    val kotlinVersion = "1.9.22"
+    val kotlinVersion = "2.2.20"
 
     repositories {
         google()
@@ -7,7 +7,7 @@ buildscript {
     }
     dependencies {
         // Utilise la version stable si disponible, sinon garde la RC
-        classpath("com.android.tools.build:gradle:8.10.0")
+        classpath("com.android.tools.build:gradle:8.11.1")
         classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlinVersion")
     }
 
