@@ -369,8 +369,17 @@ class SpeedController extends GetxController {
     _lastPositionTime = DateTime.now();
 
     double speedInKmH = speedInMs * 3.6;
-// Lissage à l'arrêt
-    if (speedInKmH < 2.0) speedInKmH = 0.0;
+
+    // 🚀 SEUIL DYNAMIQUE SELON LE MODE
+    double minThreshold = 2.0; // Par défaut pour Voiture / Vélo / Bus
+    if (_currentExpectedTravelMode == TravelMode.walking) {
+      minThreshold =
+          0.5; // 0.5 km/h pour la marche lente (personnes âgées, pentes)
+    }
+
+    if (speedInKmH < minThreshold) {
+      speedInKmH = 0.0;
+    }
 
     currentSpeed.value = speedInKmH;
 
@@ -426,6 +435,7 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
   // Animation Fluide
   AnimationController? _movementController;
   double _lastBearing = 0;
+  double _smoothedCameraBearing = 0.0;
   LatLng? _currentAnimatedPos;
 
   // 🚀 VARIABLES FILTRE PRÉDICTIF 🚀
@@ -1262,6 +1272,12 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
     _movementController!.forward();
   }
 
+  /// Calcule une rotation d'angle fluide (LERP) sans saut lors du passage par le Nord (360° -> 0°)
+  double lerpAngle(double start, double end, double t) {
+    double diff = (end - start + 540) % 360 - 180;
+    return (start + diff * t + 360) % 360;
+  }
+
   // 🚀 LANCE LA BOUCLE D'ANIMATION (Synchronisée avec l'écran via VSync)
   void startFluidNavigation() {
     _navigationTicker?.dispose();
@@ -1272,42 +1288,60 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
         return;
       }
 
-      // 1. Le filtre devine l'avancée de la voiture (inclut Mode Tunnel & Buffer adaptatif)
+      // 1. Le filtre devine l'avancée de la voiture
       LatLng? predictedPos =
           kinematicFilter.predictNextPosition(polylineCoordinates);
 
       if (predictedPos != null && kinematicFilter.lastRealPos != null) {
-        // 🔋 ECONOMIE D'ÉNERGIE : Si le véhicule est à l'arrêt, on ne recalcule pas le rendu
-        if (kinematicFilter.calculatedSpeedMps < 0.1 &&
-            _currentAnimatedPos != null) {
-          double drift = Geolocator.distanceBetween(
-              predictedPos.latitude,
-              predictedPos.longitude,
+        // Cap par défaut = cap GPS
+        double targetBearing = kinematicFilter.lastRealPos!.heading;
+
+        // 🔋 CALCUL DU CAP PAR LA TRAJECTOIRE (Beaucoup plus fluide que le cap GPS)
+        if (_currentAnimatedPos != null) {
+          double distMoved = Geolocator.distanceBetween(
               _currentAnimatedPos!.latitude,
-              _currentAnimatedPos!.longitude);
-          if (drift < 0.5)
-            return; // On saute la frame, on ne consomme pas de CPU
+              _currentAnimatedPos!.longitude,
+              predictedPos.latitude,
+              predictedPos.longitude);
+
+          // Si la voiture avance (au moins 5cm par frame), on calcule le cap réel de déplacement
+          if (distMoved > 0.05) {
+            double pathBearing = Geolocator.bearingBetween(
+                _currentAnimatedPos!.latitude,
+                _currentAnimatedPos!.longitude,
+                predictedPos.latitude,
+                predictedPos.longitude);
+            if (pathBearing < 0) pathBearing += 360;
+            targetBearing = pathBearing;
+          }
         }
 
-        // 2. MAGIE DES VIRAGES : Aimant intelligent avec pénalité d'angle progressive
-        LatLng snappedPos =
-            snapToRoute(predictedPos, kinematicFilter.lastRealPos!.heading);
+        // 2. Aimant intelligent sur la route
+        LatLng snappedPos = snapToRoute(predictedPos, targetBearing);
 
-        // 3. Mise à jour de l'UI à l'écran
-        _updateDriverMarker(snappedPos, kinematicFilter.lastRealPos!.heading);
-        _updateDiagnosticMarkers(); // ✅ Redessiner les points de diagnostic à chaque frame
+        // 3. LISSAGE MAGIQUE DE LA CAMÉRA (LERP 8% par frame = rotation ultra fluide à 60 FPS)
+        if (_smoothedCameraBearing == 0.0) {
+          _smoothedCameraBearing = targetBearing;
+        } else {
+          _smoothedCameraBearing =
+              lerpAngle(_smoothedCameraBearing, targetBearing, 0.08);
+        }
 
-        // 4. On enregistre pour le recentrage
+        // 4. Mise à jour de l'UI et de l'icône véhicule
+        _updateDriverMarker(snappedPos, _smoothedCameraBearing);
+        _updateDiagnosticMarkers();
+
         _currentAnimatedPos = snappedPos;
-        _lastBearing = kinematicFilter.lastRealPos!.heading;
+        _lastBearing = _smoothedCameraBearing;
 
-        // 5. On fait avancer la caméra de façon ultra-fluide (60/120 FPS)
+        // 5. Mouvement de caméra fluide sans à-coups
         if (isNavigationCameraLocked.value && !isAnimating.value) {
           mapController.moveCamera(CameraUpdate.newCameraPosition(
               CameraPosition(
                   target: snappedPos,
                   zoom: 18.0,
-                  bearing: kinematicFilter.lastRealPos!.heading,
+                  bearing:
+                      _smoothedCameraBearing, // <-- Angle lissé appliqué ici
                   tilt: 50)));
         }
       }
@@ -1320,6 +1354,7 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
     _navigationTicker?.stop();
     _navigationTicker?.dispose();
     _navigationTicker = null;
+    _smoothedCameraBearing = 0.0; // <-- Réinitialisation
     kinematicFilter.reset();
     _clearDiagnosticMarkers(); // 🔍 Effacer les points de diagnostic
   }
@@ -2511,7 +2546,11 @@ class NavigationController extends GetxController {
       _lastGpsReceiveTime = receiveTime;
 
       // 🚀 2. DONNER LA VRAIE POSITION AU FILTRE !
-      homeController.kinematicFilter.updateRealPosition(position);
+      final currentMode = homeController.currentTravelMode.value;
+      bool isWalking = currentMode == TravelMode.walking ||
+          currentMode == Constants.modeWalking;
+      homeController.kinematicFilter
+          .updateRealPosition(position, isWalkingMode: isWalking);
 
       // 🔍 3. MISE À JOUR DES POINTS DE DIAGNOSTIC
       homeController._updateDiagnosticMarkers();
@@ -23703,7 +23742,7 @@ class KinematicFilter {
       : null; // 🟡 JAUNE
 
   /// Réception d'un nouveau point GPS réel (Intervalle ~1 seconde)
-  void updateRealPosition(Position rawPos) {
+  void updateRealPosition(Position rawPos, {bool isWalkingMode = false}) {
     // 1. Décalage de la chaîne d'historique GPS
     _previousPreviousRawGps = _previousRawGps;
     _previousRawGps = _currentRawGps;
@@ -23733,7 +23772,11 @@ class KinematicFilter {
       calculatedSpeedMps = (calculatedSpeedMps * 0.3) + (vInst * 0.7);
     }
 
-    if (calculatedSpeedMps < 0.4) calculatedSpeedMps = 0.0;
+    // 🚀 SEUIL DE MARCHE LENTE : 0.14 m/s ~= 0.5 km/h
+    double minSpeedMps = isWalkingMode ? 0.14 : 0.4;
+    if (calculatedSpeedMps < minSpeedMps) {
+      calculatedSpeedMps = 0.0;
+    }
 
     lastRealPos = rawPos;
     _lastGpsTime = DateTime.now();
@@ -23748,7 +23791,12 @@ class KinematicFilter {
 
   /// Appelée à chaque frame (60 / 120 FPS via le Ticker VSync)
   LatLng? predictNextPosition(List<LatLng> routePolyline) {
-    if (lastRealPos == null || simulatedPos == null) return null;
+    if (lastRealPos == null) return null;
+
+    // Première initialisation
+    if (simulatedPos == null) {
+      simulatedPos = LatLng(lastRealPos!.latitude, lastRealPos!.longitude);
+    }
 
     DateTime now = DateTime.now();
     double dt = now.difference(_lastPredictTime ?? now).inMilliseconds / 1000.0;
@@ -23757,78 +23805,57 @@ class KinematicFilter {
     // Normalisation de la frame (évite les sauts de temps au réveil)
     if (dt <= 0 || dt > 0.2) dt = 1.0 / 60.0;
 
-    double timeSinceGps = _lastGpsTime != null
-        ? now.difference(_lastGpsTime!).inMilliseconds / 1000.0
-        : 0.0;
+    // ──────────────────────────────────────────────────────────────
+    // 1. OÙ DOIT ÊTRE LA VOITURE DANS 0.5 SECONDE ? (Point Bleu)
+    // ──────────────────────────────────────────────────────────────
+    LatLng yellowPos = _currentRawGps != null
+        ? LatLng(_currentRawGps!.latitude, _currentRawGps!.longitude)
+        : LatLng(lastRealPos!.latitude, lastRealPos!.longitude);
 
-    double moveSpeed = calculatedSpeedMps;
+    int gpsIndex = _findForwardRouteIndex(yellowPos,
+        _currentRawGps?.heading ?? lastRealPos!.heading, routePolyline);
+
+    // On prédit la position future selon la vitesse (lookahead d'une demi-seconde)
+    double lookaheadDist = calculatedSpeedMps * 0.5;
+
+    _targetPos = _advanceForwardFromGps(
+      yellowPos,
+      lookaheadDist,
+      _currentRawGps?.heading ?? lastRealPos!.heading,
+      routePolyline,
+      gpsIndex,
+    );
 
     // ──────────────────────────────────────────────────────────────
-    // 1. CALCUL DE LA VITESSE CIBLE & EXTROPOLATION SANS FREINAGE
+    // 2. L'ÉLASTIQUE : LA FLÈCHE CHASSE LE POINT BLEU (SANS SAUTS)
     // ──────────────────────────────────────────────────────────────
-    if (calculatedSpeedMps > 0.3) {
-      LatLng yellowPos = _currentRawGps != null
-          ? LatLng(_currentRawGps!.latitude, _currentRawGps!.longitude)
-          : LatLng(lastRealPos!.latitude, lastRealPos!.longitude);
-
-      int gpsIndex = _findForwardRouteIndex(yellowPos,
-          _currentRawGps?.heading ?? lastRealPos!.heading, routePolyline);
-
-      // Le point BLEU est placé exactement 1.0 seconde devant le point GPS actuel
-      double lookaheadDist = math.max(calculatedSpeedMps * 1.0, 2.0);
-      _targetPos = _advanceForwardFromGps(
-        yellowPos,
-        lookaheadDist,
-        _currentRawGps?.heading ?? lastRealPos!.heading,
-        routePolyline,
-        gpsIndex,
+    if (_targetPos != null) {
+      double distError = Geolocator.distanceBetween(
+        simulatedPos!.latitude,
+        simulatedPos!.longitude,
+        _targetPos!.latitude,
+        _targetPos!.longitude,
       );
 
-      if (_targetPos != null) {
-        double distToTarget = Geolocator.distanceBetween(
-          simulatedPos!.latitude,
-          simulatedPos!.longitude,
-          _targetPos!.latitude,
-          _targetPos!.longitude,
-        );
+      // Si erreur massive (téléportation GPS > 100m), on coupe l'élastique et on téléporte
+      if (distError > 100.0) {
+        simulatedPos = _targetPos;
+      } else {
+        // La vitesse de l'élastique. Plus c'est haut, plus c'est réactif.
+        // 4.0 signifie qu'on rattrape 40% du retard en 1/10 de seconde = très fluide.
+        double chaseFactor = (4.0 * dt).clamp(0.01, 1.0);
 
-        // Si le GPS a moins d'1 seconde : On adapte la vitesse pour atteindre le point bleu à t=1.0s
-        if (timeSinceGps <= 1.0) {
-          double timeRemaining = math.max(0.05, 1.0 - timeSinceGps);
-          double requiredSpeed = distToTarget / timeRemaining;
+        // La flèche glisse vers le point Bleu (vers l'avant OU vers l'arrière !)
+        simulatedPos = _lerpPosition(simulatedPos!, _targetPos!, chaseFactor);
 
-          // Lissage de l'accélération pour éviter les à-coups brutaux
-          moveSpeed = math.min(requiredSpeed, calculatedSpeedMps * 1.8);
-        }
-        // Si le GPS a du retard (> 1.0s) : ON NE RALENTIT PAS !
-        // On continue d'avancer le long du tracé à vitesse nominale.
-        else {
-          moveSpeed = calculatedSpeedMps;
+        // On "colle" la flèche sur la route pour éviter qu'elle coupe par l'herbe pendant le retour en arrière
+        int simIndex = _findForwardRouteIndex(
+            simulatedPos!, lastRealPos!.heading, routePolyline);
+        if (simIndex >= 0 && simIndex < routePolyline.length - 1) {
+          simulatedPos = _projectOnSegment(simulatedPos!,
+              routePolyline[simIndex], routePolyline[simIndex + 1]);
         }
       }
-    } else {
-      // Si le véhicule est arrêté depuis plus de 2.5 secondes
-      if (_lastGpsTime != null &&
-          now.difference(_lastGpsTime!).inMilliseconds > 2500) {
-        return simulatedPos;
-      }
-    }
-
-    // ──────────────────────────────────────────────────────────────
-    // 2. DÉPLACEMENT EFFECTIF LE LONG DU TRACÉ
-    // ──────────────────────────────────────────────────────────────
-    double stepDistance = moveSpeed * dt;
-
-    if (stepDistance > 0.0001) {
-      int simIndex = _findForwardRouteIndex(
-          simulatedPos!, lastRealPos!.heading, routePolyline);
-      simulatedPos = _advanceForwardFromGps(
-        simulatedPos!,
-        stepDistance,
-        lastRealPos!.heading,
-        routePolyline,
-        simIndex,
-      );
     }
 
     return simulatedPos;
@@ -23845,7 +23872,8 @@ class KinematicFilter {
     int bestIndex = math.max(0, lastRouteIndex);
     double minScore = double.infinity;
 
-    int searchStart = math.max(0, lastRouteIndex - 5);
+    // MODIFICATION ICI : On permet de chercher 15 points en arrière au cas où on a freiné brutalement
+    int searchStart = math.max(0, lastRouteIndex - 15);
     int searchEnd = math.min(polyline.length - 2, lastRouteIndex + 50);
 
     for (int i = searchStart; i <= searchEnd; i++) {
