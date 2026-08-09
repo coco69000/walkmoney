@@ -22,6 +22,8 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart'
+    hide Priority; // <--- AJOUT POUR LE TICKER VSYNC
 import 'package:flutter/services.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_html/flutter_html.dart' as html;
@@ -428,7 +430,19 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
 
   // 🚀 VARIABLES FILTRE PRÉDICTIF 🚀
   final KinematicFilter kinematicFilter = KinematicFilter();
-  Timer? _fluidTimer;
+  Ticker? _navigationTicker; // <--- REMPLACE Timer? _fluidTimer
+
+  // ── VARIABLE POUR AFFICHER/MASQUER LES POINTS (AJOUT) ──
+  var showDiagnosticPoints = true.obs;
+
+  void toggleDiagnosticPoints() {
+    showDiagnosticPoints.value = !showDiagnosticPoints.value;
+    if (!showDiagnosticPoints.value) {
+      _clearDiagnosticMarkers();
+    } else {
+      _updateDiagnosticMarkers();
+    }
+  }
 
   // IDs MapLibre
   static const String driverSourceId = "driver-source";
@@ -448,6 +462,16 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
 // NOUVEAU : IDs pour le rayon de l'arrêt de bus
   static const String radiusSourceId = "radius-source";
   static const String radiusLayerId = "radius-layer";
+
+  // IDs pour le diagnostic kinématique (A, B, C, Raw)
+  static const String diagPointASourceId = "diag-point-a-source";
+  static const String diagPointALayerId = "diag-point-a-layer";
+  static const String diagPointBSourceId = "diag-point-b-source";
+  static const String diagPointBLayerId = "diag-point-b-layer";
+  static const String diagPointCSourceId = "diag-point-c-source";
+  static const String diagPointCLayerId = "diag-point-c-layer";
+  static const String diagRawSourceId = "diag-raw-source";
+  static const String diagRawLayerId = "diag-raw-layer";
   CameraPosition initialCameraPosition = const CameraPosition(
     target: LatLng(48.8566, 2.3522),
     zoom: 14.0,
@@ -768,6 +792,87 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
                 iconIgnorePlacement: true));
       } catch (e) {
         debugPrint("⚠️ Layer $driverLayerId: $e");
+      }
+
+      // ── POINTS DE DIAGNOSTIC ──
+      // Point A (ROUGE - position GPS précédente)
+      try {
+        await mapController.addSource(
+            diagPointASourceId,
+            const GeojsonSourceProperties(
+                data: {"type": "FeatureCollection", "features": []}));
+        await mapController.addLayer(
+            diagPointASourceId,
+            diagPointALayerId,
+            const CircleLayerProperties(
+              circleColor: "#FF0000",
+              circleRadius: 7.0,
+              circleStrokeWidth: 2.0,
+              circleStrokeColor: "#FFFFFF",
+              circleOpacity: 0.9,
+            ));
+      } catch (e) {
+        debugPrint("⚠️ Diag Point A: $e");
+      }
+
+      // Point B (BLEU - position lissée/snappée actuelle)
+      try {
+        await mapController.addSource(
+            diagPointBSourceId,
+            const GeojsonSourceProperties(
+                data: {"type": "FeatureCollection", "features": []}));
+        await mapController.addLayer(
+            diagPointBSourceId,
+            diagPointBLayerId,
+            const CircleLayerProperties(
+              circleColor: "#2196F3",
+              circleRadius: 7.0,
+              circleStrokeWidth: 2.0,
+              circleStrokeColor: "#FFFFFF",
+              circleOpacity: 0.9,
+            ));
+      } catch (e) {
+        debugPrint("⚠️ Diag Point B: $e");
+      }
+
+      // Point C (VERT - position future prédite)
+      try {
+        await mapController.addSource(
+            diagPointCSourceId,
+            const GeojsonSourceProperties(
+                data: {"type": "FeatureCollection", "features": []}));
+        await mapController.addLayer(
+            diagPointCSourceId,
+            diagPointCLayerId,
+            const CircleLayerProperties(
+              circleColor: "#4CAF50",
+              circleRadius: 7.0,
+              circleStrokeWidth: 2.0,
+              circleStrokeColor: "#FFFFFF",
+              circleOpacity: 0.9,
+            ));
+      } catch (e) {
+        debugPrint("⚠️ Diag Point C: $e");
+      }
+
+      // Position GPS brute (JAUNE)
+      try {
+        await mapController.addSource(
+            diagRawSourceId,
+            const GeojsonSourceProperties(
+                data: {"type": "FeatureCollection", "features": []}));
+        await mapController.addLayer(
+            diagRawSourceId,
+            diagRawLayerId,
+            const CircleLayerProperties(
+              circleColor: "#FFEB3B",
+              circleRadius: 6.0,
+              circleStrokeWidth: 2.0,
+              circleStrokeColor: "#000000",
+              circleOpacity: 0.85,
+            ));
+      } catch (e) {
+        debugPrint("⚠️ Diag Raw: $e");
       }
 
       startIdleTracking();
@@ -1157,28 +1262,46 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
     _movementController!.forward();
   }
 
-  // 🚀 LANCE LA BOUCLE D'ANIMATION 60 FPS
+  // 🚀 LANCE LA BOUCLE D'ANIMATION (Synchronisée avec l'écran via VSync)
   void startFluidNavigation() {
-    _fluidTimer?.cancel();
-    // 50 millisecondes = 20 FPS constants. Le marqueur ne s'arrêtera JAMAIS.
-    _fluidTimer = Timer.periodic(const Duration(milliseconds: 50), (timer) {
-      if (mapStatus.value != Constants.onDestination) return;
+    _navigationTicker?.dispose();
 
-      // 1. Le filtre devine l'avancée de la voiture
-      LatLng? predictedPos = kinematicFilter.predictNextPosition();
+    _navigationTicker = createTicker((Duration elapsed) {
+      if (mapStatus.value != Constants.onDestination) {
+        _navigationTicker?.stop();
+        return;
+      }
+
+      // 1. Le filtre devine l'avancée de la voiture (inclut Mode Tunnel & Buffer adaptatif)
+      LatLng? predictedPos =
+          kinematicFilter.predictNextPosition(polylineCoordinates);
 
       if (predictedPos != null && kinematicFilter.lastRealPos != null) {
-        // 2. MAGIE DES VIRAGES : On force le point à épouser la ligne bleue OSRM
-        LatLng snappedPos = snapToRoute(predictedPos);
+        // 🔋 ECONOMIE D'ÉNERGIE : Si le véhicule est à l'arrêt, on ne recalcule pas le rendu
+        if (kinematicFilter.calculatedSpeedMps < 0.1 &&
+            _currentAnimatedPos != null) {
+          double drift = Geolocator.distanceBetween(
+              predictedPos.latitude,
+              predictedPos.longitude,
+              _currentAnimatedPos!.latitude,
+              _currentAnimatedPos!.longitude);
+          if (drift < 0.5)
+            return; // On saute la frame, on ne consomme pas de CPU
+        }
+
+        // 2. MAGIE DES VIRAGES : Aimant intelligent avec pénalité d'angle progressive
+        LatLng snappedPos =
+            snapToRoute(predictedPos, kinematicFilter.lastRealPos!.heading);
 
         // 3. Mise à jour de l'UI à l'écran
         _updateDriverMarker(snappedPos, kinematicFilter.lastRealPos!.heading);
+        _updateDiagnosticMarkers(); // ✅ Redessiner les points de diagnostic à chaque frame
 
         // 4. On enregistre pour le recentrage
         _currentAnimatedPos = snappedPos;
         _lastBearing = kinematicFilter.lastRealPos!.heading;
 
-        // 5. On fait avancer la caméra
+        // 5. On fait avancer la caméra de façon ultra-fluide (60/120 FPS)
         if (isNavigationCameraLocked.value && !isAnimating.value) {
           mapController.moveCamera(CameraUpdate.newCameraPosition(
               CameraPosition(
@@ -1189,11 +1312,16 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
         }
       }
     });
+
+    _navigationTicker!.start();
   }
 
   void stopFluidNavigation() {
-    _fluidTimer?.cancel();
+    _navigationTicker?.stop();
+    _navigationTicker?.dispose();
+    _navigationTicker = null;
     kinematicFilter.reset();
+    _clearDiagnosticMarkers(); // 🔍 Effacer les points de diagnostic
   }
 
   Future<void> _updateDriverMarker(LatLng position, double heading) async {
@@ -1213,49 +1341,176 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
     await _setSafeGeoJsonSource(driverSourceId, feature);
   }
 
-  // --- LOGIQUE SNAPPING ---
-  // Contient le point le plus proche sur la route ainsi que la distance à ce point.
-  // Voir la classe `_RouteSnapResult` déclarée au niveau du fichier.
-  _RouteSnapResult _getNearestRoutePoint(LatLng gpsPos) {
+  /// Met à jour les 4 points de diagnostic kinématique sur la carte
+  Future<void> _updateDiagnosticMarkers() async {
+    // Si l'affichage est désactivé, on ne dessine rien !
+    if (!showDiagnosticPoints.value) return;
+
+    final kf = kinematicFilter;
+
+    // Point A - ROUGE
+    if (kf.pointA != null) {
+      await _setSafeGeoJsonSource(diagPointASourceId, {
+        "type": "FeatureCollection",
+        "features": [
+          {
+            "type": "Feature",
+            "geometry": {
+              "type": "Point",
+              "coordinates": [kf.pointA!.longitude, kf.pointA!.latitude]
+            },
+            "properties": {}
+          }
+        ]
+      });
+    }
+
+    // Point B - BLEU
+    if (kf.pointB != null) {
+      await _setSafeGeoJsonSource(diagPointBSourceId, {
+        "type": "FeatureCollection",
+        "features": [
+          {
+            "type": "Feature",
+            "geometry": {
+              "type": "Point",
+              "coordinates": [kf.pointB!.longitude, kf.pointB!.latitude]
+            },
+            "properties": {}
+          }
+        ]
+      });
+    }
+
+    // Point C - VERT
+    if (kf.pointC != null) {
+      await _setSafeGeoJsonSource(diagPointCSourceId, {
+        "type": "FeatureCollection",
+        "features": [
+          {
+            "type": "Feature",
+            "geometry": {
+              "type": "Point",
+              "coordinates": [kf.pointC!.longitude, kf.pointC!.latitude]
+            },
+            "properties": {}
+          }
+        ]
+      });
+    }
+
+    // Position GPS brute - JAUNE
+    if (kf.rawGpsPos != null) {
+      await _setSafeGeoJsonSource(diagRawSourceId, {
+        "type": "FeatureCollection",
+        "features": [
+          {
+            "type": "Feature",
+            "geometry": {
+              "type": "Point",
+              "coordinates": [kf.rawGpsPos!.longitude, kf.rawGpsPos!.latitude]
+            },
+            "properties": {}
+          }
+        ]
+      });
+    }
+  }
+
+  /// Efface tous les points de diagnostic
+  Future<void> _clearDiagnosticMarkers() async {
+    final empty = {"type": "FeatureCollection", "features": []};
+    await _setSafeGeoJsonSource(diagPointASourceId, empty);
+    await _setSafeGeoJsonSource(diagPointBSourceId, empty);
+    await _setSafeGeoJsonSource(diagPointCSourceId, empty);
+    await _setSafeGeoJsonSource(diagRawSourceId, empty);
+  }
+
+  // --- LOGIQUE SNAPPING ET PROJECTION EXACTE ---
+
+  _RouteSnapResult _getNearestRoutePoint(LatLng gpsPos, [double? headingGps]) {
     if (polylineCoordinates.isEmpty) return _RouteSnapResult(gpsPos, 0.0);
 
     LatLng closest = polylineCoordinates.first;
     double minDist = double.infinity;
 
-    // Optimisation : ne chercher que dans un rayon raisonnable ou sur un subset si la route est longue
-    // Ici version simple
-    for (int i = 0; i < polylineCoordinates.length - 1; i++) {
+    // Optimisation : Fenêtre de recherche basée sur l'index de route connu (anti-sauts sur voies parallèles)
+    int startIndex = 0;
+    int endIndex = polylineCoordinates.length - 1;
+    if (kinematicFilter.lastRouteIndex != -1) {
+      startIndex = kinematicFilter.lastRouteIndex;
+      endIndex = math.min(startIndex + 5, polylineCoordinates.length - 1);
+    }
+
+    int bestIndex = startIndex;
+
+    for (int i = startIndex; i < endIndex; i++) {
       LatLng p1 = polylineCoordinates[i];
       LatLng p2 = polylineCoordinates[i + 1];
-      LatLng proj = _project(gpsPos, p1, p2);
+      LatLng proj = _projectCorrected(gpsPos, p1, p2);
+
       double d = Geolocator.distanceBetween(
           gpsPos.latitude, gpsPos.longitude, proj.latitude, proj.longitude);
+
+      // Pénalité Continue d'Angle (Empêche l'aimant de coller sur des routes perpendiculaires)
+      if (headingGps != null) {
+        double segmentBearing = Geolocator.bearingBetween(
+            p1.latitude, p1.longitude, p2.latitude, p2.longitude);
+        if (segmentBearing < 0) segmentBearing += 360;
+
+        double diff = (segmentBearing - headingGps).abs();
+        if (diff > 180) diff = 360 - diff;
+
+        // Courbe Cosinus fluide pour la pénalité (0m si aligné, 100m si contre-sens)
+        double diffRad = diff * (math.pi / 180.0);
+        double penalty = 100.0 * ((1.0 - math.cos(diffRad)) / 2.0);
+        d += penalty;
+      }
+
       if (d < minDist) {
         minDist = d;
         closest = proj;
+        bestIndex = i;
       }
     }
 
-    return _RouteSnapResult(closest, minDist);
+    kinematicFilter.lastRouteIndex = bestIndex;
+
+    // Distance pure sans pénalité pour les calculs de déviation réels
+    double pureDist = Geolocator.distanceBetween(
+        gpsPos.latitude, gpsPos.longitude, closest.latitude, closest.longitude);
+
+    return _RouteSnapResult(closest, pureDist);
   }
 
-  /// Snap to the route only when the user is close enough.
-  /// If the user is far from the route, we keep the real GPS position so the marker shows the deviation.
-  LatLng snapToRoute(LatLng gpsPos) {
-    final snap = _getNearestRoutePoint(gpsPos);
-    return snap.distance < 30 ? snap.point : gpsPos;
+  LatLng snapToRoute(LatLng gpsPos, [double? headingGps]) {
+    final snap = _getNearestRoutePoint(gpsPos, headingGps);
+    return snap.distance < 45.0 ? snap.point : gpsPos; // Seuil de snap à 45m
   }
 
-  LatLng _project(LatLng p, LatLng a, LatLng b) {
-    double l2 = pow(a.latitude - b.latitude, 2).toDouble() +
-        pow(a.longitude - b.longitude, 2).toDouble();
+  // Projection Orthogonale Corrigée (Prend en compte la courbure de la Terre)
+  LatLng _projectCorrected(LatLng p, LatLng a, LatLng b) {
+    double latRad = (a.latitude + b.latitude) / 2.0 * (math.pi / 180.0);
+    double cosLat = math.cos(latRad);
+
+    double ax = a.longitude * cosLat;
+    double ay = a.latitude;
+    double bx = b.longitude * cosLat;
+    double by = b.latitude;
+    double px = p.longitude * cosLat;
+    double py = p.latitude;
+
+    double l2 =
+        math.pow(bx - ax, 2).toDouble() + math.pow(by - ay, 2).toDouble();
     if (l2 == 0.0) return a;
-    double t = ((p.latitude - a.latitude) * (b.latitude - a.latitude) +
-            (p.longitude - a.longitude) * (b.longitude - a.longitude)) /
-        l2;
-    t = max(0, min(1, t));
-    return LatLng(a.latitude + t * (b.latitude - a.latitude),
-        a.longitude + t * (b.longitude - a.longitude));
+
+    double t = ((px - ax) * (bx - ax) + (py - ay) * (by - ay)) / l2;
+    t = math.max(0.0, math.min(1.0, t));
+
+    return LatLng(
+      a.latitude + t * (b.latitude - a.latitude),
+      a.longitude + t * (b.longitude - a.longitude),
+    );
   }
 
   // --- GESTION ANTI-SPAM DES PERMISSIONS GPS ---
@@ -1668,6 +1923,12 @@ class NavigationController extends GetxController {
   StreamSubscription<Position>? independentStayStream;
   Timer? independentStayTimer;
   StreamSubscription<Position>? positionStream;
+
+  // ── VARIABLES DIAGNOSTIC (AJOUT) ──
+  var timeBetweenGpsMs = 0.obs; // Temps écoulé depuis le dernier point GPS
+  var gpsProcessingMs = 0.obs; // Temps que met le code à s'exécuter
+  DateTime? _lastGpsReceiveTime;
+
 // ── VARIABLES DÉVIATION DE ROUTE ──────────────────────────────────────────
   double _cumulatedDeviationMeters = 0.0;
   LatLng? _lastOnRoutePosition;
@@ -2241,8 +2502,19 @@ class NavigationController extends GetxController {
 
     positionStream = Geolocator.getPositionStream(locationSettings: settings)
         .listen((Position position) {
-      // 🚀 1. DONNER LA VRAIE POSITION AU FILTRE !
+      // ⏱️ 1. DÉBUT DU CHRONO : Réception du GPS
+      final receiveTime = DateTime.now();
+      if (_lastGpsReceiveTime != null) {
+        timeBetweenGpsMs.value =
+            receiveTime.difference(_lastGpsReceiveTime!).inMilliseconds;
+      }
+      _lastGpsReceiveTime = receiveTime;
+
+      // 🚀 2. DONNER LA VRAIE POSITION AU FILTRE !
       homeController.kinematicFilter.updateRealPosition(position);
+
+      // 🔍 3. MISE À JOUR DES POINTS DE DIAGNOSTIC
+      homeController._updateDiagnosticMarkers();
 
       // ─── GARDE-FOU: Ne pas exécuter si on cherche déjà une route ───
       if (homeController.gettingRoute.value) return;
@@ -2264,7 +2536,8 @@ class NavigationController extends GetxController {
         if (stopNow) return;
       }
 
-      final snapResult = homeController._getNearestRoutePoint(rawPos);
+      final snapResult =
+          homeController._getNearestRoutePoint(rawPos, position.heading);
       LatLng snappedPos =
           snapResult.distance < 30.0 ? snapResult.point : rawPos;
       double distanceDeviation = snapResult.distance;
@@ -2465,6 +2738,10 @@ class NavigationController extends GetxController {
       _lastPositionTime = now;
       _lastSnappedPos = snappedPos;
       _checkRouteLogic(rawPos, snappedPos);
+
+      // ⏱️ 4. FIN DU CHRONO : Temps de traitement du code
+      final finishTime = DateTime.now();
+      gpsProcessingMs.value = finishTime.difference(receiveTime).inMilliseconds;
     });
   }
 
@@ -3687,6 +3964,7 @@ class NavigationController extends GetxController {
 
   void stopNavigation({bool keepChallengeCallbacks = false}) {
     positionStream?.cancel();
+    _lastGpsReceiveTime = null;
     homeController.stopFluidNavigation();
     _lastPositionTime = null;
     _lastSnappedPos = null;
@@ -3962,13 +4240,13 @@ enum TransitLegPhase { BeforeBoarding, Onboard }
 class SpeedometerDisplay extends StatelessWidget {
   final SpeedController speedController = Get.find();
   final HomeController homeController = Get.find();
+  final NavigationController navigationController = Get.find();
 
   SpeedometerDisplay({Key? key}) : super(key: key);
 
   @override
   Widget build(BuildContext context) {
     return Obx(() {
-// Afficher seulement en mode navigation
       if (homeController.mapStatus.value != Constants.onDestination) {
         return const SizedBox.shrink();
       }
@@ -3976,6 +4254,8 @@ class SpeedometerDisplay extends StatelessWidget {
       final speed = speedController.currentSpeed.value;
       final cheatStatus = speedController.cheatStatus.value;
       final cheatMessage = speedController.cheatWarningMessage.value;
+      final gpsIntervalMs = navigationController.timeBetweenGpsMs.value;
+      final gpsProcessingMs = navigationController.gpsProcessingMs.value;
 
       Color displayColor = Colors.black;
       if (cheatStatus == CheatModeStatus.exceededSpeedWarning)
@@ -3983,23 +4263,32 @@ class SpeedometerDisplay extends StatelessWidget {
       if (cheatStatus == CheatModeStatus.exceededSpeedCheating)
         displayColor = Colors.red;
 
+      // Couleur du GPS selon la qualité du signal
+      Color gpsColor = Colors.greenAccent;
+      if (gpsIntervalMs > 2000)
+        gpsColor = Colors.redAccent;
+      else if (gpsIntervalMs > 1200) gpsColor = Colors.orangeAccent;
+
       return Positioned(
         top: MediaQuery.of(context).padding.top + 120,
         left: 20,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            // ── VITESSE ──
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
               decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(15),
-                  boxShadow: [BoxShadow(color: Colors.black26, blurRadius: 8)],
-                  border: Border.all(
-                      color: displayColor == Colors.black
-                          ? Colors.transparent
-                          : displayColor,
-                      width: 2)),
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(15),
+                boxShadow: [BoxShadow(color: Colors.black26, blurRadius: 8)],
+                border: Border.all(
+                  color: displayColor == Colors.black
+                      ? Colors.transparent
+                      : displayColor,
+                  width: 2,
+                ),
+              ),
               child: Column(
                 children: [
                   Text(
@@ -4026,7 +4315,233 @@ class SpeedometerDisplay extends StatelessWidget {
                 color: displayColor,
                 child: Text(cheatMessage,
                     style: const TextStyle(color: Colors.white, fontSize: 10)),
-              )
+              ),
+            const SizedBox(height: 8),
+            // ── TEMPS GPS EN MILLISECONDES ──
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.8),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Colors.grey.withOpacity(0.4)),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    "⏱️ GPS CAPTATION",
+                    style: TextStyle(
+                      color: Colors.white70,
+                      fontSize: 9,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 0.5,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  // Intervalle entre 2 points GPS
+                  Row(
+                    children: [
+                      Icon(Icons.gps_fixed, color: gpsColor, size: 14),
+                      const SizedBox(width: 6),
+                      Text(
+                        "Intervalle: ",
+                        style: const TextStyle(
+                          color: Colors.white60,
+                          fontSize: 11,
+                        ),
+                      ),
+                      Text(
+                        "${gpsIntervalMs} ms",
+                        style: TextStyle(
+                          color: gpsColor,
+                          fontSize: 13,
+                          fontWeight: FontWeight.bold,
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 2),
+                  // Temps de traitement
+                  Row(
+                    children: [
+                      Icon(Icons.memory,
+                          color: gpsProcessingMs > 50
+                              ? Colors.orangeAccent
+                              : Colors.greenAccent,
+                          size: 14),
+                      const SizedBox(width: 6),
+                      Text(
+                        "Traitement: ",
+                        style: const TextStyle(
+                          color: Colors.white60,
+                          fontSize: 11,
+                        ),
+                      ),
+                      Text(
+                        "${gpsProcessingMs} ms",
+                        style: TextStyle(
+                          color: gpsProcessingMs > 50
+                              ? Colors.orangeAccent
+                              : Colors.greenAccent,
+                          fontSize: 13,
+                          fontWeight: FontWeight.bold,
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 2),
+                  // Fréquence théorique vs réelle
+                  Text(
+                    "Théorique: 1000 ms | Réel: ${gpsIntervalMs} ms",
+                    style: TextStyle(
+                      color: gpsIntervalMs <= 1100
+                          ? Colors.greenAccent
+                          : Colors.orangeAccent,
+                      fontSize: 9,
+                      fontStyle: FontStyle.italic,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      );
+    });
+  }
+}
+
+class DebugOverlayWidget extends StatelessWidget {
+  const DebugOverlayWidget({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    final nav = Get.find<NavigationController>();
+    final home = Get.find<HomeController>();
+
+    return Obx(() {
+      if (home.mapStatus.value != Constants.onDestination) {
+        return const SizedBox.shrink();
+      }
+
+      final pingMs = nav.timeBetweenGpsMs.value;
+      final procMs = nav.gpsProcessingMs.value;
+      final isVisible = home.showDiagnosticPoints.value;
+
+      // Calcul de la précision
+      String precisionLabel;
+      Color precisionColor;
+      if (pingMs <= 1050) {
+        precisionLabel = "EXCELLENT";
+        precisionColor = Colors.greenAccent;
+      } else if (pingMs <= 1500) {
+        precisionLabel = "BON";
+        precisionColor = Colors.lightGreenAccent;
+      } else if (pingMs <= 2500) {
+        precisionLabel = "MOYEN";
+        precisionColor = Colors.orangeAccent;
+      } else {
+        precisionLabel = "FAIBLE";
+        precisionColor = Colors.redAccent;
+      }
+
+      return Container(
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: Colors.black.withOpacity(0.85),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.grey.withOpacity(0.5)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.gps_fixed, color: Colors.white, size: 14),
+                const SizedBox(width: 6),
+                const Text(
+                  "GPS DIAGNOSTIC",
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            // Intervalle précis en ms
+            Text(
+              "📡 Intervalle GPS : ${pingMs} ms",
+              style: TextStyle(
+                color: precisionColor,
+                fontSize: 12,
+                fontWeight: FontWeight.bold,
+                fontFamily: 'monospace',
+              ),
+            ),
+            const SizedBox(height: 2),
+            // Temps de traitement
+            Text(
+              "⚙️ Traitement : ${procMs} ms",
+              style: TextStyle(
+                color: procMs > 50 ? Colors.orangeAccent : Colors.greenAccent,
+                fontSize: 11,
+                fontFamily: 'monospace',
+              ),
+            ),
+            const SizedBox(height: 2),
+            // Qualité du signal
+            Text(
+              "📶 Qualité : $precisionLabel",
+              style: TextStyle(
+                color: precisionColor,
+                fontSize: 10,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(height: 2),
+            // Écart par rapport à la théorie
+            Text(
+              "📐 Écart théorie : ${pingMs - 1000} ms",
+              style: TextStyle(
+                color: (pingMs - 1000).abs() > 200
+                    ? Colors.orangeAccent
+                    : Colors.greenAccent,
+                fontSize: 9,
+                fontStyle: FontStyle.italic,
+              ),
+            ),
+            const Divider(color: Colors.white24, height: 10),
+            // Toggle points diagnostic
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  isVisible ? "Points: VISIBLES" : "Points: MASQUÉS",
+                  style: const TextStyle(color: Colors.white, fontSize: 10),
+                ),
+                const SizedBox(width: 10),
+                GestureDetector(
+                  onTap: () => home.toggleDiagnosticPoints(),
+                  child: Container(
+                    padding: const EdgeInsets.all(4),
+                    decoration: BoxDecoration(
+                      color: isVisible ? Colors.blueAccent : Colors.grey[700],
+                      borderRadius: BorderRadius.circular(5),
+                    ),
+                    child: Icon(
+                      isVisible ? Icons.visibility : Icons.visibility_off,
+                      color: Colors.white,
+                      size: 16,
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ],
         ),
       );
@@ -4147,23 +4662,82 @@ class HomePage extends StatelessWidget {
                   bottom: 0, left: 0, right: 0, child: const BottomPanel())
               : Container()),
 
-// Panneau STOP pendant la navigation
-          Obx(() => home.mapStatus.value == Constants.onDestination
-              ? Positioned(
-                  bottom: 30,
-                  left: 20,
-                  right: 20,
-                  child: ElevatedButton(
-                    style: ElevatedButton.styleFrom(
+          // ── BOUTON STOP + TOGGLE POINTS GPS (pendant navigation) ──
+          Obx(() {
+            if (home.mapStatus.value != Constants.onDestination) {
+              return const SizedBox.shrink();
+            }
+            final showPoints = home.showDiagnosticPoints.value;
+            return Positioned(
+              bottom: 80,
+              left: 20,
+              right: 20,
+              child: Row(
+                children: [
+                  // ── BOUTON TOGGLE POINTS GPS ──
+                  Expanded(
+                    flex: 2,
+                    child: ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: showPoints
+                            ? Colors.blue.shade700
+                            : Colors.grey.shade700,
+                        padding: const EdgeInsets.symmetric(
+                            vertical: 14, horizontal: 8),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        elevation: 4,
+                      ),
+                      icon: Icon(
+                        showPoints ? Icons.visibility : Icons.visibility_off,
+                        color: Colors.white,
+                        size: 20,
+                      ),
+                      label: Text(
+                        showPoints ? "Points GPS" : "Points masqués",
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 11,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      onPressed: () {
+                        home.toggleDiagnosticPoints();
+                      },
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  // ── BOUTON STOP NAVIGATION ──
+                  Expanded(
+                    flex: 3,
+                    child: ElevatedButton(
+                      style: ElevatedButton.styleFrom(
                         backgroundColor: Colors.red,
-                        padding: const EdgeInsets.all(15)),
-                    child: const Text("STOP NAVIGATION",
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        elevation: 4,
+                      ),
+                      child: const Text(
+                        "STOP NAVIGATION",
                         style: TextStyle(
-                            color: Colors.white, fontWeight: FontWeight.bold)),
-                    onPressed: () =>
-                        Get.find<NavigationController>().stopNavigation(),
-                  ))
-              : Container()),
+                          color: Colors.white,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 14,
+                        ),
+                      ),
+                      onPressed: () =>
+                          Get.find<NavigationController>().stopNavigation(),
+                    ),
+                  ),
+                ],
+              ),
+            );
+          }),
         ],
       ),
     );
@@ -13458,6 +14032,88 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
                                     .stopIndependentStayTimer(),
                               )
                             ])));
+                  }),
+
+                  // ── BOUTON STOP + TOGGLE POINTS GPS (pendant navigation) ──
+                  Obx(() {
+                    if (homeController.mapStatus.value !=
+                        Constants.onDestination) {
+                      return const SizedBox.shrink();
+                    }
+                    final showPoints =
+                        homeController.showDiagnosticPoints.value;
+                    return Positioned(
+                      bottom: 80,
+                      left: 20,
+                      right: 20,
+                      child: Row(
+                        children: [
+                          // ── BOUTON TOGGLE POINTS GPS ──
+                          Expanded(
+                            flex: 2,
+                            child: ElevatedButton.icon(
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: showPoints
+                                    ? Colors.blue.shade700
+                                    : Colors.grey.shade700,
+                                padding: const EdgeInsets.symmetric(
+                                    vertical: 14, horizontal: 8),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                                elevation: 4,
+                              ),
+                              icon: Icon(
+                                showPoints
+                                    ? Icons.visibility
+                                    : Icons.visibility_off,
+                                color: Colors.white,
+                                size: 20,
+                              ),
+                              label: Text(
+                                showPoints ? "Points GPS" : "Points masqués",
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 11,
+                                ),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                              onPressed: () {
+                                homeController.toggleDiagnosticPoints();
+                              },
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          // ── BOUTON STOP NAVIGATION ──
+                          Expanded(
+                            flex: 3,
+                            child: ElevatedButton(
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Colors.red,
+                                padding:
+                                    const EdgeInsets.symmetric(vertical: 14),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                                elevation: 4,
+                              ),
+                              child: const Text(
+                                "STOP NAVIGATION",
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 14,
+                                ),
+                              ),
+                              onPressed: () =>
+                                  navigationController.stopNavigation(),
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
                   }),
 
                   // --- BARRE DU BAS (Info Route) ---
@@ -23011,64 +23667,297 @@ class _NotificationHistorySheetState extends State<NotificationHistorySheet> {
 }
 
 // ===========================================================================
-// 🚀 FILTRE DE PRÉDICTION KINÉMATIQUE (Dead Reckoning + Lissage)
+// 🚀 FILTRE KINÉMATIQUE FLUIDE (AVANCÉE CONTINUE SANS RALENTISSEMENT)
 // ===========================================================================
 class KinematicFilter {
-  LatLng? simulatedPos;
-  Position? lastRealPos;
+  // Points clés de rendu
+  LatLng? simulatedPos; // Position actuelle de la flèche à l'écran
+  Position? lastRealPos; // Dernière position GPS lissée
+
+  // Chaîne des positions GPS brutes pour le diagnostic
+  Position? _currentRawGps; // 🟡 JAUNE = GPS actuel
+  Position? _previousRawGps; // 🟢 VERT  = GPS t-1
+  Position? _previousPreviousRawGps; // 🔴 ROUGE = GPS t-2
+
+  LatLng? _targetPos; // 🔵 BLEU = Cible future à +1.0s
+  DateTime? _lastGpsTime;
   DateTime? _lastPredictTime;
 
-  void updateRealPosition(Position realPos) {
-    if (simulatedPos == null) {
-      simulatedPos = LatLng(realPos.latitude, realPos.longitude);
-    } else {
-      // LISSAGE ANTI-SAUT : On fusionne doucement l'ancienne position avec la nouvelle
-      // (Lerp 40%) pour que la voiture glisse vers sa vraie position sans se téléporter.
-      simulatedPos = _lerpPosition(
-        simulatedPos!,
-        LatLng(realPos.latitude, realPos.longitude),
-        0.4,
-      );
+  double calculatedSpeedMps = 0.0;
+  int lastRouteIndex = -1;
+
+  // ── GETTERS DIAGNOSTIC ──
+  LatLng? get pointA => _previousPreviousRawGps != null
+      ? LatLng(
+          _previousPreviousRawGps!.latitude, _previousPreviousRawGps!.longitude)
+      : null; // 🔴 ROUGE
+
+  LatLng? get pointB => _targetPos; // 🔵 BLEU (Cible visée à 1s)
+
+  LatLng? get pointC => _previousRawGps != null
+      ? LatLng(_previousRawGps!.latitude, _previousRawGps!.longitude)
+      : null; // 🟢 VERT
+
+  LatLng? get rawGpsPos => _currentRawGps != null
+      ? LatLng(_currentRawGps!.latitude, _currentRawGps!.longitude)
+      : null; // 🟡 JAUNE
+
+  /// Réception d'un nouveau point GPS réel (Intervalle ~1 seconde)
+  void updateRealPosition(Position rawPos) {
+    // 1. Décalage de la chaîne d'historique GPS
+    _previousPreviousRawGps = _previousRawGps;
+    _previousRawGps = _currentRawGps;
+    _currentRawGps = rawPos;
+
+    // 2. Calcul de la vitesse Doppler / secours distance
+    double vInst = rawPos.speed;
+    if (vInst <= 0 || vInst == 1.0) {
+      if (lastRealPos != null) {
+        double d = Geolocator.distanceBetween(
+          lastRealPos!.latitude,
+          lastRealPos!.longitude,
+          rawPos.latitude,
+          rawPos.longitude,
+        );
+        double dt =
+            rawPos.timestamp.difference(lastRealPos!.timestamp).inMilliseconds /
+                1000.0;
+        if (dt > 0.05) vInst = d / dt;
+      }
     }
-    lastRealPos = realPos;
-    _lastPredictTime = DateTime.now();
+
+    // Lissage progressif de la vitesse (EMA)
+    if (calculatedSpeedMps == 0.0) {
+      calculatedSpeedMps = vInst;
+    } else {
+      calculatedSpeedMps = (calculatedSpeedMps * 0.3) + (vInst * 0.7);
+    }
+
+    if (calculatedSpeedMps < 0.4) calculatedSpeedMps = 0.0;
+
+    lastRealPos = rawPos;
+    _lastGpsTime = DateTime.now();
+
+    // Première initialisation si la carte vient de s'ouvrir
+    if (simulatedPos == null) {
+      simulatedPos = LatLng(rawPos.latitude, rawPos.longitude);
+    }
+
+    _lastPredictTime ??= DateTime.now();
   }
 
-  LatLng? predictNextPosition() {
-    if (lastRealPos == null || simulatedPos == null || _lastPredictTime == null)
-      return null;
+  /// Appelée à chaque frame (60 / 120 FPS via le Ticker VSync)
+  LatLng? predictNextPosition(List<LatLng> routePolyline) {
+    if (lastRealPos == null || simulatedPos == null) return null;
 
     DateTime now = DateTime.now();
-    int msPassed = now.difference(_lastPredictTime!).inMilliseconds;
-    _lastPredictTime = now; // Reset du chrono pour la prochaine frame
+    double dt = now.difference(_lastPredictTime ?? now).inMilliseconds / 1000.0;
+    _lastPredictTime = now;
 
-    // --- CORRECTION CRITIQUE ANTI-DÉRIVE ---
-    // Si on n'a pas reçu de "vraie" position GPS depuis plus de 3 secondes,
-    // on considère que l'utilisateur s'est arrêté ou a perdu le signal. On coupe le moteur.
-    if (now.difference(lastRealPos!.timestamp).inSeconds > 3) {
-      return simulatedPos; // La flèche s'arrête net.
+    // Normalisation de la frame (évite les sauts de temps au réveil)
+    if (dt <= 0 || dt > 0.2) dt = 1.0 / 60.0;
+
+    double timeSinceGps = _lastGpsTime != null
+        ? now.difference(_lastGpsTime!).inMilliseconds / 1000.0
+        : 0.0;
+
+    double moveSpeed = calculatedSpeedMps;
+
+    // ──────────────────────────────────────────────────────────────
+    // 1. CALCUL DE LA VITESSE CIBLE & EXTROPOLATION SANS FREINAGE
+    // ──────────────────────────────────────────────────────────────
+    if (calculatedSpeedMps > 0.3) {
+      LatLng yellowPos = _currentRawGps != null
+          ? LatLng(_currentRawGps!.latitude, _currentRawGps!.longitude)
+          : LatLng(lastRealPos!.latitude, lastRealPos!.longitude);
+
+      int gpsIndex = _findForwardRouteIndex(yellowPos,
+          _currentRawGps?.heading ?? lastRealPos!.heading, routePolyline);
+
+      // Le point BLEU est placé exactement 1.0 seconde devant le point GPS actuel
+      double lookaheadDist = math.max(calculatedSpeedMps * 1.0, 2.0);
+      _targetPos = _advanceForwardFromGps(
+        yellowPos,
+        lookaheadDist,
+        _currentRawGps?.heading ?? lastRealPos!.heading,
+        routePolyline,
+        gpsIndex,
+      );
+
+      if (_targetPos != null) {
+        double distToTarget = Geolocator.distanceBetween(
+          simulatedPos!.latitude,
+          simulatedPos!.longitude,
+          _targetPos!.latitude,
+          _targetPos!.longitude,
+        );
+
+        // Si le GPS a moins d'1 seconde : On adapte la vitesse pour atteindre le point bleu à t=1.0s
+        if (timeSinceGps <= 1.0) {
+          double timeRemaining = math.max(0.05, 1.0 - timeSinceGps);
+          double requiredSpeed = distToTarget / timeRemaining;
+
+          // Lissage de l'accélération pour éviter les à-coups brutaux
+          moveSpeed = math.min(requiredSpeed, calculatedSpeedMps * 1.8);
+        }
+        // Si le GPS a du retard (> 1.0s) : ON NE RALENTIT PAS !
+        // On continue d'avancer le long du tracé à vitesse nominale.
+        else {
+          moveSpeed = calculatedSpeedMps;
+        }
+      }
+    } else {
+      // Si le véhicule est arrêté depuis plus de 2.5 secondes
+      if (_lastGpsTime != null &&
+          now.difference(_lastGpsTime!).inMilliseconds > 2500) {
+        return simulatedPos;
+      }
     }
 
-    double speedMps = lastRealPos!.speed;
+    // ──────────────────────────────────────────────────────────────
+    // 2. DÉPLACEMENT EFFECTIF LE LONG DU TRACÉ
+    // ──────────────────────────────────────────────────────────────
+    double stepDistance = moveSpeed * dt;
 
-    // Si on roule à moins de 2km/h, on s'arrête (pour ne pas dériver)
-    if (speedMps < 0.5) return simulatedPos;
+    if (stepDistance > 0.0001) {
+      int simIndex = _findForwardRouteIndex(
+          simulatedPos!, lastRealPos!.heading, routePolyline);
+      simulatedPos = _advanceForwardFromGps(
+        simulatedPos!,
+        stepDistance,
+        lastRealPos!.heading,
+        routePolyline,
+        simIndex,
+      );
+    }
 
-    // Distance = Vitesse * Temps
-    double distanceMeters = speedMps * (msPassed / 1000.0);
-
-    // On calcule le prochain point (tout droit selon le cap)
-    var newLocation = toolkit.SphericalUtil.computeOffset(
-      toolkit.LatLng(simulatedPos!.latitude, simulatedPos!.longitude),
-      distanceMeters,
-      lastRealPos!.heading,
-    );
-
-    simulatedPos = LatLng(newLocation.latitude, newLocation.longitude);
     return simulatedPos;
   }
 
-  // Interpolation Linéaire (Lerp) pour la fluidité
+  // ══════════════════════════════════════════════════════════════
+  // 🎯 Outils de projection géométrique sur polyline
+  // ══════════════════════════════════════════════════════════════
+
+  int _findForwardRouteIndex(
+      LatLng gpsPos, double heading, List<LatLng> polyline) {
+    if (polyline.length < 2) return 0;
+
+    int bestIndex = math.max(0, lastRouteIndex);
+    double minScore = double.infinity;
+
+    int searchStart = math.max(0, lastRouteIndex - 5);
+    int searchEnd = math.min(polyline.length - 2, lastRouteIndex + 50);
+
+    for (int i = searchStart; i <= searchEnd; i++) {
+      LatLng proj = _projectOnSegment(gpsPos, polyline[i], polyline[i + 1]);
+      double d = Geolocator.distanceBetween(
+          gpsPos.latitude, gpsPos.longitude, proj.latitude, proj.longitude);
+
+      double segBearing = Geolocator.bearingBetween(
+          polyline[i].latitude,
+          polyline[i].longitude,
+          polyline[i + 1].latitude,
+          polyline[i + 1].longitude);
+      double angleDiff = (segBearing - heading).abs();
+      if (angleDiff > 180) angleDiff = 360 - angleDiff;
+      double penalty = angleDiff > 90 ? 100.0 : 0.0;
+
+      double score = d + penalty;
+      if (score < minScore) {
+        minScore = score;
+        bestIndex = i;
+      }
+    }
+    lastRouteIndex = bestIndex;
+    return bestIndex;
+  }
+
+  LatLng _advanceForwardFromGps(
+    LatLng startPos,
+    double distanceMeters,
+    double heading,
+    List<LatLng> polyline,
+    int startIndex,
+  ) {
+    if (polyline.length < 2 ||
+        startIndex < 0 ||
+        startIndex >= polyline.length - 1) {
+      var newLoc = toolkit.SphericalUtil.computeOffset(
+        toolkit.LatLng(startPos.latitude, startPos.longitude),
+        distanceMeters,
+        heading,
+      );
+      return LatLng(newLoc.latitude, newLoc.longitude);
+    }
+
+    LatLng proj = _projectOnSegment(
+        startPos, polyline[startIndex], polyline[startIndex + 1]);
+
+    double remainingDistance = distanceMeters;
+    LatLng currentPos = proj;
+
+    for (int i = startIndex; i < polyline.length - 1; i++) {
+      LatLng pNext = polyline[i + 1];
+
+      double dSeg = Geolocator.distanceBetween(
+        currentPos.latitude,
+        currentPos.longitude,
+        pNext.latitude,
+        pNext.longitude,
+      );
+
+      if (dSeg < 0.001) continue;
+
+      if (remainingDistance <= dSeg) {
+        double t = remainingDistance / dSeg;
+        return _lerpPosition(currentPos, pNext, t);
+      } else {
+        remainingDistance -= dSeg;
+        currentPos = pNext;
+      }
+    }
+
+    if (remainingDistance > 0 && polyline.length >= 2) {
+      double lastBearing = Geolocator.bearingBetween(
+        polyline[polyline.length - 2].latitude,
+        polyline[polyline.length - 2].longitude,
+        polyline.last.latitude,
+        polyline.last.longitude,
+      );
+      var newLoc = toolkit.SphericalUtil.computeOffset(
+        toolkit.LatLng(currentPos.latitude, currentPos.longitude),
+        remainingDistance,
+        lastBearing,
+      );
+      return LatLng(newLoc.latitude, newLoc.longitude);
+    }
+
+    return currentPos;
+  }
+
+  LatLng _projectOnSegment(LatLng p, LatLng a, LatLng b) {
+    double latRad = (a.latitude + b.latitude) / 2.0 * (math.pi / 180.0);
+    double cosLat = math.cos(latRad);
+
+    double ax = a.longitude * cosLat;
+    double ay = a.latitude;
+    double bx = b.longitude * cosLat;
+    double by = b.latitude;
+    double px = p.longitude * cosLat;
+    double py = p.latitude;
+
+    double l2 = (bx - ax) * (bx - ax) + (by - ay) * (by - ay);
+    if (l2 == 0.0) return a;
+
+    double t = ((px - ax) * (bx - ax) + (py - ay) * (by - ay)) / l2;
+    t = t.clamp(0.0, 1.0);
+
+    return LatLng(
+      a.latitude + t * (b.latitude - a.latitude),
+      a.longitude + t * (b.longitude - a.longitude),
+    );
+  }
+
   LatLng _lerpPosition(LatLng a, LatLng b, double t) {
     return LatLng(
       a.latitude + (b.latitude - a.latitude) * t,
@@ -23079,6 +23968,13 @@ class KinematicFilter {
   void reset() {
     simulatedPos = null;
     lastRealPos = null;
+    _currentRawGps = null;
+    _previousRawGps = null;
+    _previousPreviousRawGps = null;
+    _targetPos = null;
+    _lastGpsTime = null;
     _lastPredictTime = null;
+    calculatedSpeedMps = 0.0;
+    lastRouteIndex = -1;
   }
 }
