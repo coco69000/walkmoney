@@ -23704,10 +23704,9 @@ class _NotificationHistorySheetState extends State<NotificationHistorySheet> {
     );
   }
 }
-
-// ===========================================================================
-// 🚀 FILTRE KINÉMATIQUE FLUIDE (AVANCÉE CONTINUE SANS RALENTISSEMENT)
-// ===========================================================================
+// ══════════════════════════════════════════════════════════════════════════
+// 🚀 FILTRE KINÉMATIQUE FLUIDE (AVANCÉE CONTINUE SANS RALENTISSEMENT NI RECUL)
+// ══════════════════════════════════════════════════════════════════════════
 class KinematicFilter {
   // Points clés de rendu
   LatLng? simulatedPos; // Position actuelle de la flèche à l'écran
@@ -23728,6 +23727,9 @@ class KinematicFilter {
   int _lastGpsRouteIndex = 0;
   int _lastSimRouteIndex = 0;
 
+  // 🔴 Variable conservée pour la compatibilité avec HomeController
+  int lastRouteIndex = -1;
+
   // ── GETTERS DIAGNOSTIC ──
   LatLng? get pointA => _previousPreviousRawGps != null
       ? LatLng(_previousPreviousRawGps!.latitude, _previousPreviousRawGps!.longitude)
@@ -23743,6 +23745,7 @@ class KinematicFilter {
       ? LatLng(_currentRawGps!.latitude, _currentRawGps!.longitude)
       : null;
 
+  /// Réception d'un nouveau point GPS réel
   void updateRealPosition(Position rawPos, {bool isWalkingMode = false}) {
     _previousPreviousRawGps = _previousRawGps;
     _previousRawGps = _currentRawGps;
@@ -23801,6 +23804,8 @@ class KinematicFilter {
         : LatLng(lastRealPos!.latitude, lastRealPos!.longitude);
 
     _lastGpsRouteIndex = _findRouteIndex(yellowPos, _currentRawGps?.heading ?? lastRealPos!.heading, routePolyline, _lastGpsRouteIndex);
+    lastRouteIndex = _lastGpsRouteIndex; // Mise à jour pour le HomeController
+
     LatLng snappedGps = _projectOnSegment(yellowPos, routePolyline[_lastGpsRouteIndex], routePolyline[_lastGpsRouteIndex + 1]);
 
     // 2. Créer une cible bleue légèrement en avance (pour compenser le lag naturel du GPS)
@@ -23860,7 +23865,7 @@ class KinematicFilter {
   }
 
   // ══════════════════════════════════════════════════════════════
-  // 🎯 Outils mathématiques corrigés (Isolés pour ne pas mélanger la mémoire)
+  // 🎯 Outils mathématiques (Isolés pour ne pas mélanger la mémoire)
   // ══════════════════════════════════════════════════════════════
 
   int _findRouteIndex(LatLng pos, double heading, List<LatLng> polyline, int hintIndex) {
@@ -23967,5 +23972,6 @@ class KinematicFilter {
     calculatedSpeedMps = 0.0;
     _lastGpsRouteIndex = 0;
     _lastSimRouteIndex = 0;
+    lastRouteIndex = -1; // Réinitialisation de la variable globale
   }
 }
