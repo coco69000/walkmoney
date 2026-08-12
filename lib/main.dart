@@ -1293,7 +1293,7 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
         LatLng snappedPos =
             snapToRoute(predictedPos, kinematicFilter.lastRealPos!.heading);
 
-        // 🚀 2.5 CORRECTION ANTI-RETARD DYNAMIQUE
+        // 🚀 2.5 CORRECTION ANTI-RETARD, FREINAGE ET RATTRAPAGE
         final lastGps = kinematicFilter.lastRealPos;
         if (lastGps != null) {
           final now = DateTime.now();
@@ -1308,38 +1308,107 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
 
           // Borne de sécurité (entre 0.0s et 1.0s max)
           double exactLatencySeconds = (latencyMs / 1000.0).clamp(0.0, 1.0);
-          double speedMps = kinematicFilter.calculatedSpeedMps;
+          double currentSpeedMps = kinematicFilter.calculatedSpeedMps;
 
-          // Si le véhicule avance et qu'il y a de la latence, on projette la flèche vers l'avant
-          if (speedMps > 1.0 && exactLatencySeconds > 0.02) {
-            double advanceMeters = speedMps * exactLatencySeconds;
-            double headingRad = lastGps.heading * (math.pi / 180.0);
+          if (_currentAnimatedPos != null) {
+            // Calcul de la distance entre la flèche animée et la vraie position GPS
+            double driftDistance = Geolocator.distanceBetween(
+                _currentAnimatedPos!.latitude,
+                _currentAnimatedPos!.longitude,
+                lastGps.latitude,
+                lastGps.longitude);
 
-            double deltaLat = (advanceMeters * math.cos(headingRad)) / 111111.0;
-            double deltaLng = (advanceMeters * math.sin(headingRad)) /
-                (111111.0 *
-                    math.cos(snappedPos.latitude * (math.pi / 180.0)));
+            // RÈGLE 3 : Rupture (Snap)
+            if (driftDistance > 20.0) {
+              snappedPos = snapToRoute(
+                  LatLng(lastGps.latitude, lastGps.longitude), lastGps.heading);
+            }
+            // RÈGLE 1 & 2 : Freinage proportionnel et rattrapage élastique
+            else if (driftDistance > 2.0) {
+              if (currentSpeedMps < 1.0) {
+                // Véhicule à l'arrêt/lent : on ramène progressivement la flèche vers le GPS réel
+                double lerpFactor = 0.10;
+                LatLng interpolatedPos = LatLng(
+                    _currentAnimatedPos!.latitude +
+                        (lastGps.latitude - _currentAnimatedPos!.latitude) *
+                            lerpFactor,
+                    _currentAnimatedPos!.longitude +
+                        (lastGps.longitude - _currentAnimatedPos!.longitude) *
+                            lerpFactor);
+                snappedPos = snapToRoute(interpolatedPos, lastGps.heading);
+              } else {
+                // Véhicule en mouvement : freinage de la projection selon l'écart
+                double brakingFactor = (20.0 - driftDistance) / 20.0;
+                brakingFactor = brakingFactor.clamp(0.1, 1.0);
 
-            snappedPos = LatLng(
-                snappedPos.latitude + deltaLat, snappedPos.longitude + deltaLng);
+                if (exactLatencySeconds > 0.02) {
+                  double advanceMeters =
+                      (currentSpeedMps * brakingFactor) * exactLatencySeconds;
+                  double headingRad = lastGps.heading * (math.pi / 180.0);
+
+                  double deltaLat =
+                      (advanceMeters * math.cos(headingRad)) / 111111.0;
+                  double deltaLng = (advanceMeters * math.sin(headingRad)) /
+                      (111111.0 *
+                          math.cos(snappedPos.latitude * (math.pi / 180.0)));
+
+                  snappedPos = LatLng(
+                      snappedPos.latitude + deltaLat,
+                      snappedPos.longitude + deltaLng);
+                }
+              }
+            }
+            // Cas nominal : compensation simple de latence
+            else if (currentSpeedMps > 1.0 && exactLatencySeconds > 0.02) {
+              double advanceMeters = currentSpeedMps * exactLatencySeconds;
+              double headingRad = lastGps.heading * (math.pi / 180.0);
+
+              double deltaLat = (advanceMeters * math.cos(headingRad)) / 111111.0;
+              double deltaLng = (advanceMeters * math.sin(headingRad)) /
+                  (111111.0 * math.cos(snappedPos.latitude * (math.pi / 180.0)));
+
+              snappedPos = LatLng(
+                  snappedPos.latitude + deltaLat, snappedPos.longitude + deltaLng);
+            }
+          } else {
+            // Fallback de sécurité si _currentAnimatedPos n'est pas encore initialisé
+            if (currentSpeedMps > 1.0 && exactLatencySeconds > 0.02) {
+              double advanceMeters = currentSpeedMps * exactLatencySeconds;
+              double headingRad = lastGps.heading * (math.pi / 180.0);
+
+              double deltaLat = (advanceMeters * math.cos(headingRad)) / 111111.0;
+              double deltaLng = (advanceMeters * math.sin(headingRad)) /
+                  (111111.0 * math.cos(snappedPos.latitude * (math.pi / 180.0)));
+
+              snappedPos = LatLng(
+                  snappedPos.latitude + deltaLat, snappedPos.longitude + deltaLng);
+            }
           }
         }
 
-        // 3. Mise à jour de l'UI à l'écran
-        _updateDriverMarker(snappedPos, kinematicFilter.lastRealPos!.heading);
+        // 🔄 3. LISSAGE ANGULAIRE (Rotation Fluide de la Caméra)
+        double targetBearing = kinematicFilter.lastRealPos!.heading;
+        double diff = targetBearing - _lastBearing;
+        if (diff > 180) diff -= 360;
+        if (diff < -180) diff += 360;
+        _lastBearing += diff * 0.05;
+        if (_lastBearing < 0) _lastBearing += 360;
+        if (_lastBearing >= 360) _lastBearing -= 360;
+
+        // 4. Mise à jour de l'UI à l'écran (avec l'angle lissé)
+        _updateDriverMarker(snappedPos, _lastBearing);
         _updateDiagnosticMarkers(); // ✅ Redessiner les points de diagnostic à chaque frame
 
-        // 4. On enregistre pour le recentrage
+        // 5. On enregistre pour le recentrage
         _currentAnimatedPos = snappedPos;
-        _lastBearing = kinematicFilter.lastRealPos!.heading;
 
-        // 5. On fait avancer la caméra de façon ultra-fluide (60/120 FPS)
+        // 6. On fait avancer la caméra de façon ultra-fluide (60/120 FPS)
         if (isNavigationCameraLocked.value && !isAnimating.value) {
           mapController.moveCamera(CameraUpdate.newCameraPosition(
               CameraPosition(
                   target: snappedPos,
                   zoom: 18.0,
-                  bearing: kinematicFilter.lastRealPos!.heading,
+                  bearing: _lastBearing,
                   tilt: 50)));
         }
       }
