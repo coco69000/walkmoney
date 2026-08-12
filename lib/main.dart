@@ -1318,32 +1318,63 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
                 lastGps.latitude,
                 lastGps.longitude);
 
+            final snappedGpsPos = snapToRoute(
+                LatLng(lastGps.latitude, lastGps.longitude), lastGps.heading);
+
             // RÈGLE 3 : Rupture (Snap)
             if (driftDistance > 20.0) {
-              snappedPos = snapToRoute(
-                  LatLng(lastGps.latitude, lastGps.longitude), lastGps.heading);
+              snappedPos = snappedGpsPos;
             }
-            // RÈGLE 1 & 2 : Freinage proportionnel et rattrapage élastique
+            // RÈGLE 1 & 2 : Freinage proportionnel, correction avant/arrière et rattrapage adaptatif
             else if (driftDistance > 2.0) {
-              if (currentSpeedMps < 1.0) {
-                // Véhicule à l'arrêt/lent : on ramène progressivement la flèche vers le GPS réel
-                double lerpFactor = 0.10;
-                LatLng interpolatedPos = LatLng(
-                    _currentAnimatedPos!.latitude +
-                        (lastGps.latitude - _currentAnimatedPos!.latitude) *
-                            lerpFactor,
-                    _currentAnimatedPos!.longitude +
-                        (lastGps.longitude - _currentAnimatedPos!.longitude) *
-                            lerpFactor);
-                snappedPos = snapToRoute(interpolatedPos, lastGps.heading);
-              } else {
-                // Véhicule en mouvement : freinage de la projection selon l'écart
-                double brakingFactor = (20.0 - driftDistance) / 20.0;
-                brakingFactor = brakingFactor.clamp(0.1, 1.0);
+              final previousSpeedMps = kinematicFilter.previousCalculatedSpeedMps;
+              final brakingRatio = previousSpeedMps > 0.4
+                  ? ((previousSpeedMps - currentSpeedMps) / previousSpeedMps)
+                      .clamp(0.0, 1.0)
+                  : (currentSpeedMps < 0.5 ? 1.0 : 0.0);
 
-                if (exactLatencySeconds > 0.02) {
+              final signedDrift = _signedDistanceAlongHeadingMeters(
+                  from: snappedGpsPos,
+                  to: _currentAnimatedPos!,
+                  headingDegrees: lastGps.heading);
+              final arrowAhead = signedDrift > 0;
+
+              double correctionFactor = arrowAhead
+                  ? (0.18 + (brakingRatio * 0.62))
+                  : (0.10 + (brakingRatio * 0.35));
+
+              if (currentSpeedMps < 0.8) {
+                correctionFactor += 0.12;
+              }
+
+              double estimatedCatchSeconds = driftDistance /
+                  math.max(currentSpeedMps * math.max(correctionFactor, 0.15), 0.5);
+
+              if (estimatedCatchSeconds > 4.0 || driftDistance > 12.0) {
+                correctionFactor = math.max(correctionFactor, 0.60);
+              }
+
+              correctionFactor = correctionFactor.clamp(0.10, 0.85);
+
+              if (estimatedCatchSeconds > 8.0 || driftDistance > 18.0) {
+                snappedPos = snappedGpsPos;
+              } else {
+                LatLng correctedPos = LatLng(
+                  _currentAnimatedPos!.latitude +
+                      (snappedGpsPos.latitude - _currentAnimatedPos!.latitude) *
+                          correctionFactor,
+                  _currentAnimatedPos!.longitude +
+                      (snappedGpsPos.longitude - _currentAnimatedPos!.longitude) *
+                          correctionFactor,
+                );
+                snappedPos = snapToRoute(correctedPos, lastGps.heading);
+
+                if (!arrowAhead &&
+                    currentSpeedMps > 1.0 &&
+                    exactLatencySeconds > 0.02) {
+                  double latencyScale = (1.0 - (brakingRatio * 0.5)).clamp(0.4, 1.0);
                   double advanceMeters =
-                      (currentSpeedMps * brakingFactor) * exactLatencySeconds;
+                      (currentSpeedMps * latencyScale) * exactLatencySeconds;
                   double headingRad = lastGps.heading * (math.pi / 180.0);
 
                   double deltaLat =
@@ -1587,6 +1618,25 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
   LatLng snapToRoute(LatLng gpsPos, [double? headingGps]) {
     final snap = _getNearestRoutePoint(gpsPos, headingGps);
     return snap.distance < 45.0 ? snap.point : gpsPos; // Seuil de snap à 45m
+  }
+
+  double _signedDistanceAlongHeadingMeters({
+    required LatLng from,
+    required LatLng to,
+    required double headingDegrees,
+  }) {
+    final midLatRad = ((from.latitude + to.latitude) / 2.0) * (math.pi / 180.0);
+    final metersPerDegreeLat = 111111.0;
+    final metersPerDegreeLng = 111111.0 * math.cos(midLatRad);
+
+    final dx = (to.longitude - from.longitude) * metersPerDegreeLng;
+    final dy = (to.latitude - from.latitude) * metersPerDegreeLat;
+
+    final headingRad = headingDegrees * (math.pi / 180.0);
+    final forwardX = math.sin(headingRad);
+    final forwardY = math.cos(headingRad);
+
+    return (dx * forwardX) + (dy * forwardY);
   }
 
   // Projection Orthogonale Corrigée (Prend en compte la courbure de la Terre)
@@ -23809,6 +23859,7 @@ class KinematicFilter {
   DateTime? _lastPredictTime;
 
   double calculatedSpeedMps = 0.0;
+  double previousCalculatedSpeedMps = 0.0;
   int lastRouteIndex = -1;
 
   // ── GETTERS DIAGNOSTIC ──
@@ -23850,6 +23901,8 @@ class KinematicFilter {
         if (dt > 0.05) vInst = d / dt;
       }
     }
+
+    previousCalculatedSpeedMps = calculatedSpeedMps;
 
     // Lissage progressif de la vitesse (EMA)
     if (calculatedSpeedMps == 0.0) {
@@ -24100,6 +24153,7 @@ class KinematicFilter {
     _lastGpsTime = null;
     _lastPredictTime = null;
     calculatedSpeedMps = 0.0;
+    previousCalculatedSpeedMps = 0.0;
     lastRouteIndex = -1;
   }
 }
