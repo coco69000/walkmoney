@@ -1293,6 +1293,38 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
         LatLng snappedPos =
             snapToRoute(predictedPos, kinematicFilter.lastRealPos!.heading);
 
+        // 🚀 2.5 CORRECTION ANTI-RETARD DYNAMIQUE
+        final lastGps = kinematicFilter.lastRealPos;
+        if (lastGps != null) {
+          final now = DateTime.now();
+
+          // Calcul de la latence exacte en millisecondes
+          int latencyMs = now.difference(lastGps.timestamp).inMilliseconds;
+
+          // Mise à jour de l'UI de diagnostic
+          if (Get.isRegistered<NavigationController>()) {
+            Get.find<NavigationController>().gpsLatencyMs.value = latencyMs;
+          }
+
+          // Borne de sécurité (entre 0.0s et 1.0s max)
+          double exactLatencySeconds = (latencyMs / 1000.0).clamp(0.0, 1.0);
+          double speedMps = kinematicFilter.calculatedSpeedMps;
+
+          // Si le véhicule avance et qu'il y a de la latence, on projette la flèche vers l'avant
+          if (speedMps > 1.0 && exactLatencySeconds > 0.02) {
+            double advanceMeters = speedMps * exactLatencySeconds;
+            double headingRad = lastGps.heading * (math.pi / 180.0);
+
+            double deltaLat = (advanceMeters * math.cos(headingRad)) / 111111.0;
+            double deltaLng = (advanceMeters * math.sin(headingRad)) /
+                (111111.0 *
+                    math.cos(snappedPos.latitude * (math.pi / 180.0)));
+
+            snappedPos = LatLng(
+                snappedPos.latitude + deltaLat, snappedPos.longitude + deltaLng);
+          }
+        }
+
         // 3. Mise à jour de l'UI à l'écran
         _updateDriverMarker(snappedPos, kinematicFilter.lastRealPos!.heading);
         _updateDiagnosticMarkers(); // ✅ Redessiner les points de diagnostic à chaque frame
@@ -1505,6 +1537,8 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
     if (l2 == 0.0) return a;
 
     double t = ((px - ax) * (bx - ax) + (py - ay) * (by - ay)) / l2;
+
+    // Force strictement le point projeté à rester sur le segment (Anti-retours en arrière)
     t = math.max(0.0, math.min(1.0, t));
 
     return LatLng(
@@ -1927,6 +1961,7 @@ class NavigationController extends GetxController {
   // ── VARIABLES DIAGNOSTIC (AJOUT) ──
   var timeBetweenGpsMs = 0.obs; // Temps écoulé depuis le dernier point GPS
   var gpsProcessingMs = 0.obs; // Temps que met le code à s'exécuter
+  var gpsLatencyMs = 0.obs; // 🚀 NOUVEAU : Latence exacte entre le fix GPS et l'écran
   DateTime? _lastGpsReceiveTime;
 
 // ── VARIABLES DÉVIATION DE ROUTE ──────────────────────────────────────────
@@ -4256,6 +4291,7 @@ class SpeedometerDisplay extends StatelessWidget {
       final cheatMessage = speedController.cheatWarningMessage.value;
       final gpsIntervalMs = navigationController.timeBetweenGpsMs.value;
       final gpsProcessingMs = navigationController.gpsProcessingMs.value;
+      final gpsLatencyMs = navigationController.gpsLatencyMs.value; // 🚀 NOUVEAU
 
       Color displayColor = Colors.black;
       if (cheatStatus == CheatModeStatus.exceededSpeedWarning)
@@ -4354,6 +4390,26 @@ class SpeedometerDisplay extends StatelessWidget {
                         "${gpsIntervalMs} ms",
                         style: TextStyle(
                           color: gpsColor,
+                          fontSize: 13,
+                          fontWeight: FontWeight.bold,
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 2),
+                  // NOUVEAU: Latence exacte du fix GPS
+                  Row(
+                    children: [
+                      Icon(Icons.timer, color: Colors.cyanAccent, size: 14),
+                      const SizedBox(width: 6),
+                      Text("Latence: ",
+                          style: const TextStyle(
+                              color: Colors.white60, fontSize: 11)),
+                      Text(
+                        "${gpsLatencyMs} ms",
+                        style: TextStyle(
+                          color: Colors.cyanAccent,
                           fontSize: 13,
                           fontWeight: FontWeight.bold,
                           fontFamily: 'monospace',
