@@ -1386,21 +1386,29 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
           }
         }
 
-        // 3. Mise à jour de l'UI à l'écran
-        _updateDriverMarker(snappedPos, kinematicFilter.lastRealPos!.heading);
+        // 🔄 3. LISSAGE ANGULAIRE (Rotation Fluide de la Caméra)
+        double targetBearing = kinematicFilter.lastRealPos!.heading;
+        double diff = targetBearing - _lastBearing;
+        if (diff > 180) diff -= 360;
+        if (diff < -180) diff += 360;
+        _lastBearing += diff * 0.05;
+        if (_lastBearing < 0) _lastBearing += 360;
+        if (_lastBearing >= 360) _lastBearing -= 360;
+
+        // 4. Mise à jour de l'UI à l'écran (avec l'angle lissé)
+        _updateDriverMarker(snappedPos, _lastBearing);
         _updateDiagnosticMarkers(); // ✅ Redessiner les points de diagnostic à chaque frame
 
-        // 4. On enregistre pour le recentrage
+        // 5. On enregistre pour le recentrage
         _currentAnimatedPos = snappedPos;
-        _lastBearing = kinematicFilter.lastRealPos!.heading;
 
-        // 5. On fait avancer la caméra de façon ultra-fluide (60/120 FPS)
+        // 6. On fait avancer la caméra de façon ultra-fluide (60/120 FPS)
         if (isNavigationCameraLocked.value && !isAnimating.value) {
           mapController.moveCamera(CameraUpdate.newCameraPosition(
               CameraPosition(
                   target: snappedPos,
                   zoom: 18.0,
-                  bearing: kinematicFilter.lastRealPos!.heading,
+                  bearing: _lastBearing,
                   tilt: 50)));
         }
       }
