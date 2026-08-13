@@ -23753,6 +23753,8 @@ class KinematicFilter {
   double _arrowSpeedMps = 0.0;
   double _brakingIntensity = 0.0;
   double _lastGpsIntervalSeconds = 1.0;
+  double _stoppedForSeconds = 0.0;
+  double _lastRawSpeedMps = 0.0;
 
   int _lastSimRouteIndex = 0;
   int _snappedGpsIndex = 0;
@@ -23778,6 +23780,25 @@ class KinematicFilter {
   static const double _snapDistanceVehicle = 70.0; // mètres
 
   static const double _maxStoppedRecoverySeconds = 3.5;
+
+  // ══════════════════════════════════════════════════════════════
+  // 🎯 PALIERS DE COMPORTEMENT (AJOUT)
+  // ══════════════════════════════════════════════════════════════
+
+  /// Petit écart : la flèche CONTINUE d'avancer mais plus lentement
+  static const double _smallGapAheadWalking = 5.0; // mètres
+  static const double _smallGapAheadVehicle = 10.0; // mètres
+
+  /// Écart moyen : la flèche S'ARRÊTE et attend le GPS
+  static const double _mediumGapAheadWalking = 15.0; // mètres
+  static const double _mediumGapAheadVehicle = 35.0; // mètres
+
+  /// Gros écart : la flèche RECULE (seulement si vraiment nécessaire)
+  static const double _hardReverseGapWalking = 25.0; // mètres
+  static const double _hardReverseGapVehicle = 70.0; // mètres
+
+  /// Détection d'arrêt confirmé
+  static const double _stopConfirmSeconds = 0.9;
 
   // ── GETTERS DIAGNOSTIC ──
   LatLng? get pointA => _previousPreviousRawGps != null
@@ -23859,6 +23880,17 @@ class KinematicFilter {
       _brakingIntensity = math.max(_brakingIntensity, intensity);
     } else {
       _brakingIntensity = math.max(0.0, _brakingIntensity - (dt * 0.65));
+    }
+
+    // ── DÉTECTION D'ARRÊT CONFIRMÉ (AJOUT) ──
+    _lastRawSpeedMps = vInst;
+    final double stopThresh = _isWalking ? _walkingStopSpeed : _vehicleStopSpeed;
+    final bool instantStopped = vInst < stopThresh && _vehicleSpeedMps < stopThresh;
+
+    if (instantStopped) {
+      _stoppedForSeconds += dt;
+    } else {
+      _stoppedForSeconds = 0.0;
     }
 
     if (simulatedPos == null) {
@@ -23982,38 +24014,85 @@ class KinematicFilter {
       }
 
       final double catchupTime = _computeCatchupTime(absError, isStopped);
-
       double desiredSpeed = 0.0;
 
-      if (isStopped) {
-        // À l’arrêt : la flèche doit revenir sur le GPS.
-        desiredSpeed = signedError / catchupTime;
-        desiredSpeed = _clamp(desiredSpeed, -maxReverse, maxReverse);
-      } else {
-        // En mouvement : vitesse de base + correction proportionnelle.
-        double correction = signedError / catchupTime;
+      // ── Détection d'arrêt confirmé ──
+      final bool isReallyStopped = _stoppedForSeconds >= _stopConfirmSeconds ||
+          (_vehicleSpeedMps < stopThreshold && _lastRawSpeedMps < stopThreshold);
 
-        // Plus le freinage est fort, plus la correction est agressive.
-        final double gain = 0.55 + (0.45 * _brakingIntensity);
-        correction *= gain;
+      // ── GAP = distance entre flèche et GPS (positif = flèche devant) ──
+      final double gapAhead = -signedError; // positif si flèche DEVANT le GPS
 
-        correction = _clamp(correction, -maxReverse, _maxForwardCorrection);
+      if (signedError < -0.35) {
+        // ═══════════════════════════════════════════════════
+        // LA FLÈCHE EST DEVANT LE GPS
+        // ═══════════════════════════════════════════════════
+        final double smallGap = _isWalking ? _smallGapAheadWalking : _smallGapAheadVehicle;
+        final double mediumGap = _isWalking ? _mediumGapAheadWalking : _mediumGapAheadVehicle;
+        final double reverseGap = _isWalking ? _hardReverseGapWalking : _hardReverseGapVehicle;
 
-        desiredSpeed = _vehicleSpeedMps + correction;
+        if (isReallyStopped) {
+          // ── ARRÊTÉ : reculer si écart significatif ──
+          final double tolerance = _isWalking ? 2.0 : 4.0;
+          if (gapAhead <= tolerance) {
+            desiredSpeed = 0.0; // trop petit, on bouge pas
+          } else {
+            final double ratio = _clamp(
+              (gapAhead - tolerance) / math.max(reverseGap - tolerance, 1.0),
+              0.15,
+              1.0,
+            );
+            desiredSpeed = -maxReverse * (0.30 + (0.70 * ratio));
 
-        if (signedError < -1.5) {
-          // La flèche est devant : on autorise un ralentissement fort,
-          // voire un léger recul si freinage intense.
-          final double minAllowed =
-              -maxReverse * (0.35 + (0.65 * _brakingIntensity));
-
-          desiredSpeed = math.max(desiredSpeed, minAllowed);
+            // Si trop long → snap
+            final double recoveryTime = gapAhead / math.max(maxReverse, 0.1);
+            if (recoveryTime > _maxStoppedRecoverySeconds) {
+              simulatedPos = referencePos;
+              _lastSimRouteIndex = referenceIndex;
+              _arrowSpeedMps = 0.0;
+              isBackwardRecovery = false;
+              return simulatedPos;
+            }
+          }
         } else {
-          desiredSpeed = _clamp(
-            desiredSpeed,
-            0.0,
-            _vehicleSpeedMps + _maxForwardCorrection,
-          );
+          // ── EN MOUVEMENT : logique par paliers ──
+          if (gapAhead <= smallGap) {
+            // ✅ PETIT ÉCART : avancer mais plus lentement
+            final double gapRatio = _clamp(gapAhead / math.max(smallGap, 0.1), 0.0, 1.0);
+            double slowFactor = 0.70 - (0.35 * gapRatio) - (0.25 * _brakingIntensity);
+            slowFactor = _clamp(slowFactor, 0.20, 0.80);
+            desiredSpeed = _vehicleSpeedMps * slowFactor;
+
+            if (_brakingIntensity > 0.70) {
+              desiredSpeed = math.min(desiredSpeed, _vehicleSpeedMps * 0.25);
+            }
+          } else if (gapAhead <= mediumGap) {
+            // 🛑 ÉCART MOYEN : s'arrêter, le GPS va rattraper
+            desiredSpeed = 0.0;
+          } else {
+            // 🔙 GROS ÉCART : reculer proportionnellement
+            final double ratio = _clamp(
+              (gapAhead - mediumGap) / math.max(reverseGap - mediumGap, 1.0),
+              0.0,
+              1.0,
+            );
+            final double reverseFactor =
+                (0.30 + (0.70 * ratio)) * (0.55 + (0.45 * _brakingIntensity));
+            desiredSpeed = -maxReverse * _clamp(reverseFactor, 0.0, 1.0);
+          }
+        }
+      } else {
+        // ═══════════════════════════════════════════════════
+        // LA FLÈCHE EST DERRIÈRE OU SUR LE GPS → rattraper
+        // ═══════════════════════════════════════════════════
+        if (isReallyStopped) {
+          desiredSpeed = signedError / catchupTime;
+          desiredSpeed = _clamp(desiredSpeed, 0.0, _isWalking ? 1.2 : 2.5);
+        } else {
+          double correction = signedError / catchupTime;
+          correction = _clamp(correction, 0.0, _maxForwardCorrection);
+          desiredSpeed = _vehicleSpeedMps + correction;
+          desiredSpeed = _clamp(desiredSpeed, 0.0, _vehicleSpeedMps + _maxForwardCorrection);
         }
       }
 
@@ -24427,10 +24506,11 @@ class KinematicFilter {
     _arrowSpeedMps = 0.0;
     _brakingIntensity = 0.0;
     _lastGpsIntervalSeconds = 1.0;
+    _stoppedForSeconds = 0.0;
+    _lastRawSpeedMps = 0.0;
 
     _lastSimRouteIndex = 0;
     _snappedGpsIndex = 0;
     lastRouteIndex = -1;
   }
 }
-
