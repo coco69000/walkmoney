@@ -1311,8 +1311,16 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
                 _currentAnimatedPos!.longitude,
                 predictedPos.latitude,
                 predictedPos.longitude);
+
             if (pathBearing < 0) pathBearing += 360;
-            targetBearing = pathBearing;
+
+            // Si la flèche recule seulement pour rattraper le GPS,
+            // on évite de retourner brutalement l’icône.
+            if (kinematicFilter.isBackwardRecovery && _lastBearing != 0.0) {
+              targetBearing = _lastBearing;
+            } else {
+              targetBearing = pathBearing;
+            }
           }
         }
 
@@ -23724,207 +23732,664 @@ class KinematicFilter {
   Position? lastRealPos; // Dernier GPS brut
 
   // Historique pour les points de diagnostic
-  Position? _currentRawGps; // 🟡 JAUNE (GPS Actuel)
+  Position? _currentRawGps; // 🟡 JAUNE (GPS actuel)
   Position? _previousRawGps; // 🟢 VERT
   Position? _previousPreviousRawGps; // 🔴 ROUGE
 
-  LatLng? _targetPos; // 🔵 BLEU (Projection à 1 seconde)
+  LatLng? _targetPos; // 🔵 BLEU (projection cible)
+  LatLng? _snappedGpsPos;
+
   DateTime? _lastPredictTime;
+  DateTime? _lastGpsUpdateTime;
 
   bool _isNewGpsPoint = false;
   bool _isWalking = false;
-  double _vehicleSpeedMps = 0.0; // Vitesse de la voiture
-  double _arrowSpeedMps = 0.0; // Vitesse calculée de la flèche
-  
+
+  /// True quand la flèche recule pour rejoindre le GPS.
+  bool isBackwardRecovery = false;
+
+  double _vehicleSpeedMps = 0.0;
+  double _previousVehicleSpeedMps = 0.0;
+  double _arrowSpeedMps = 0.0;
+  double _brakingIntensity = 0.0;
+  double _lastGpsIntervalSeconds = 1.0;
+
   int _lastSimRouteIndex = 0;
-  int lastRouteIndex = -1; // Conservé pour le HomeController
+  int _snappedGpsIndex = 0;
+  int lastRouteIndex = -1;
+
+  // ══════════════════════════════════════════════════════════════
+  // ⚙️ RÉGLAGES DU COMPORTEMENT
+  // ══════════════════════════════════════════════════════════════
+
+  static const double _normalLookaheadSeconds = 1.0;
+  static const double _brakingLookaheadSeconds = 0.35;
+
+  static const double _walkingStopSpeed = 0.18; // ~0.65 km/h
+  static const double _vehicleStopSpeed = 0.35; // ~1.26 km/h
+
+  static const double _hardBrakeDecel = 1.6; // m/s²
+
+  static const double _maxForwardCorrection = 10.0; // m/s
+  static const double _maxReverseWalking = 1.7; // m/s
+  static const double _maxReverseVehicle = 3.8; // m/s
+
+  static const double _snapDistanceWalking = 25.0; // mètres
+  static const double _snapDistanceVehicle = 70.0; // mètres
+
+  static const double _maxStoppedRecoverySeconds = 3.5;
 
   // ── GETTERS DIAGNOSTIC ──
   LatLng? get pointA => _previousPreviousRawGps != null
-      ? LatLng(_previousPreviousRawGps!.latitude, _previousPreviousRawGps!.longitude) : null;
-  LatLng? get pointB => _targetPos; 
-  LatLng? get pointC => _previousRawGps != null
-      ? LatLng(_previousRawGps!.latitude, _previousRawGps!.longitude) : null;
-  LatLng? get rawGpsPos => _currentRawGps != null
-      ? LatLng(_currentRawGps!.latitude, _currentRawGps!.longitude) : null;
+      ? LatLng(_previousPreviousRawGps!.latitude, _previousPreviousRawGps!.longitude)
+      : null;
 
-  /// Réception du GPS (Chaque seconde)
+  LatLng? get pointB => _targetPos;
+
+  LatLng? get pointC => _previousRawGps != null
+      ? LatLng(_previousRawGps!.latitude, _previousRawGps!.longitude)
+      : null;
+
+  LatLng? get rawGpsPos => _currentRawGps != null
+      ? LatLng(_currentRawGps!.latitude, _currentRawGps!.longitude)
+      : null;
+
+  /// Réception du GPS (chaque seconde environ)
   void updateRealPosition(Position rawPos, {bool isWalkingMode = false}) {
+    final Position? oldLastRealPos = lastRealPos;
+
     _previousPreviousRawGps = _previousRawGps;
     _previousRawGps = _currentRawGps;
     _currentRawGps = rawPos;
     lastRealPos = rawPos;
+
     _isWalking = isWalkingMode;
 
-    double vInst = rawPos.speed;
-    if (vInst <= 0 || vInst == 1.0) {
-      if (lastRealPos != null) {
-        double d = Geolocator.distanceBetween(
-          lastRealPos!.latitude, lastRealPos!.longitude,
-          rawPos.latitude, rawPos.longitude,
-        );
-        double dt = rawPos.timestamp.difference(lastRealPos!.timestamp).inMilliseconds / 1000.0;
-        if (dt > 0.05) vInst = d / dt;
-      }
+    final DateTime now = rawPos.timestamp;
+    double dt = 1.0;
+
+    if (_lastGpsUpdateTime != null) {
+      dt = now.difference(_lastGpsUpdateTime!).inMilliseconds / 1000.0;
+      if (dt <= 0.02 || dt > 5.0) dt = 1.0;
     }
 
-    if (_vehicleSpeedMps == 0.0) {
+    _lastGpsUpdateTime = now;
+    _lastGpsIntervalSeconds = dt;
+
+    double vInst = rawPos.speed;
+
+    // Fallback si la vitesse native est invalide
+    if ((vInst <= 0.0 || vInst == 1.0) && oldLastRealPos != null) {
+      final double d = Geolocator.distanceBetween(
+        oldLastRealPos.latitude,
+        oldLastRealPos.longitude,
+        rawPos.latitude,
+        rawPos.longitude,
+      );
+
+      final double dtPos =
+          rawPos.timestamp.difference(oldLastRealPos.timestamp).inMilliseconds / 1000.0;
+
+      if (dtPos > 0.05) vInst = d / dtPos;
+    }
+
+    if (vInst.isNaN || vInst.isInfinite) vInst = 0.0;
+    vInst = _clamp(vInst, 0.0, 55.0);
+
+    _previousVehicleSpeedMps = _vehicleSpeedMps;
+
+    if (_vehicleSpeedMps <= 0.01) {
       _vehicleSpeedMps = vInst;
     } else {
-      _vehicleSpeedMps = (_vehicleSpeedMps * 0.4) + (vInst * 0.6);
+      _vehicleSpeedMps = (_vehicleSpeedMps * 0.45) + (vInst * 0.55);
+    }
+
+    // Détection du freinage
+    double deceleration = 0.0;
+    if (dt > 0.1) {
+      deceleration = (_previousVehicleSpeedMps - _vehicleSpeedMps) / dt;
+    }
+
+    if (deceleration > _hardBrakeDecel) {
+      final double intensity = _clamp(
+        (deceleration - _hardBrakeDecel) / 3.5,
+        0.35,
+        1.0,
+      );
+      _brakingIntensity = math.max(_brakingIntensity, intensity);
+    } else {
+      _brakingIntensity = math.max(0.0, _brakingIntensity - (dt * 0.65));
     }
 
     if (simulatedPos == null) {
       simulatedPos = LatLng(rawPos.latitude, rawPos.longitude);
     }
 
-    _isNewGpsPoint = true; // Déclenche le recalcul de la cible Bleue
+    _isNewGpsPoint = true;
   }
 
   /// 🚀 MOTEUR DE PROJECTION (60 FPS)
   LatLng? predictNextPosition(List<LatLng> routePolyline) {
-    if (lastRealPos == null || _currentRawGps == null || simulatedPos == null) return null;
+    if (lastRealPos == null || _currentRawGps == null || simulatedPos == null) {
+      return null;
+    }
 
-    DateTime now = DateTime.now();
+    final DateTime now = DateTime.now();
     double dt = now.difference(_lastPredictTime ?? now).inMilliseconds / 1000.0;
     _lastPredictTime = now;
-    if (dt <= 0 || dt > 0.2) dt = 1.0 / 60.0; // Normalisation frame
 
-    // 1. NOUVEAU GPS : PLACER LE POINT BLEU ET CALCULER LA VITESSE DE LA FLÈCHE
+    if (dt <= 0.0 || dt > 0.2) dt = 1.0 / 60.0;
+
+    if (routePolyline.length < 2) {
+      isBackwardRecovery = false;
+      return simulatedPos;
+    }
+
+    // Si on vient de recevoir un nouveau point GPS, on recalcule la cible
     if (_isNewGpsPoint) {
       _isNewGpsPoint = false;
 
-      // A. Positionner le Jaune sur la ligne
-      LatLng rawYellow = LatLng(_currentRawGps!.latitude, _currentRawGps!.longitude);
-      int yellowIndex = _findRouteIndex(rawYellow, _currentRawGps!.heading, routePolyline, math.max(0, lastRouteIndex));
-      lastRouteIndex = yellowIndex;
-      LatLng snappedYellow = _projectOnSegment(rawYellow, routePolyline[yellowIndex], routePolyline[yellowIndex + 1]);
+      final LatLng rawPos = LatLng(
+        _currentRawGps!.latitude,
+        _currentRawGps!.longitude,
+      );
 
-      // B. Le Bleu est la PROJECTION de la voiture dans 1 seconde
-      double distanceToProject = _vehicleSpeedMps * 1.0; 
-      _targetPos = _advanceForwardAlongRoute(snappedYellow, distanceToProject, routePolyline, yellowIndex);
+      final double heading = lastRealPos!.heading;
+      final int hint = lastRouteIndex < 0 ? 0 : lastRouteIndex;
 
-      // C. Calculer la distance entre la Flèche actuelle et le Bleu
-      double distArrowToBlue = Geolocator.distanceBetween(
-          simulatedPos!.latitude, simulatedPos!.longitude, 
-          _targetPos!.latitude, _targetPos!.longitude);
+      final int rawIndex = _findRouteIndex(
+        rawPos,
+        heading,
+        routePolyline,
+        hint,
+      );
 
-      // Sécurité : le bleu est-il buggé (derrière la flèche) ?
-      _lastSimRouteIndex = _findRouteIndex(simulatedPos!, lastRealPos!.heading, routePolyline, _lastSimRouteIndex);
-      int blueIndex = _findRouteIndex(_targetPos!, lastRealPos!.heading, routePolyline, yellowIndex);
-      
-      bool isBehind = false;
-      if (blueIndex < _lastSimRouteIndex) {
-        isBehind = true;
-      } else if (blueIndex == _lastSimRouteIndex && _lastSimRouteIndex < routePolyline.length - 1) {
-        double simToNext = Geolocator.distanceBetween(simulatedPos!.latitude, simulatedPos!.longitude, routePolyline[_lastSimRouteIndex+1].latitude, routePolyline[_lastSimRouteIndex+1].longitude);
-        double blueToNext = Geolocator.distanceBetween(_targetPos!.latitude, _targetPos!.longitude, routePolyline[_lastSimRouteIndex+1].latitude, routePolyline[_lastSimRouteIndex+1].longitude);
-        if (blueToNext > simToNext) isBehind = true;
-      }
+      lastRouteIndex = rawIndex;
+      _snappedGpsIndex = rawIndex;
+      _snappedGpsPos = _projectOnSegment(
+        rawPos,
+        routePolyline[rawIndex],
+        routePolyline[rawIndex + 1],
+      );
 
-      // D. Définir la VITESSE DE LA FLÈCHE pour cette seconde
-      if (distArrowToBlue > 50.0) {
-        // Erreur géante (Saut GPS), on téléporte
-        simulatedPos = snappedYellow;
-        _lastSimRouteIndex = yellowIndex;
-        _arrowSpeedMps = _vehicleSpeedMps; 
-      } else if (isBehind) {
-        // Le Bleu est derrière, on ne recule surtout pas, on maintient la vitesse !
-        _arrowSpeedMps = _vehicleSpeedMps;
+      final double stopThreshold = _isWalking ? _walkingStopSpeed : _vehicleStopSpeed;
+
+      final bool isStopped = _vehicleSpeedMps < stopThreshold;
+
+      double lookahead = _normalLookaheadSeconds;
+
+      if (isStopped) {
+        lookahead = 0.0;
       } else {
-        // ⚡ LA FLÈCHE DOIT PARCOURIR LA DISTANCE JUSQU'AU BLEU EN EXACTEMENT 1.0 SECONDE
-        _arrowSpeedMps = distArrowToBlue / 1.0; 
+        lookahead = _brakingLookaheadSeconds +
+            (1.0 - _brakingIntensity) *
+                (_normalLookaheadSeconds - _brakingLookaheadSeconds);
       }
 
-      // Arrêt propre
-      double minSpeedMps = _isWalking ? 0.14 : 0.4;
-      if (_vehicleSpeedMps < minSpeedMps && _currentRawGps!.speed < minSpeedMps) {
+      // Point bleu : projection du GPS dans le futur selon vitesse actuelle
+      _targetPos = _advanceForwardAlongRoute(
+        _snappedGpsPos!,
+        _vehicleSpeedMps * lookahead,
+        routePolyline,
+        rawIndex,
+      );
+
+      // Si on est arrêté, la cible redevient le point GPS projeté
+      final LatLng referencePos = isStopped ? _snappedGpsPos! : _targetPos!;
+
+      final int referenceIndex = isStopped
+          ? rawIndex
+          : _findRouteIndex(referencePos, heading, routePolyline, rawIndex);
+
+      final int simIndex = _findRouteIndex(
+        simulatedPos!,
+        heading,
+        routePolyline,
+        _lastSimRouteIndex,
+      );
+
+      _lastSimRouteIndex = simIndex;
+
+      // signedError > 0 : la cible est devant la flèche
+      // signedError < 0 : la cible est derrière la flèche
+      final double signedError = _signedRouteDistance(
+        simulatedPos!,
+        simIndex,
+        referencePos,
+        referenceIndex,
+        routePolyline,
+      );
+
+      final double absError = signedError.abs();
+
+      final double maxReverse = _isWalking ? _maxReverseWalking : _maxReverseVehicle;
+
+      double snapLimit = _isWalking ? _snapDistanceWalking : _snapDistanceVehicle;
+
+      if (_brakingIntensity > 0.65) snapLimit *= 0.70;
+
+      final bool tooLongToRecover = isStopped &&
+          maxReverse > 0.0 &&
+          (absError / maxReverse) > _maxStoppedRecoverySeconds;
+
+      // Si l’écart est trop grand, on téléporte proprement la flèche
+      if (absError > snapLimit || tooLongToRecover) {
+        simulatedPos = referencePos;
+        _lastSimRouteIndex = referenceIndex;
+        _arrowSpeedMps = isStopped ? 0.0 : _vehicleSpeedMps;
+        isBackwardRecovery = false;
+        return simulatedPos;
+      }
+
+      final double catchupTime = _computeCatchupTime(absError, isStopped);
+
+      double desiredSpeed = 0.0;
+
+      if (isStopped) {
+        // À l’arrêt : la flèche doit revenir sur le GPS.
+        desiredSpeed = signedError / catchupTime;
+        desiredSpeed = _clamp(desiredSpeed, -maxReverse, maxReverse);
+      } else {
+        // En mouvement : vitesse de base + correction proportionnelle.
+        double correction = signedError / catchupTime;
+
+        // Plus le freinage est fort, plus la correction est agressive.
+        final double gain = 0.55 + (0.45 * _brakingIntensity);
+        correction *= gain;
+
+        correction = _clamp(correction, -maxReverse, _maxForwardCorrection);
+
+        desiredSpeed = _vehicleSpeedMps + correction;
+
+        if (signedError < -1.5) {
+          // La flèche est devant : on autorise un ralentissement fort,
+          // voire un léger recul si freinage intense.
+          final double minAllowed =
+              -maxReverse * (0.35 + (0.65 * _brakingIntensity));
+
+          desiredSpeed = math.max(desiredSpeed, minAllowed);
+        } else {
+          desiredSpeed = _clamp(
+            desiredSpeed,
+            0.0,
+            _vehicleSpeedMps + _maxForwardCorrection,
+          );
+        }
+      }
+
+      // Lissage de la vitesse de la flèche : accélération / freinage progressif
+      final double maxAccel = _isWalking ? 2.2 : 4.5;
+      double maxDecel = _isWalking ? 3.8 : 8.0;
+
+      if (_brakingIntensity > 0.5) maxDecel *= 1.35;
+
+      double delta = desiredSpeed - _arrowSpeedMps;
+
+      final double maxDelta =
+          delta >= 0.0 ? maxAccel * _lastGpsIntervalSeconds : maxDecel * _lastGpsIntervalSeconds;
+
+      if (delta > maxDelta) delta = maxDelta;
+      if (delta < -maxDelta) delta = -maxDelta;
+
+      _arrowSpeedMps += delta;
+
+      // Si on est arrêté et très proche du GPS, on stoppe complètement
+      if (absError < 0.75 && isStopped) {
         _arrowSpeedMps = 0.0;
+      }
+
+      _arrowSpeedMps = _clamp(
+        _arrowSpeedMps,
+        -maxReverse,
+        math.max(30.0, _vehicleSpeedMps + 8.0),
+      );
+    }
+
+    // Sécurité : si plus de GPS depuis un moment, on ralentit la flèche
+    if (_lastGpsUpdateTime != null) {
+      final double gpsAge = DateTime.now().difference(_lastGpsUpdateTime!).inMilliseconds / 1000.0;
+
+      if (gpsAge > 2.5) {
+        _arrowSpeedMps *= 0.82;
+        if (_arrowSpeedMps.abs() < 0.05) _arrowSpeedMps = 0.0;
       }
     }
 
-    // 2. APPLIQUER LE MOUVEMENT : La flèche avance. 
-    // Elle ne s'arrêtera jamais au bleu ! Elle continuera à _arrowSpeedMps jusqu'au prochain GPS.
-    double distanceToMoveThisFrame = _arrowSpeedMps * dt;
+    final double moveDistance = _arrowSpeedMps * dt;
+    isBackwardRecovery = moveDistance < -0.02;
 
-    if (distanceToMoveThisFrame > 0.01) {
-      _lastSimRouteIndex = _findRouteIndex(simulatedPos!, lastRealPos!.heading, routePolyline, _lastSimRouteIndex);
-      simulatedPos = _advanceForwardAlongRoute(simulatedPos!, distanceToMoveThisFrame, routePolyline, _lastSimRouteIndex);
+    if (moveDistance.abs() > 0.008) {
+      final double heading = lastRealPos?.heading ?? 0.0;
+
+      final int simIndex = _findRouteIndex(
+        simulatedPos!,
+        heading,
+        routePolyline,
+        _lastSimRouteIndex,
+      );
+
+      _lastSimRouteIndex = simIndex;
+
+      simulatedPos = _moveAlongRouteSigned(
+        simulatedPos!,
+        moveDistance,
+        routePolyline,
+        simIndex,
+      );
     }
 
     return simulatedPos;
   }
 
-  // ══════════════════════════════════════════════════════════════
-  // 🎯 Outils mathématiques de projection géométrique
-  // ══════════════════════════════════════════════════════════════
+  double _computeCatchupTime(double absError, bool isStopped) {
+    if (isStopped) {
+      return _clamp(
+        0.75 + (absError / 28.0),
+        0.75,
+        1.8,
+      );
+    }
 
-  int _findRouteIndex(LatLng pos, double heading, List<LatLng> polyline, int hintIndex) {
+    if (_brakingIntensity > 0.75) return 0.55;
+    if (_brakingIntensity > 0.45) return 0.85;
+
+    return _clamp(
+      1.25 - (absError / 120.0),
+      0.85,
+      1.35,
+    );
+  }
+
+  double _clamp(double value, double min, double max) {
+    if (value.isNaN) return min;
+    if (value < min) return min;
+    if (value > max) return max;
+    return value;
+  }
+
+  int _findRouteIndex(
+    LatLng pos,
+    double heading,
+    List<LatLng> polyline,
+    int hintIndex,
+  ) {
     if (polyline.length < 2) return 0;
-    int searchStart = math.max(0, hintIndex - 15);
-    int searchEnd = math.min(polyline.length - 2, hintIndex + 50);
+    if (heading.isNaN || heading.isInfinite) heading = 0.0;
 
-    int bestIndex = math.max(0, hintIndex);
+    final int maxSeg = polyline.length - 2;
+
+    int start = (hintIndex - 25).clamp(0, maxSeg);
+    int end = (hintIndex + 70).clamp(start, maxSeg);
+
+    if (start > end) {
+      start = 0;
+      end = maxSeg;
+    }
+
+    int bestIndex = start;
     double minScore = double.infinity;
 
-    for (int i = searchStart; i <= searchEnd; i++) {
-      LatLng proj = _projectOnSegment(pos, polyline[i], polyline[i + 1]);
-      double d = Geolocator.distanceBetween(pos.latitude, pos.longitude, proj.latitude, proj.longitude);
-      double segBearing = Geolocator.bearingBetween(polyline[i].latitude, polyline[i].longitude, polyline[i + 1].latitude, polyline[i + 1].longitude);
-          
-      double angleDiff = (segBearing - heading).abs();
-      if (angleDiff > 180) angleDiff = 360 - angleDiff;
-      double penalty = angleDiff > 90 ? 100.0 : 0.0;
+    for (int i = start; i <= end; i++) {
+      if (i < 0 || i > maxSeg) continue;
 
-      double score = d + penalty;
+      final LatLng proj = _projectOnSegment(
+        pos,
+        polyline[i],
+        polyline[i + 1],
+      );
+
+      final double d = Geolocator.distanceBetween(
+        pos.latitude,
+        pos.longitude,
+        proj.latitude,
+        proj.longitude,
+      );
+
+      final double segBearing = Geolocator.bearingBetween(
+        polyline[i].latitude,
+        polyline[i].longitude,
+        polyline[i + 1].latitude,
+        polyline[i + 1].longitude,
+      );
+
+      double angleDiff = (segBearing - heading).abs();
+      if (angleDiff > 180.0) angleDiff = 360.0 - angleDiff;
+
+      double penalty = 0.0;
+      if (angleDiff > 100.0) {
+        penalty = 80.0;
+      } else if (angleDiff > 60.0) {
+        penalty = 25.0;
+      }
+
+      final double score = d + penalty;
+
       if (score < minScore) {
         minScore = score;
         bestIndex = i;
       }
     }
+
     return bestIndex;
   }
 
-  LatLng _advanceForwardAlongRoute(LatLng startPos, double distanceMeters, List<LatLng> polyline, int startIndex) {
-    if (polyline.length < 2 || startIndex < 0 || startIndex >= polyline.length - 1) return startPos;
+  /// Retourne une distance signée le long de la route.
+  /// Positif si [to] est devant [from], négatif si [to] est derrière.
+  double _signedRouteDistance(
+    LatLng from,
+    int fromIndex,
+    LatLng to,
+    int toIndex,
+    List<LatLng> polyline,
+  ) {
+    if (polyline.length < 2) return 0.0;
 
-    LatLng proj = _projectOnSegment(startPos, polyline[startIndex], polyline[startIndex + 1]);
+    final int maxSeg = polyline.length - 2;
+    fromIndex = fromIndex.clamp(0, maxSeg);
+    toIndex = toIndex.clamp(0, maxSeg);
+
+    if (fromIndex == toIndex) {
+      final double fromToNext = Geolocator.distanceBetween(
+        from.latitude,
+        from.longitude,
+        polyline[fromIndex + 1].latitude,
+        polyline[fromIndex + 1].longitude,
+      );
+
+      final double toToNext = Geolocator.distanceBetween(
+        to.latitude,
+        to.longitude,
+        polyline[toIndex + 1].latitude,
+        polyline[toIndex + 1].longitude,
+      );
+
+      return fromToNext - toToNext;
+    }
+
+    if (toIndex > fromIndex) {
+      double dist = Geolocator.distanceBetween(
+        from.latitude,
+        from.longitude,
+        polyline[fromIndex + 1].latitude,
+        polyline[fromIndex + 1].longitude,
+      );
+
+      for (int i = fromIndex + 1; i < toIndex; i++) {
+        dist += Geolocator.distanceBetween(
+          polyline[i].latitude,
+          polyline[i].longitude,
+          polyline[i + 1].latitude,
+          polyline[i + 1].longitude,
+        );
+      }
+
+      dist += Geolocator.distanceBetween(
+        polyline[toIndex].latitude,
+        polyline[toIndex].longitude,
+        to.latitude,
+        to.longitude,
+      );
+
+      return dist;
+    }
+
+    double dist = Geolocator.distanceBetween(
+      from.latitude,
+      from.longitude,
+      polyline[fromIndex].latitude,
+      polyline[fromIndex].longitude,
+    );
+
+    for (int i = fromIndex; i > toIndex + 1; i--) {
+      dist += Geolocator.distanceBetween(
+        polyline[i].latitude,
+        polyline[i].longitude,
+        polyline[i - 1].latitude,
+        polyline[i - 1].longitude,
+      );
+    }
+
+    dist += Geolocator.distanceBetween(
+      polyline[toIndex + 1].latitude,
+      polyline[toIndex + 1].longitude,
+      to.latitude,
+      to.longitude,
+    );
+
+    return -dist;
+  }
+
+  LatLng _moveAlongRouteSigned(
+    LatLng start,
+    double signedDistance,
+    List<LatLng> polyline,
+    int startIndex,
+  ) {
+    if (polyline.length < 2) return start;
+
+    final int maxSeg = polyline.length - 2;
+    final int idx = startIndex.clamp(0, maxSeg);
+
+    final LatLng proj = _projectOnSegment(
+      start,
+      polyline[idx],
+      polyline[idx + 1],
+    );
+
+    if (signedDistance >= 0.0) {
+      return _advanceForwardAlongRoute(proj, signedDistance, polyline, idx);
+    }
+
+    return _retreatAlongRoute(proj, -signedDistance, polyline, idx);
+  }
+
+  LatLng _advanceForwardAlongRoute(
+    LatLng startPos,
+    double distanceMeters,
+    List<LatLng> polyline,
+    int startIndex,
+  ) {
+    if (distanceMeters <= 0.0 || polyline.length < 2) return startPos;
+
+    final int maxSeg = polyline.length - 2;
+    final int idx = startIndex.clamp(0, maxSeg);
+
+    LatLng proj = _projectOnSegment(
+      startPos,
+      polyline[idx],
+      polyline[idx + 1],
+    );
+
     double remainingDistance = distanceMeters;
     LatLng currentPos = proj;
 
-    for (int i = startIndex; i < polyline.length - 1; i++) {
-      LatLng pNext = polyline[i + 1];
-      double dSeg = Geolocator.distanceBetween(currentPos.latitude, currentPos.longitude, pNext.latitude, pNext.longitude);
+    for (int i = idx; i < polyline.length - 1; i++) {
+      final LatLng next = polyline[i + 1];
+
+      final double dSeg = Geolocator.distanceBetween(
+        currentPos.latitude,
+        currentPos.longitude,
+        next.latitude,
+        next.longitude,
+      );
 
       if (dSeg < 0.001) continue;
 
       if (remainingDistance <= dSeg) {
-        double t = remainingDistance / dSeg;
-        return _lerpPosition(currentPos, pNext, t);
-      } else {
-        remainingDistance -= dSeg;
-        currentPos = pNext;
+        final double t = remainingDistance / dSeg;
+        return _lerpPosition(currentPos, next, t);
       }
+
+      remainingDistance -= dSeg;
+      currentPos = next;
     }
+
+    return currentPos;
+  }
+
+  LatLng _retreatAlongRoute(
+    LatLng startPos,
+    double distanceMeters,
+    List<LatLng> polyline,
+    int startIndex,
+  ) {
+    if (distanceMeters <= 0.0 || polyline.length < 2) return startPos;
+
+    final int maxSeg = polyline.length - 2;
+    final int idx = startIndex.clamp(0, maxSeg);
+
+    LatLng proj = _projectOnSegment(
+      startPos,
+      polyline[idx],
+      polyline[idx + 1],
+    );
+
+    double remainingDistance = distanceMeters;
+    LatLng currentPos = proj;
+
+    for (int i = idx; i >= 0; i--) {
+      final LatLng previous = polyline[i];
+
+      final double dSeg = Geolocator.distanceBetween(
+        currentPos.latitude,
+        currentPos.longitude,
+        previous.latitude,
+        previous.longitude,
+      );
+
+      if (dSeg < 0.001) continue;
+
+      if (remainingDistance <= dSeg) {
+        final double t = remainingDistance / dSeg;
+        return _lerpPosition(currentPos, previous, t);
+      }
+
+      remainingDistance -= dSeg;
+      currentPos = previous;
+    }
+
     return currentPos;
   }
 
   LatLng _projectOnSegment(LatLng p, LatLng a, LatLng b) {
-    double latRad = (a.latitude + b.latitude) / 2.0 * (math.pi / 180.0);
-    double cosLat = math.cos(latRad);
+    final double latRad = ((a.latitude + b.latitude) / 2.0) * (math.pi / 180.0);
+    final double cosLat = math.cos(latRad);
 
-    double ax = a.longitude * cosLat;
-    double ay = a.latitude;
-    double bx = b.longitude * cosLat;
-    double by = b.latitude;
-    double px = p.longitude * cosLat;
-    double py = p.latitude;
+    final double ax = a.longitude * cosLat;
+    final double ay = a.latitude;
 
-    double l2 = (bx - ax) * (bx - ax) + (by - ay) * (by - ay);
+    final double bx = b.longitude * cosLat;
+    final double by = b.latitude;
+
+    final double px = p.longitude * cosLat;
+    final double py = p.latitude;
+
+    final double l2 = ((bx - ax) * (bx - ax)) + ((by - ay) * (by - ay));
+
     if (l2 == 0.0) return a;
 
-    double t = ((px - ax) * (bx - ax) + (py - ay) * (by - ay)) / l2;
-    t = t.clamp(0.0, 1.0);
+    double t = (((px - ax) * (bx - ax)) + ((py - ay) * (by - ay))) / l2;
+    t = t.clamp(0.0, 1.0).toDouble();
 
     return LatLng(
       a.latitude + t * (b.latitude - a.latitude),
@@ -23942,15 +24407,30 @@ class KinematicFilter {
   void reset() {
     simulatedPos = null;
     lastRealPos = null;
+
     _currentRawGps = null;
     _previousRawGps = null;
     _previousPreviousRawGps = null;
+
     _targetPos = null;
+    _snappedGpsPos = null;
+
     _lastPredictTime = null;
+    _lastGpsUpdateTime = null;
+
     _isNewGpsPoint = false;
+    _isWalking = false;
+    isBackwardRecovery = false;
+
     _vehicleSpeedMps = 0.0;
+    _previousVehicleSpeedMps = 0.0;
     _arrowSpeedMps = 0.0;
+    _brakingIntensity = 0.0;
+    _lastGpsIntervalSeconds = 1.0;
+
     _lastSimRouteIndex = 0;
+    _snappedGpsIndex = 0;
     lastRouteIndex = -1;
   }
 }
+
