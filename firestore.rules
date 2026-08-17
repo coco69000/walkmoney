@@ -5,7 +5,7 @@ service cloud.firestore {
     match /users/{userId} {
       allow read: if request.auth != null && request.auth.uid == userId;
       
-      // L'utilisateur peut mettre à jour son profil (ex: domicile), mais NE PEUT PAS modifier ses champs sensibles
+      // L'utilisateur peut mettre à jour son profil (ex: domicile, nom), mais NE PEUT PAS modifier ses champs sensibles
       allow update: if request.auth != null && request.auth.uid == userId
                     && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
                          'lame_points', 
@@ -13,7 +13,16 @@ service cloud.firestore {
                          'is_vip', 
                          'consecutive_logins',
                          'ad_points',
-                         'store_boosts'
+                         'store_boosts',
+                         'next_level_boost',
+                         'last_trip_timestamp',
+                         'loyalty_progress',
+                         'stripe_customer_id',
+                         'stripe_subscription_id',
+                         'stripe_subscription_item_id',
+                         'last_ad_point_timestamp',
+                         'last_store_boost_timestamp',
+                         'last_ocr_timestamp'
                        ]);
                        
       allow create: if request.auth != null && request.auth.uid == userId;
@@ -27,7 +36,14 @@ service cloud.firestore {
     }
 
     match /users/{userId}/trip_logs/{docId} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
+      allow read, create: if request.auth != null && request.auth.uid == userId;
+      allow update: if request.auth != null && request.auth.uid == userId
+                    && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+                         'validation_status',
+                         'validated_at',
+                         'lames_earned'
+                       ]);
+      allow delete: if request.auth != null && request.auth.uid == userId;
     }
 
     match /users/{userId}/cashback_history/{docId} {
@@ -35,9 +51,16 @@ service cloud.firestore {
       allow write: if false;
     }
 
-    // Statistiques des utilisateurs (ex: cycle de rafraîchissement des défis)
+    // Protection des réclamations de tickets anti-rejeu (Hash SHA-256)
+    match /cashback_claims/{docId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+
+    // Statistiques des utilisateurs (Gérées uniquement par Cloud Functions)
     match /user_stats/{userId} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
+      allow read: if request.auth != null && request.auth.uid == userId;
+      allow write: if false;
     }
 
     // Journaux d'activité utilisateur (top-level)
@@ -45,29 +68,32 @@ service cloud.firestore {
       allow read, create: if request.auth != null;
     }
 
-    // Agrégat du classement public (Généré par Cloud Function, aucune donnée sensible)
+    // Agrégat du classement public (Généré par Cloud Function)
     match /leaderboards/{docId} {
       allow read: if request.auth != null;
       allow write: if false;
     }
 
-    // Défis généraux et défis utilisateur
+    // Défis généraux et défis utilisateur (Validation par Cloud Function)
     match /challenges/{docId} {
       allow read: if request.auth != null;
       allow write: if false;
     }
 
     match /user_challenges/{docId} {
-      allow read, write: if request.auth != null;
+      allow read: if request.auth != null;
+      allow write: if false;
     }
 
+    // Offres réclamées (Créées uniquement par Cloud Functions)
     match /user_claimed_offers/{docId} {
       allow read: if request.auth != null;
-      allow write: if request.auth != null;
+      allow write: if false;
     }
 
     match /stores/{storeId} {
       allow read: if true;
+      allow write: if false;
     }
 
     match /shop_items/{itemId} {
@@ -80,20 +106,26 @@ service cloud.firestore {
       allow write: if false;
     }
 
-    // Concours
+    // Concours et participations (Gérés uniquement par Cloud Functions)
     match /contests/{contestId} {
       allow read: if request.auth != null;
       allow write: if false;
     }
 
-    match /contest_entries/{entryId} {
-      allow read, write: if request.auth != null;
+    match /contest_state/{contestId} {
+      allow read: if request.auth != null;
+      allow write: if false;
     }
 
-    // Dons aux campagnes
+    match /contest_entries/{entryId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+
+    // Dons aux campagnes (Gérés uniquement par Cloud Functions)
     match /campaign_donations/{donationId} {
       allow read: if request.auth != null;
-      allow write: if request.auth != null;
+      allow write: if false;
     }
   }
 }

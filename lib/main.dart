@@ -18,6 +18,7 @@ import 'package:google_maps_utils/google_maps_utils.dart' as gmaps_utils
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
+import 'package:firebase_app_check/firebase_app_check.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/cupertino.dart';
@@ -59,8 +60,93 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart'; // IMPORTANT POUR LA NOTIF
 import 'package:safe_device/safe_device.dart'; // <--- AJOUTER CET IMPORT
+import 'package:flutter_play_integrity_wrapper/flutter_play_integrity_wrapper.dart';
 import 'package:google_generative_ai/google_generative_ai.dart';
 import 'auth_screen.dart';
+import 'package:sensors_plus/sensors_plus.dart'; // ← AJOUTER CETTE LIGNE
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+
+/// Helper pour sécuriser le stockage local anti-triche via Android Keystore / iOS Keychain
+class SecureBgStorage {
+  static const _storage = FlutterSecureStorage();
+
+  static Future<void> setDouble(String key, double value) async {
+    await _storage.write(key: key, value: value.toString());
+  }
+
+  static Future<double?> getDouble(String key) async {
+    final str = await _storage.read(key: key);
+    return str != null ? double.tryParse(str) : null;
+  }
+
+  static Future<void> setInt(String key, int value) async {
+    await _storage.write(key: key, value: value.toString());
+  }
+
+  static Future<int?> getInt(String key) async {
+    final str = await _storage.read(key: key);
+    return str != null ? int.tryParse(str) : null;
+  }
+
+  static Future<void> setBool(String key, bool value) async {
+    await _storage.write(key: key, value: value.toString());
+  }
+
+  static Future<bool?> getBool(String key) async {
+    final str = await _storage.read(key: key);
+    return str != null ? str == 'true' : null;
+  }
+
+  static Future<void> setString(String key, String value) async {
+    await _storage.write(key: key, value: value);
+  }
+
+  static Future<String?> getString(String key) async {
+    return await _storage.read(key: key);
+  }
+
+  static Future<void> remove(String key) async {
+    await _storage.delete(key: key);
+  }
+}
+
+Future<bool> verifyDeviceIntegrity() async {
+  try {
+    // 1. Demande un nonce à ta Cloud Function (pour éviter le replay attack)
+    final callable =
+        FirebaseFunctions.instance.httpsCallable('generateIntegrityNonce');
+    final nonceResult = await callable.call();
+    final String nonce = nonceResult.data['nonce'];
+
+    // 2. Demande le token d'intégrité à Google (Android)
+    final playIntegrity = FlutterPlayIntegrityWrapper();
+    final String? token = await playIntegrity.requestIntegrityToken(
+      cloudProjectNumber: '996207167634',
+      nonce: nonce,
+    );
+
+    if (token != null) {
+      // 3. Envoie le token à ta Cloud Function pour vérification auprès de Google
+      final verifyCallable =
+          FirebaseFunctions.instance.httpsCallable('verifyPlayIntegrity');
+      final verifyResult = await verifyCallable.call({'token': token});
+
+      final bool isDeviceValid = verifyResult.data['device_integrity']
+                  ?['attestation']?['deviceRecognitionVerdict']
+              ?.contains('MEETS_DEVICE_INTEGRITY') ??
+          false;
+      final bool isBasicIntegrity =
+          verifyResult.data['basicIntegrity'] ?? false;
+
+      return isDeviceValid && isBasicIntegrity;
+    }
+  } catch (e) {
+    debugPrint("Erreur Play Integrity: $e");
+    // En cas d'erreur, on bloque par sécurité
+    return false;
+  }
+  return false;
+}
 
 class OsrmService {
   final Dio _dio = Dio();
@@ -396,6 +482,16 @@ class SpeedController extends GetxController {
   }
 }
 
+// 🔧 CORRECTIF CAP : petit historique de trajectoire de la flèche, utilisé
+// pour calculer un cap stable même à faible vitesse (marche), au lieu de
+// dépendre du cap GPS brut (bruité) ou d'un seuil de déplacement/frame trop
+// élevé pour être atteint à 3-4 km/h.
+class _ArrowTrailPoint {
+  final DateTime time;
+  final LatLng pos;
+  _ArrowTrailPoint(this.time, this.pos);
+}
+
 class HomeController extends GetxController with GetTickerProviderStateMixin {
   late MapLibreMapController mapController;
   final Completer<void> _mapReadyCompleter = Completer<void>();
@@ -437,6 +533,29 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
   double _lastBearing = 0;
   double _smoothedCameraBearing = 0.0;
   LatLng? _currentAnimatedPos;
+  DateTime _lastMapRenderTime = DateTime.now();
+  LatLng _lastMapRenderPos = const LatLng(0, 0);
+
+  // 🔧 CORRECTIF CAP : historique de la trajectoire réelle de la flèche
+  // (~0.9s) pour calculer un cap stable, fiable même à 3-4 km/h.
+  final List<_ArrowTrailPoint> _arrowTrail = <_ArrowTrailPoint>[];
+
+  void _pushArrowTrail(LatLng p) {
+    final now = DateTime.now();
+    if (_arrowTrail.isNotEmpty) {
+      final last = _arrowTrail.last.pos;
+      if (Geolocator.distanceBetween(
+              last.latitude, last.longitude, p.latitude, p.longitude) >
+          15.0) {
+        _arrowTrail.clear(); // téléportation détectée → repart de zéro
+      }
+    }
+    _arrowTrail.add(_ArrowTrailPoint(now, p));
+    while (_arrowTrail.length > 2 &&
+        now.difference(_arrowTrail.first.time).inMilliseconds > 900) {
+      _arrowTrail.removeAt(0);
+    }
+  }
 
   // 🚀 VARIABLES FILTRE PRÉDICTIF 🚀
   final KinematicFilter kinematicFilter = KinematicFilter();
@@ -963,11 +1082,21 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
               gmaps_utils.PolyUtils.decode(encodedPoly);
 
           if (points.isNotEmpty) {
+            final List<LatLng> stepLatLng = points
+                .map((p) => LatLng(p.x.toDouble(), p.y.toDouble()))
+                .toList();
+
+            // 🔥 Lissage de l’étape
+            final List<LatLng> smoothStep = _smoothRouteForDisplay(
+              stepLatLng,
+              maxSegmentMeters: 10.0,
+              chaikinIterations: 1,
+            );
+
             stepCoords =
-                points.map((p) => [p.y.toDouble(), p.x.toDouble()]).toList();
-            for (var p in points) {
-              polylineCoordinates.add(LatLng(p.x.toDouble(), p.y.toDouble()));
-            }
+                smoothStep.map((p) => [p.longitude, p.latitude]).toList();
+
+            polylineCoordinates.addAll(smoothStep);
           }
         }
 
@@ -1278,6 +1407,71 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
     return (start + diff * t + 360) % 360;
   }
 
+  /// Retourne le cap du segment courant de l'itinéraire.
+  /// Utilisé comme cap sécurisé quand aucun cap fiable n'est disponible.
+  double? _stableRouteBearing(LatLng pos) {
+    if (polylineCoordinates.length < 2) return null;
+
+    int idx = kinematicFilter.displaySnapIndex >= 0
+        ? kinematicFilter.displaySnapIndex
+        : kinematicFilter.lastRouteIndex;
+
+    // Si aucun index connu, on cherche le point le plus proche.
+    if (idx < 0) {
+      double bestDist = double.infinity;
+      idx = 0;
+
+      for (int i = 0; i < polylineCoordinates.length - 1; i++) {
+        final d = Geolocator.distanceBetween(
+          pos.latitude,
+          pos.longitude,
+          polylineCoordinates[i].latitude,
+          polylineCoordinates[i].longitude,
+        );
+
+        if (d < bestDist) {
+          bestDist = d;
+          idx = i;
+        }
+      }
+    }
+
+    idx = idx.clamp(0, polylineCoordinates.length - 2).toInt();
+
+    // Éviter les segments trop courts qui donnent un cap instable.
+    int segmentIndex = idx;
+
+    for (int i = 0; i < 4; i++) {
+      final int candidate = idx + i;
+      if (candidate >= polylineCoordinates.length - 1) break;
+
+      final double len = Geolocator.distanceBetween(
+        polylineCoordinates[candidate].latitude,
+        polylineCoordinates[candidate].longitude,
+        polylineCoordinates[candidate + 1].latitude,
+        polylineCoordinates[candidate + 1].longitude,
+      );
+
+      segmentIndex = candidate;
+
+      if (len > 1.0) break;
+    }
+
+    final p1 = polylineCoordinates[segmentIndex];
+    final p2 = polylineCoordinates[segmentIndex + 1];
+
+    double bearing = Geolocator.bearingBetween(
+      p1.latitude,
+      p1.longitude,
+      p2.latitude,
+      p2.longitude,
+    );
+
+    if (bearing < 0) bearing += 360;
+
+    return bearing;
+  }
+
   // 🚀 LANCE LA BOUCLE D'ANIMATION (Synchronisée avec l'écran via VSync)
   void startFluidNavigation() {
     _navigationTicker?.dispose();
@@ -1293,26 +1487,97 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
           kinematicFilter.predictNextPosition(polylineCoordinates);
 
       if (predictedPos != null && kinematicFilter.lastRealPos != null) {
-        // Cap par défaut = cap GPS
-        double targetBearing = kinematicFilter.lastRealPos!.heading;
+        // ✅ CORRECTIF : à l'arrêt, on fige le cap pour éviter que la flèche
+        // se retourne à cause du jitter GPS ou d'une correction arrière.
+        final bool freezeHeading = kinematicFilter.isStationary;
 
-        // 🔋 CALCUL DU CAP PAR LA TRAJECTOIRE (Beaucoup plus fluide que le cap GPS)
-        if (_currentAnimatedPos != null) {
-          double distMoved = Geolocator.distanceBetween(
-              _currentAnimatedPos!.latitude,
-              _currentAnimatedPos!.longitude,
-              predictedPos.latitude,
-              predictedPos.longitude);
+        double targetBearing = _lastBearing;
+        bool bearingFromPath = _lastBearing != 0.0;
 
-          // Si la voiture avance (au moins 5cm par frame), on calcule le cap réel de déplacement
-          if (distMoved > 0.05) {
+        // Si aucun cap fiable n'est encore connu, on utilise le cap de la route,
+        // jamais le cap GPS brut à l'arrêt.
+        if (!bearingFromPath) {
+          final double? routeBearing = _stableRouteBearing(predictedPos);
+          if (routeBearing != null) {
+            targetBearing = routeBearing;
+            bearingFromPath = true;
+          }
+        }
+
+        // Calcul du cap à partir de la trajectoire réelle de la flèche,
+        // UNIQUEMENT si on n'est pas arrêté.
+        if (!freezeHeading && _arrowTrail.length >= 2) {
+          final LatLng oldP = _arrowTrail.first.pos;
+
+          final double disp = Geolocator.distanceBetween(
+            oldP.latitude,
+            oldP.longitude,
+            predictedPos.latitude,
+            predictedPos.longitude,
+          );
+
+          // Seuil un peu plus élevé qu'avant pour éviter le bruit GPS à l'arrêt.
+          final double minDisp = kinematicFilter.isWalking ? 1.8 : 2.8;
+
+          if (disp >= minDisp) {
             double pathBearing = Geolocator.bearingBetween(
-                _currentAnimatedPos!.latitude,
-                _currentAnimatedPos!.longitude,
-                predictedPos.latitude,
-                predictedPos.longitude);
+              oldP.latitude,
+              oldP.longitude,
+              predictedPos.latitude,
+              predictedPos.longitude,
+            );
+
             if (pathBearing < 0) pathBearing += 360;
-            targetBearing = pathBearing;
+
+            // Sécurité : si le nouveau cap est opposé alors que le déplacement
+            // est petit, c'est probablement du bruit ou une correction arrière.
+            double diff = (pathBearing - targetBearing + 540) % 360 - 180;
+
+            bool suspiciousReverse = targetBearing != 0.0 &&
+                diff.abs() > 120.0 &&
+                disp < (kinematicFilter.isWalking ? 3.5 : 9.0);
+
+            if (kinematicFilter.isBackwardRecovery || suspiciousReverse) {
+              targetBearing =
+                  _lastBearing != 0.0 ? _lastBearing : targetBearing;
+            } else {
+              targetBearing = pathBearing;
+            }
+
+            bearingFromPath = true;
+          }
+        }
+
+        // Repli GPS brut -> cible, UNIQUEMENT en mouvement.
+        // À l'arrêt, le cap GPS brut est beaucoup trop bruité.
+        if (!bearingFromPath && !freezeHeading) {
+          final LatLng? yellowPos = kinematicFilter.rawGpsPos; // 🟡 GPS brut
+          final LatLng? bluePos = kinematicFilter.pointB; // 🔵 cible
+
+          if (yellowPos != null && bluePos != null) {
+            final double yellowToBlueDist = Geolocator.distanceBetween(
+              yellowPos.latitude,
+              yellowPos.longitude,
+              bluePos.latitude,
+              bluePos.longitude,
+            );
+
+            if (yellowToBlueDist > 1.5) {
+              double gpsToTargetBearing = Geolocator.bearingBetween(
+                yellowPos.latitude,
+                yellowPos.longitude,
+                bluePos.latitude,
+                bluePos.longitude,
+              );
+
+              if (gpsToTargetBearing < 0) gpsToTargetBearing += 360;
+
+              if (kinematicFilter.isBackwardRecovery && _lastBearing != 0.0) {
+                targetBearing = _lastBearing;
+              } else {
+                targetBearing = gpsToTargetBearing;
+              }
+            }
           }
         }
 
@@ -1327,22 +1592,54 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
               lerpAngle(_smoothedCameraBearing, targetBearing, 0.08);
         }
 
-        // 4. Mise à jour de l'UI et de l'icône véhicule
-        _updateDriverMarker(snappedPos, _smoothedCameraBearing);
-        _updateDiagnosticMarkers();
-
         _currentAnimatedPos = snappedPos;
         _lastBearing = _smoothedCameraBearing;
 
-        // 5. Mouvement de caméra fluide sans à-coups
-        if (isNavigationCameraLocked.value && !isAnimating.value) {
-          mapController.moveCamera(CameraUpdate.newCameraPosition(
-              CameraPosition(
-                  target: snappedPos,
-                  zoom: 18.0,
-                  bearing:
-                      _smoothedCameraBearing, // <-- Angle lissé appliqué ici
-                  tilt: 50)));
+        // ✅ À l'arrêt, on vide l'historique de trajectoire pour éviter
+        // qu'un ancien point devant + un nouveau point derrière créent un cap inversé.
+        if (freezeHeading) {
+          _arrowTrail.clear();
+        } else {
+          _pushArrowTrail(snappedPos);
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // 🚀 OPTIMISATION RENDU MAPLIBRE (THROTTLING)
+        // ══════════════════════════════════════════════════════════════
+        // MapLibre ne peut pas encaisser 60 mises à jour GeoJSON + Camera par seconde.
+        // On limite le rendu visuel à ~30 FPS OU si le déplacement est significatif.
+        final now = DateTime.now();
+        final timeSinceLastRender =
+            now.difference(_lastMapRenderTime).inMilliseconds;
+        final distSinceLastRender = Geolocator.distanceBetween(
+          _lastMapRenderPos.latitude,
+          _lastMapRenderPos.longitude,
+          snappedPos.latitude,
+          snappedPos.longitude,
+        );
+
+        if (timeSinceLastRender > 30 || distSinceLastRender > 1.5) {
+          _lastMapRenderTime = now;
+          _lastMapRenderPos = snappedPos;
+
+          // 4. Mise à jour de l'UI et de l'icône véhicule
+          _updateDriverMarker(snappedPos, _smoothedCameraBearing);
+          _updateDiagnosticMarkers();
+
+          // 5. Mouvement de caméra fluide sans à-coups
+          if (isNavigationCameraLocked.value && !isAnimating.value) {
+            // 🔧 CORRECTION : Remplacer moveCamera (instantané/saccadé) par animateCamera
+            // avec une durée très courte (40ms). Cela délègue le lissage au moteur natif.
+            mapController.animateCamera(
+              CameraUpdate.newCameraPosition(CameraPosition(
+                target: snappedPos,
+                zoom: 18.0,
+                bearing: _smoothedCameraBearing, // Angle lissé appliqué ici
+                tilt: 50,
+              )),
+              duration: const Duration(milliseconds: 40),
+            );
+          }
         }
       }
     });
@@ -1355,6 +1652,12 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
     _navigationTicker?.dispose();
     _navigationTicker = null;
     _smoothedCameraBearing = 0.0; // <-- Réinitialisation
+    _arrowTrail.clear(); // 🔧 réinitialise l'historique de cap
+
+    // Reset du throttling
+    _lastMapRenderTime = DateTime.now();
+    _lastMapRenderPos = const LatLng(0, 0);
+
     kinematicFilter.reset();
     _clearDiagnosticMarkers(); // 🔍 Effacer les points de diagnostic
   }
@@ -1466,20 +1769,52 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
   _RouteSnapResult _getNearestRoutePoint(LatLng gpsPos, [double? headingGps]) {
     if (polylineCoordinates.isEmpty) return _RouteSnapResult(gpsPos, 0.0);
 
-    LatLng closest = polylineCoordinates.first;
-    double minDist = double.infinity;
+    final int maxSeg = polylineCoordinates.length - 2;
+    if (maxSeg < 0) return _RouteSnapResult(polylineCoordinates.first, 0.0);
 
-    // Optimisation : Fenêtre de recherche basée sur l'index de route connu (anti-sauts sur voies parallèles)
-    int startIndex = 0;
-    int endIndex = polylineCoordinates.length - 1;
-    if (kinematicFilter.lastRouteIndex != -1) {
-      startIndex = kinematicFilter.lastRouteIndex;
-      endIndex = math.min(startIndex + 5, polylineCoordinates.length - 1);
+    // 🔧 CORRIGÉ (anti-téléportation rond-point) : fenêtre bornée en MÈTRES
+    // et BIDIRECTIONNELLE autour du dernier index connu, au lieu d'une
+    // fenêtre de 5 segments UNIQUEMENT EN AVANT. Dans un rond-point, les
+    // points du polyline sont très rapprochés : l'ancienne fenêtre pouvait
+    // accrocher le mauvais côté de la boucle, et comme elle écrivait dans
+    // `kinematicFilter.lastRouteIndex` (la variable du pipeline GPS validé,
+    // voir _findRouteIndex), l'erreur se propageait au fix GPS suivant →
+    // le point bleu semblait "sauter". On utilise maintenant un index
+    // d'affichage dédié (`displaySnapIndex`), jamais partagé.
+    int hint = kinematicFilter.displaySnapIndex;
+    if (hint < 0) hint = kinematicFilter.lastRouteIndex;
+    if (hint < 0) hint = 0;
+    hint = hint.clamp(0, maxSeg);
+
+    const double searchWindowMeters =
+        60.0; // couvre large un rond-point standard
+
+    double segLen(int i) => Geolocator.distanceBetween(
+          polylineCoordinates[i].latitude,
+          polylineCoordinates[i].longitude,
+          polylineCoordinates[i + 1].latitude,
+          polylineCoordinates[i + 1].longitude,
+        );
+
+    int startIndex = hint;
+    double accBehind = 0.0;
+    while (startIndex > 0 && accBehind < searchWindowMeters) {
+      accBehind += segLen(startIndex - 1);
+      startIndex--;
     }
 
+    int endIndex = hint;
+    double accAhead = 0.0;
+    while (endIndex < maxSeg && accAhead < searchWindowMeters) {
+      accAhead += segLen(endIndex);
+      endIndex++;
+    }
+
+    LatLng closest = polylineCoordinates[hint];
+    double minDist = double.infinity;
     int bestIndex = startIndex;
 
-    for (int i = startIndex; i < endIndex; i++) {
+    for (int i = startIndex; i <= endIndex; i++) {
       LatLng p1 = polylineCoordinates[i];
       LatLng p2 = polylineCoordinates[i + 1];
       LatLng proj = _projectCorrected(gpsPos, p1, p2);
@@ -1509,7 +1844,9 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
       }
     }
 
-    kinematicFilter.lastRouteIndex = bestIndex;
+    // ⚠️ On ne touche plus à kinematicFilter.lastRouteIndex ici : cet index
+    // reste la propriété exclusive du pipeline GPS validé (_findRouteIndex).
+    kinematicFilter.displaySnapIndex = bestIndex;
 
     // Distance pure sans pénalité pour les calculs de déviation réels
     double pureDist = Geolocator.distanceBetween(
@@ -1519,8 +1856,25 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
   }
 
   LatLng snapToRoute(LatLng gpsPos, [double? headingGps]) {
+    // CORRIGÉ : on ne snappe plus uniquement sur la distance au point le
+    // plus proche, on tient aussi compte de la précision du dernier fix
+    // GPS (comme le fait déjà predictNextPosition). Un fix dégradé (ville,
+    // sous bois...) proche d'un point de route "par hasard" ne doit pas
+    // faire coller la position affichée dessus.
+    final double maxAccuracy = kinematicFilter.isWalking
+        ? kinematicFilter.maxAccuracyWalking
+        : kinematicFilter.maxAccuracyVehicle;
+
+    if (kinematicFilter.lastRawAccuracy > maxAccuracy) {
+      return gpsPos;
+    }
+
     final snap = _getNearestRoutePoint(gpsPos, headingGps);
-    return snap.distance < 45.0 ? snap.point : gpsPos; // Seuil de snap à 45m
+    // Plus de seuil fixe (45m) : le point bleu glisse toujours sur
+    // l'itinéraire suivi. La cohérence n'est plus jugée sur l'écart brut
+    // au tracé, mais plus loin sur la distance parcourue le long de la
+    // route elle-même (voir VÉRIFICATION DE COHÉRENCE BLEU ↔ JAUNE).
+    return snap.point;
   }
 
   // Projection Orthogonale Corrigée (Prend en compte la courbure de la Terre)
@@ -1546,6 +1900,153 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
       a.latitude + t * (b.latitude - a.latitude),
       a.longitude + t * (b.longitude - a.longitude),
     );
+  }
+
+  /// Lisse une route pour obtenir une courbe visuelle plus fluide.
+  /// maxSegmentMeters : plus il est petit, plus la courbe est dense.
+  /// chaikinIterations : 1 = léger, 2 = très arrondi.
+  List<LatLng> _smoothRouteForDisplay(
+    List<LatLng> raw, {
+    double? maxSegmentMeters,
+    int? chaikinIterations,
+  }) {
+    if (raw.length < 3) return raw;
+
+    final double totalMeters = _polylineLengthMeters(raw);
+
+    // Adaptation automatique selon la longueur du trajet
+    double maxSeg = maxSegmentMeters ??
+        (totalMeters > 20000
+            ? 30.0
+            : totalMeters > 5000
+                ? 20.0
+                : 12.0);
+
+    int iterations = chaikinIterations ?? (totalMeters > 10000 ? 1 : 2);
+
+    // 1. Densifier les segments longs
+    List<LatLng> pts = _densifyRoute(raw, maxSegmentMeters: maxSeg);
+
+    // Sécurité performance
+    if (pts.length > 12000) iterations = 1;
+    if (pts.length > 20000) return pts;
+
+    // 2. Lisser avec Chaikin
+    pts = _chaikinSmooth(pts, iterations: iterations);
+
+    // Forcer à garder exactement le départ et l’arrivée
+    if (pts.length >= 2) {
+      pts[0] = raw.first;
+      pts[pts.length - 1] = raw.last;
+    }
+
+    return pts;
+  }
+
+  double _polylineLengthMeters(List<LatLng> points) {
+    if (points.length < 2) return 0.0;
+
+    double total = 0.0;
+    for (int i = 0; i < points.length - 1; i++) {
+      total += Geolocator.distanceBetween(
+        points[i].latitude,
+        points[i].longitude,
+        points[i + 1].latitude,
+        points[i + 1].longitude,
+      );
+    }
+
+    return total;
+  }
+
+  /// Découpe les segments trop longs pour éviter les grands segments droits.
+  List<LatLng> _densifyRoute(
+    List<LatLng> points, {
+    required double maxSegmentMeters,
+  }) {
+    if (points.length < 2 || maxSegmentMeters <= 0) {
+      return List<LatLng>.from(points);
+    }
+
+    final List<LatLng> result = [points.first];
+
+    for (int i = 0; i < points.length - 1; i++) {
+      final LatLng a = points[i];
+      final LatLng b = points[i + 1];
+
+      final double dist = Geolocator.distanceBetween(
+        a.latitude,
+        a.longitude,
+        b.latitude,
+        b.longitude,
+      );
+
+      if (dist.isNaN || dist.isInfinite || dist <= 0) {
+        result.add(b);
+        continue;
+      }
+
+      if (dist > maxSegmentMeters) {
+        int splits = (dist / maxSegmentMeters).ceil();
+
+        // Sécurité anti-explosion du nombre de points
+        if (splits < 2) splits = 2;
+        if (splits > 180) splits = 180;
+
+        for (int s = 1; s < splits; s++) {
+          final double t = s / splits;
+
+          final double lat = a.latitude + (b.latitude - a.latitude) * t;
+          final double lng = a.longitude + (b.longitude - a.longitude) * t;
+
+          result.add(LatLng(lat, lng));
+        }
+      }
+
+      result.add(b);
+    }
+
+    return result;
+  }
+
+  /// Algorithme de lissage Chaikin.
+  /// Transforme une polyligne anguleuse en courbe plus douce.
+  List<LatLng> _chaikinSmooth(
+    List<LatLng> points, {
+    int iterations = 1,
+  }) {
+    List<LatLng> current = List<LatLng>.from(points);
+
+    for (int it = 0; it < iterations; it++) {
+      if (current.length < 3) break;
+
+      final List<LatLng> next = <LatLng>[current.first];
+
+      for (int i = 0; i < current.length - 1; i++) {
+        final LatLng a = current[i];
+        final LatLng b = current[i + 1];
+
+        // Point à 25% du segment
+        final LatLng q = LatLng(
+          a.latitude + (b.latitude - a.latitude) * 0.25,
+          a.longitude + (b.longitude - a.longitude) * 0.25,
+        );
+
+        // Point à 75% du segment
+        final LatLng r = LatLng(
+          a.latitude + (b.latitude - a.latitude) * 0.75,
+          a.longitude + (b.longitude - a.longitude) * 0.75,
+        );
+
+        next.add(q);
+        next.add(r);
+      }
+
+      next.add(current.last);
+      current = next;
+    }
+
+    return current;
   }
 
   // --- GESTION ANTI-SPAM DES PERMISSIONS GPS ---
@@ -1771,23 +2272,44 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
         int hours = mins ~/ 60;
         timeLeft.value = hours > 0 ? "${hours}h ${mins % 60}min" : "$mins min";
 
-        // Traitement de la géométrie (Polyline)
-        List coords = routeData['geometry']['coordinates'];
-        for (var c in coords) {
-          // OSRM renvoie [long, lat], on stocke LatLng(lat, long)
-          polylineCoordinates.add(LatLng(c[1], c[0]));
-        }
+        // Traitement de la géométrie OSRM
+        final List rawCoords = routeData['geometry']['coordinates'] as List;
 
-        // Dessin sur la carte (Source GeoJSON)
+        final List<LatLng> rawRoute = rawCoords.map((dynamic c) {
+          final List pair = c as List;
+          final double lat = (pair[1] as num).toDouble();
+          final double lng = (pair[0] as num).toDouble();
+          return LatLng(lat, lng);
+        }).toList();
+
+        // 🔥 Transformation en courbe fluide
+        final List<LatLng> smoothRoute = _smoothRouteForDisplay(
+          rawRoute,
+          maxSegmentMeters: 10.0,
+          chaikinIterations: 2,
+        );
+
+        // On utilise la route lissée pour le snapping / animation / distance restante
+        polylineCoordinates.clear();
+        polylineCoordinates.addAll(smoothRoute);
+
+        // GeoJSON lissé pour MapLibre
+        final List<List<double>> smoothCoords =
+            smoothRoute.map((LatLng p) => [p.longitude, p.latitude]).toList();
+
         final feature = {
           "type": "FeatureCollection",
           "features": [
             {
               "type": "Feature",
-              "geometry": {"type": "LineString", "coordinates": coords}
+              "geometry": {
+                "type": "LineString",
+                "coordinates": smoothCoords,
+              },
             }
           ]
         };
+
         await _setSafeGeoJsonSource(routeSourceId, feature);
 
         // -----------------------------------------------------
@@ -1874,8 +2396,15 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
         Geolocator.getPositionStream(locationSettings: settings)
             .listen((Position position) {
       if (mapStatus.value == Constants.onDestination) return;
+
+      // ✅ Évite de faire tourner la flèche quand la vitesse est quasi nulle.
+      final double heading =
+          position.speed > 0.3 ? position.heading : _lastBearing;
+
       _updateDriverMarker(
-          LatLng(position.latitude, position.longitude), position.heading);
+        LatLng(position.latitude, position.longitude),
+        heading,
+      );
     });
   }
 
@@ -1930,17 +2459,13 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
     }
 
     // --- AJOUT SÉCURITÉ MOCK LOCATION ---
-    const bool securityEnabled = false;
-
-    if (securityEnabled) {
-      if (permission == LocationPermission.always ||
-          permission == LocationPermission.whileInUse) {
-        bool isMockLocation = await SafeDevice.isMockLocation;
-        if (isMockLocation) {
-          Get.offAll(() => const SecurityBlockedScreen(
-              reason: "Position fictive (Fake GPS) détectée."));
-          return;
-        }
+    if (permission == LocationPermission.always ||
+        permission == LocationPermission.whileInUse) {
+      bool isMockLocation = await SafeDevice.isMockLocation;
+      if (isMockLocation) {
+        Get.offAll(() => const SecurityBlockedScreen(
+            reason: "Position fictive (Fake GPS) détectée."));
+        return;
       }
     }
     // ------------------------------------
@@ -1949,6 +2474,19 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
 }
 
 class NavigationController extends GetxController {
+  @override
+  void onInit() {
+    super.onInit();
+    if (!kIsWeb && (Platform.isAndroid || Platform.isIOS)) {
+      FlutterBackgroundService().on('bg_arrival_detected').listen((event) {
+        if (!homeController.arrived.value) {
+          homeController.arrived.value = true;
+          _finishTripWithRecap();
+        }
+      });
+    }
+  }
+
   final HomeController homeController = Get.find();
   final SpeedController speedController = Get.find();
   var isStayTimerActive = false.obs;
@@ -1987,7 +2525,9 @@ class NavigationController extends GetxController {
   Function()? onStoreDestinationReached;
   Function(dynamic)? _onChallengeReached;
   Function(String)? _onWorkReached;
-  Function(int)? onNormalDestinationReached;
+  Function(int, String?)? onNormalDestinationReached;
+  String? _lastCompletedTripId;
+  LatLng? _tripStartPos;
 
   // Variables spécifiques Arrêt de Bus
   LatLng? _targetBusStopLocation;
@@ -2176,6 +2716,7 @@ class NavigationController extends GetxController {
       _totalDeviationMeters = 0.0;
       _positionSampleCount = 0;
       final userPos = await homeController.getMyCurrentLocation();
+      _tripStartPos = LatLng(userPos.latitude, userPos.longitude);
       final docRef = await FirebaseFirestore.instance
           .collection('users')
           .doc(userId)
@@ -2229,16 +2770,9 @@ class NavigationController extends GetxController {
   Future<void> _flushTripPositions() async {
     if (_activeTripId == null || _tripPositionBuffer.isEmpty) return;
     try {
-      final userId = FirebaseAuth.instance.currentUser?.uid;
-      if (userId == null) return;
-      final buf = List<Map<String, dynamic>>.from(_tripPositionBuffer);
+      // 🚨 OPTIMISATION FIRESTORE : Les points GPS ne sont PAS sauvegardés sous forme de tableau NoSQL dans Firestore.
+      // Cela évite la surfacturation d'écritures et la taille de document excessive (arrayUnion).
       _tripPositionBuffer.clear();
-      await FirebaseFirestore.instance
-          .collection('users')
-          .doc(userId)
-          .collection('trip_logs')
-          .doc(_activeTripId)
-          .update({'positions': FieldValue.arrayUnion(buf)});
     } catch (e) {
       debugPrint('[TripLog] Erreur flush: $e');
     }
@@ -2349,7 +2883,7 @@ class NavigationController extends GetxController {
       _onChallengeReached = cb;
   void setOnWorkDestinationReachedCallback(Function(String) cb) =>
       _onWorkReached = cb;
-  void setOnNormalDestinationReachedCallback(Function(int) cb) =>
+  void setOnNormalDestinationReachedCallback(Function(int, String?) cb) =>
       onNormalDestinationReached = cb;
 
   /// Transmettre le profil utilisateur pour la tolérance déviation (3km standard / 6km premium)
@@ -2378,6 +2912,301 @@ class NavigationController extends GetxController {
     navigateToDestination();
   }
 
+  int _currentGpsIntervalMs = 1000; // Intervalle par défaut (1 seconde)
+
+  void _startPositionStream() {
+    positionStream?.cancel();
+
+    LocationSettings settings = Platform.isAndroid
+        ? AndroidSettings(
+            accuracy: LocationAccuracy.bestForNavigation,
+            distanceFilter: 0,
+            intervalDuration: Duration(milliseconds: _currentGpsIntervalMs),
+          )
+        : AppleSettings(
+            accuracy: LocationAccuracy.bestForNavigation,
+            distanceFilter: 0,
+            activityType: ActivityType.automotiveNavigation,
+          );
+
+    positionStream = Geolocator.getPositionStream(locationSettings: settings)
+        .listen(_onGpsPositionUpdate);
+  }
+
+  void _updateGpsInterval(double speedKmh) {
+    int targetIntervalMs = 1000;
+
+    // 🚀 LOGIQUE DYNAMIQUE :
+    // <= 10 km/h (arrêt/lent) ou > 25 km/h (rapide) -> 550 ms pour la précision
+    // Entre 10 et 25 km/h -> 1000 ms pour économiser la batterie/CPU
+    if (speedKmh <= 10.0 || speedKmh > 25.0) {
+      targetIntervalMs = 550;
+    }
+
+    if (targetIntervalMs != _currentGpsIntervalMs) {
+      _currentGpsIntervalMs = targetIntervalMs;
+      debugPrint(
+          "🔄 GPS Interval changed to ${_currentGpsIntervalMs}ms (Speed: ${speedKmh.toStringAsFixed(1)} km/h)");
+      _startPositionStream(); // Recrée le stream avec le nouvel intervalle
+    }
+  }
+
+  // Méthode qui remplace l'ancienne closure du listener
+  void _onGpsPositionUpdate(Position position) {
+    // ⏱️ 1. DÉBUT DU CHRONO : Réception du GPS
+    final receiveTime = DateTime.now();
+    if (_lastGpsReceiveTime != null) {
+      timeBetweenGpsMs.value =
+          receiveTime.difference(_lastGpsReceiveTime!).inMilliseconds;
+    }
+    _lastGpsReceiveTime = receiveTime;
+
+    // 🚀 2. DONNER LA VRAIE POSITION AU FILTRE !
+    final currentMode = homeController.currentTravelMode.value;
+    bool isWalking = currentMode == TravelMode.walking ||
+        currentMode == Constants.modeWalking;
+    homeController.kinematicFilter
+        .updateRealPosition(position, isWalkingMode: isWalking);
+
+    // 🔍 3. MISE À JOUR DES POINTS DE DIAGNOSTIC
+    homeController._updateDiagnosticMarkers();
+
+    // ─── GARDE-FOU: Ne pas exécuter si on cherche déjà une route ───
+    if (homeController.gettingRoute.value) return;
+
+    final now = DateTime.now();
+    speedController.updateSpeed(position);
+
+    LatLng rawPos = LatLng(position.latitude, position.longitude);
+    // CORRIGÉ : On utilise la vitesse lissée du SpeedController
+    double currentSpeedKmh = speedController.currentSpeed.value;
+    if (currentSpeedKmh < 0) currentSpeedKmh = 0;
+
+    // 🚀 AJOUT : Ajustement dynamique de l'intervalle GPS selon la vitesse
+    _updateGpsInterval(currentSpeedKmh);
+
+    // CORRIGÉ : On enregistre la vitesse pour le récapitulatif final (tous les modes)
+    _speedHistory.add(currentSpeedKmh);
+
+    if (homeController.currentTravelMode.value != TravelMode.transit &&
+        !_isSwitchingModeDialogTrace) {
+      bool stopNow = _analyzeSpeedCompliance(currentSpeedKmh);
+      if (stopNow) return;
+    }
+
+    // ✅ À faible vitesse, le heading GPS n'est pas fiable.
+    final double? headingForSnap =
+        currentSpeedKmh > 3.0 ? position.heading : null;
+
+    final snapResult =
+        homeController._getNearestRoutePoint(rawPos, headingForSnap);
+    LatLng snappedPos = snapResult.distance < 30.0 ? snapResult.point : rawPos;
+    double distanceDeviation = snapResult.distance;
+
+    // Initialiser _lastOnRoutePosition au premier point GPS si pas encore init
+    if (_lastOnRoutePosition == null) {
+      _lastOnRoutePosition = snappedPos;
+      _lastOnRouteTime = DateTime.now();
+      debugPrint(
+          "✅ Déviation: Point de référence initialisé à ${snappedPos.latitude}, ${snappedPos.longitude}");
+    }
+
+    var mode = homeController.currentTravelMode.value;
+    bool isWalkOrBike =
+        mode == TravelMode.walking || mode == TravelMode.bicycling;
+
+    if (isWalkOrBike && !_isDeviationDialogOpen) {
+      if (distanceDeviation > 30.0) {
+        LatLng referencePoint = _lastOnRoutePosition ?? snappedPos;
+        double distSinceLastOnRoute = Geolocator.distanceBetween(
+          rawPos.latitude,
+          rawPos.longitude,
+          referencePoint.latitude,
+          referencePoint.longitude,
+        );
+        if (distSinceLastOnRoute > _cumulatedDeviationMeters) {
+          _cumulatedDeviationMeters = distSinceLastOnRoute;
+        }
+      } else {
+        _lastOnRoutePosition = snappedPos;
+        _lastOnRouteTime = DateTime.now();
+        _cumulatedDeviationMeters = 0.0;
+      }
+
+      // RÈGLE DE LA MORT SUBITE
+      if (_hasUsedManualRecalculate && _cumulatedDeviationMeters > 50.0) {
+        print("🚨 DEUXIÈME DÉVIATION DÉTECTÉE (> 50m). ARRÊT IMMÉDIAT.");
+        _triggerDeviationFailure();
+        return;
+      }
+
+      bool isPremium = _activeUserProfile?.isVip ?? false;
+      double deviationLimitMeters = isPremium ? 6000.0 : 3000.0;
+      double autoRecalculateLimitMeters = isWalkOrBike ? 50.0 : 100.0;
+
+      if (_cumulatedDeviationMeters >= autoRecalculateLimitMeters &&
+          !_isDeviationDialogOpen &&
+          !_hasUsedManualRecalculate) {
+        bool canAutoRecalculate = _lastAutoRecalculateTime == null ||
+            DateTime.now().difference(_lastAutoRecalculateTime!).inSeconds >=
+                10;
+
+        if (canAutoRecalculate) {
+          print(
+              "🚨 DÉVIATION MAJEURE DÉTECTÉE : ${(_cumulatedDeviationMeters / 1000).toStringAsFixed(2)}km - RECALCUL AUTOMATIQUE");
+          _isDeviationDialogOpen = true;
+          _recalculateToLastOnRoutePoint(rawPos).then((_) {
+            _isDeviationDialogOpen = false;
+          }).catchError((e) {
+            debugPrint("❌ Erreur recalcul déviation: $e");
+            _isDeviationDialogOpen = false;
+          });
+          return;
+        }
+      }
+
+      if (_cumulatedDeviationMeters >= deviationLimitMeters &&
+          !_hasUsedManualRecalculate) {
+        _showDeviationPopup(
+            _cumulatedDeviationMeters, deviationLimitMeters, rawPos);
+        return;
+      }
+    }
+
+    homeController.updateRemainingDistanceAndTime(snappedPos);
+    _updateInstruction(rawPos);
+    _logTripPosition(rawPos, currentSpeedKmh, position.heading);
+
+    if (_targetBusStopLocation != null) {
+      double distanceToStop = Geolocator.distanceBetween(
+          rawPos.latitude,
+          rawPos.longitude,
+          _targetBusStopLocation!.latitude,
+          _targetBusStopLocation!.longitude);
+
+      // Détection d'arrêt de bus
+      if (distanceToStop <= 15.0 && !_hasReachedBusStop) {
+        _hasReachedBusStop = true;
+        isOnBus.value = false;
+        _busStopArrivalTime = DateTime.now();
+        currentInstructionText.value =
+            "🚌 Arrêt de bus atteint. En attente du départ...";
+        homeController._safeSnackbar(
+          "🚌 Arrêt de bus atteint",
+          "Restez près du point d'arrêt pour monter à bord.",
+          backgroundColor: Colors.blue.shade700,
+          duration: const Duration(seconds: 4),
+        );
+      }
+
+      // Détection du départ du bus
+      if (_hasReachedBusStop &&
+          !isOnBus.value &&
+          distanceToStop > 30.0 &&
+          currentSpeedKmh > 8.0) {
+        isOnBus.value = true;
+        _hasReachedBusStop = false;
+        _busStopArrivalTime = null;
+        _targetBusStopLocation = null;
+        currentInstructionText.value = "🚌 Bus parti. Bon voyage !";
+        homeController._safeSnackbar(
+          "🚌 Bus parti",
+          "Le bus est en mouvement. Profitez du trajet.",
+          backgroundColor: Colors.green.shade700,
+          duration: const Duration(seconds: 4),
+        );
+      }
+
+      // Arrivée à un arrêt (si déjà dans le bus)
+      if (isOnBus.value && distanceToStop <= 15.0 && currentSpeedKmh < 5.0) {
+        isOnBus.value = false;
+        _busStopArrivalTime = DateTime.now();
+        currentInstructionText.value =
+            "🚌 Bus à l'arrêt. Préparez-vous à descendre.";
+        homeController._safeSnackbar(
+          "🚌 Arrivée",
+          "Le bus est à l'arrêt. Préparez-vous à descendre.",
+          backgroundColor: Colors.blue.shade700,
+          duration: const Duration(seconds: 4),
+        );
+      }
+
+      // --- CORRECTION LOGIQUE RETARD BUS ---
+      if (_busStopArrivalTime != null &&
+          _hasReachedBusStop &&
+          distanceToStop <= 15.0) {
+        bool isDelayed = false;
+
+        if (_targetBusStopSchedule != null) {
+          // Le bus est en retard SI on a dépassé l'heure prévue de plus de 5 minutes
+          isDelayed =
+              DateTime.now().difference(_targetBusStopSchedule!).inSeconds >
+                  300;
+        } else {
+          // Fallback: 15 minutes d'attente minimum avant de le considérer en retard
+          isDelayed =
+              DateTime.now().difference(_busStopArrivalTime!).inSeconds > 900;
+        }
+
+        if (isDelayed) {
+          _showCriticalModal(
+            'Retard de bus détecté',
+            '⏳ Le bus semble bloqué ou en retard. Vérifiez le planning ou choisissez un autre itinéraire.',
+          );
+          _busStopArrivalTime = null; // Ne pas spammer l'utilisateur
+        }
+      }
+      // --------------------------------------
+
+      // Détection d'écart du tracé (transit)
+      if (_transitMonitor != null &&
+          homeController.polylineCoordinates.isNotEmpty) {
+        bool isOnRoute = _transitMonitor!.checkPosition(
+          rawPos,
+          homeController.polylineCoordinates,
+          currentSpeedKmh,
+        );
+
+        if (!isOnRoute && _transitOffRouteSince != null) {
+          final offRouteDuration =
+              DateTime.now().difference(_transitOffRouteSince!);
+
+          if (offRouteDuration.inSeconds > 60) {
+            print(
+                "🚨 TRICHE TRANSIT : Hors du tracé depuis plus de 60s. ARRÊT IMMÉDIAT.");
+            _triggerCheatDetection("Vous avez quitté le trajet du bus.");
+            return;
+          }
+
+          if (offRouteDuration.inSeconds > 30 && !_transitOffRouteLongWarning) {
+            _transitOffRouteLongWarning = true;
+            homeController._safeSnackbar(
+              "⚠️ Hors itinéraire",
+              "Vous avez quitté le trajet du bus. Retournez-y vite !",
+              backgroundColor: Colors.orange.shade700,
+              duration: const Duration(seconds: 5),
+            );
+          }
+        }
+      }
+
+      // Gestion du pop-up horaire du bus (retard / avance)
+      if (distanceToStop <= 10.0 &&
+          !_isScheduleDialogOpen &&
+          !_hasReachedBusStop) {
+        _checkBusStopArrivalLogic();
+      }
+    }
+
+    _lastPositionTime = now;
+    _lastSnappedPos = snappedPos;
+    _checkRouteLogic(rawPos, snappedPos);
+
+    // ⏱️ 4. FIN DU CHRONO : Temps de traitement du code
+    final finishTime = DateTime.now();
+    gpsProcessingMs.value = finishTime.difference(receiveTime).inMilliseconds;
+  } // Fin de _onGpsPositionUpdate
+
   void navigateToDestination({bool validateWalkingLegs = false}) async {
     if (homeController.polylineCoordinates.isEmpty) return;
 
@@ -2395,19 +3224,25 @@ class NavigationController extends GetxController {
         .map((p) => {'lat': p.latitude, 'lng': p.longitude})
         .toList();
 
-    await SharedPreferences.getInstance().then((prefs) {
-      prefs.setBool('bg_is_navigating', true);
-      prefs.setString('bg_travel_mode', bgModeStr);
-      prefs.setDouble('bg_elevation_factor', currentElevFactor);
-      prefs.setDouble('bg_max_deviation', deviationLimit);
-      prefs.setString('bg_route_polyline', jsonEncode(serializedPolyline));
-    });
+    await SecureBgStorage.setBool('bg_is_navigating', true);
+    await SecureBgStorage.setString('bg_travel_mode', bgModeStr);
+    await SecureBgStorage.setDouble('bg_elevation_factor', currentElevFactor);
+    await SecureBgStorage.setDouble('bg_max_deviation', deviationLimit);
+    await SecureBgStorage.setString(
+        'bg_route_polyline', jsonEncode(serializedPolyline));
+    await SecureBgStorage.setDouble(
+        'bg_destination_lat', homeController.destinationCoordinates.latitude);
+    await SecureBgStorage.setDouble(
+        'bg_destination_lng', homeController.destinationCoordinates.longitude);
     // ----------------------------------------------------
 
-    FlutterBackgroundService().invoke("stop_background_trip", {
+    // Démarrer le service de fond s'il n'est pas déjà actif
+    await FlutterBackgroundService().startService();
+    // Envoyer le signal pour activer le mode navigation
+    FlutterBackgroundService().invoke("start_navigation_tracking", {
       'travel_mode': bgModeStr,
     });
-    print("📡 Envoi signal: stop_background_trip avec paramètres avancés");
+    print("📡 Envoi signal: start_navigation_tracking (Service démarré)");
 
     // Dessiner le cercle rouge si c'est un défi "Rester sur place"
     if (activeChallenge != null &&
@@ -2516,272 +3351,19 @@ class NavigationController extends GetxController {
       );
     });
 
+    // ═══ AJOUT : Démarrer l'accéléromètre ═══
+    final bool isWalkMode =
+        homeController.currentTravelMode.value == TravelMode.walking ||
+            homeController.currentTravelMode.value == Constants.modeWalking;
+    homeController.kinematicFilter.accelDetector.setWalkingMode(isWalkMode);
+    homeController.kinematicFilter.accelDetector.start(isWalking: isWalkMode);
+
     // 🚀 Lancer l'animation prédictive
     homeController.startFluidNavigation();
 
-    // 🔋 RÉGLAGES GPS TEMPS RÉEL (Idéal pour la navigation, comme Google Maps/Waze)
-    // On met distanceFilter à 0 pour recevoir des updates même à l'arrêt.
-    LocationSettings settings = Platform.isAndroid
-        ? AndroidSettings(
-            accuracy: LocationAccuracy.bestForNavigation,
-            distanceFilter:
-                0, // 0 = Désactivé, on se base uniquement sur le temps
-            intervalDuration:
-                const Duration(seconds: 1), // 1 update par seconde !
-          )
-        : AppleSettings(
-            accuracy: LocationAccuracy.bestForNavigation,
-            distanceFilter: 0, // 0 = Désactivé
-            activityType: ActivityType.automotiveNavigation,
-          );
-
-    positionStream = Geolocator.getPositionStream(locationSettings: settings)
-        .listen((Position position) {
-      // ⏱️ 1. DÉBUT DU CHRONO : Réception du GPS
-      final receiveTime = DateTime.now();
-      if (_lastGpsReceiveTime != null) {
-        timeBetweenGpsMs.value =
-            receiveTime.difference(_lastGpsReceiveTime!).inMilliseconds;
-      }
-      _lastGpsReceiveTime = receiveTime;
-
-      // 🚀 2. DONNER LA VRAIE POSITION AU FILTRE !
-      final currentMode = homeController.currentTravelMode.value;
-      bool isWalking = currentMode == TravelMode.walking ||
-          currentMode == Constants.modeWalking;
-      homeController.kinematicFilter
-          .updateRealPosition(position, isWalkingMode: isWalking);
-
-      // 🔍 3. MISE À JOUR DES POINTS DE DIAGNOSTIC
-      homeController._updateDiagnosticMarkers();
-
-      // ─── GARDE-FOU: Ne pas exécuter si on cherche déjà une route ───
-      if (homeController.gettingRoute.value) return;
-
-      final now = DateTime.now();
-      speedController.updateSpeed(position);
-
-      LatLng rawPos = LatLng(position.latitude, position.longitude);
-      // CORRIGÉ : On utilise la vitesse lissée du SpeedController
-      double currentSpeedKmh = speedController.currentSpeed.value;
-      if (currentSpeedKmh < 0) currentSpeedKmh = 0;
-
-      // CORRIGÉ : On enregistre la vitesse pour le récapitulatif final (tous les modes)
-      _speedHistory.add(currentSpeedKmh);
-
-      if (homeController.currentTravelMode.value != TravelMode.transit &&
-          !_isSwitchingModeDialogTrace) {
-        bool stopNow = _analyzeSpeedCompliance(currentSpeedKmh);
-        if (stopNow) return;
-      }
-
-      final snapResult =
-          homeController._getNearestRoutePoint(rawPos, position.heading);
-      LatLng snappedPos =
-          snapResult.distance < 30.0 ? snapResult.point : rawPos;
-      double distanceDeviation = snapResult.distance;
-
-      // Initialiser _lastOnRoutePosition au premier point GPS si pas encore init
-      if (_lastOnRoutePosition == null) {
-        _lastOnRoutePosition = snappedPos;
-        _lastOnRouteTime = DateTime.now();
-        debugPrint(
-            "✅ Déviation: Point de référence initialisé à ${snappedPos.latitude}, ${snappedPos.longitude}");
-      }
-
-      var mode = homeController.currentTravelMode.value;
-      bool isWalkOrBike =
-          mode == TravelMode.walking || mode == TravelMode.bicycling;
-
-      if (isWalkOrBike && !_isDeviationDialogOpen) {
-        if (distanceDeviation > 30.0) {
-          LatLng referencePoint = _lastOnRoutePosition ?? snappedPos;
-          double distSinceLastOnRoute = Geolocator.distanceBetween(
-            rawPos.latitude,
-            rawPos.longitude,
-            referencePoint.latitude,
-            referencePoint.longitude,
-          );
-          if (distSinceLastOnRoute > _cumulatedDeviationMeters) {
-            _cumulatedDeviationMeters = distSinceLastOnRoute;
-          }
-        } else {
-          _lastOnRoutePosition = snappedPos;
-          _lastOnRouteTime = DateTime.now();
-          _cumulatedDeviationMeters = 0.0;
-        }
-
-        // RÈGLE DE LA MORT SUBITE
-        if (_hasUsedManualRecalculate && _cumulatedDeviationMeters > 50.0) {
-          print("🚨 DEUXIÈME DÉVIATION DÉTECTÉE (> 50m). ARRÊT IMMÉDIAT.");
-          _triggerDeviationFailure();
-          return;
-        }
-
-        bool isPremium = _activeUserProfile?.isVip ?? false;
-        double deviationLimitMeters = isPremium ? 6000.0 : 3000.0;
-        double autoRecalculateLimitMeters = isWalkOrBike ? 50.0 : 100.0;
-
-        if (_cumulatedDeviationMeters >= autoRecalculateLimitMeters &&
-            !_isDeviationDialogOpen &&
-            !_hasUsedManualRecalculate) {
-          bool canAutoRecalculate = _lastAutoRecalculateTime == null ||
-              DateTime.now().difference(_lastAutoRecalculateTime!).inSeconds >=
-                  10;
-
-          if (canAutoRecalculate) {
-            print(
-                "🚨 DÉVIATION MAJEURE DÉTECTÉE : ${(_cumulatedDeviationMeters / 1000).toStringAsFixed(2)}km - RECALCUL AUTOMATIQUE");
-            _isDeviationDialogOpen = true;
-            _recalculateToLastOnRoutePoint(rawPos).then((_) {
-              _isDeviationDialogOpen = false;
-            }).catchError((e) {
-              debugPrint("❌ Erreur recalcul déviation: $e");
-              _isDeviationDialogOpen = false;
-            });
-            return;
-          }
-        }
-
-        if (_cumulatedDeviationMeters >= deviationLimitMeters &&
-            !_hasUsedManualRecalculate) {
-          _showDeviationPopup(
-              _cumulatedDeviationMeters, deviationLimitMeters, rawPos);
-          return;
-        }
-      }
-
-      homeController.updateRemainingDistanceAndTime(snappedPos);
-      _updateInstruction(rawPos);
-      _logTripPosition(rawPos, currentSpeedKmh, position.heading);
-
-      if (_targetBusStopLocation != null) {
-        double distanceToStop = Geolocator.distanceBetween(
-            rawPos.latitude,
-            rawPos.longitude,
-            _targetBusStopLocation!.latitude,
-            _targetBusStopLocation!.longitude);
-
-        // Détection d'arrêt de bus
-        if (distanceToStop <= 15.0 && !_hasReachedBusStop) {
-          _hasReachedBusStop = true;
-          isOnBus.value = false;
-          _busStopArrivalTime = DateTime.now();
-          currentInstructionText.value =
-              "🚌 Arrêt de bus atteint. En attente du départ...";
-          homeController._safeSnackbar(
-            "🚌 Arrêt de bus atteint",
-            "Restez près du point d'arrêt pour monter à bord.",
-            backgroundColor: Colors.blue.shade700,
-            duration: const Duration(seconds: 4),
-          );
-        }
-
-        // Détection du départ du bus
-        if (_hasReachedBusStop &&
-            !isOnBus.value &&
-            distanceToStop > 30.0 &&
-            currentSpeedKmh > 8.0) {
-          isOnBus.value = true;
-          _hasReachedBusStop = false;
-          _busStopArrivalTime = null;
-          _targetBusStopLocation = null;
-          currentInstructionText.value = "🚌 Bus parti. Bon voyage !";
-          homeController._safeSnackbar(
-            "🚌 Bus parti",
-            "Le bus est en mouvement. Profitez du trajet.",
-            backgroundColor: Colors.green.shade700,
-            duration: const Duration(seconds: 4),
-          );
-        }
-
-        // Arrivée à un arrêt (si déjà dans le bus)
-        if (isOnBus.value && distanceToStop <= 15.0 && currentSpeedKmh < 5.0) {
-          isOnBus.value = false;
-          _busStopArrivalTime = DateTime.now();
-          currentInstructionText.value =
-              "🚌 Bus à l'arrêt. Préparez-vous à descendre.";
-          homeController._safeSnackbar(
-            "🚌 Arrivée",
-            "Le bus est à l'arrêt. Préparez-vous à descendre.",
-            backgroundColor: Colors.blue.shade700,
-            duration: const Duration(seconds: 4),
-          );
-        }
-
-        // --- CORRECTION LOGIQUE RETARD BUS ---
-        if (_busStopArrivalTime != null &&
-            _hasReachedBusStop &&
-            distanceToStop <= 15.0) {
-          bool isDelayed = false;
-
-          if (_targetBusStopSchedule != null) {
-            // Le bus est en retard SI on a dépassé l'heure prévue de plus de 5 minutes
-            isDelayed =
-                DateTime.now().difference(_targetBusStopSchedule!).inSeconds >
-                    300;
-          } else {
-            // Fallback: 15 minutes d'attente minimum avant de le considérer en retard
-            isDelayed =
-                DateTime.now().difference(_busStopArrivalTime!).inSeconds > 900;
-          }
-
-          if (isDelayed) {
-            _showCriticalModal(
-              'Retard de bus détecté',
-              '⏳ Le bus semble bloqué ou en retard. Vérifiez le planning ou choisissez un autre itinéraire.',
-            );
-            _busStopArrivalTime = null; // Ne pas spammer l'utilisateur
-          }
-        }
-        // --------------------------------------
-
-        // Détection d'écart du tracé (transit)
-        if (_transitMonitor != null &&
-            homeController.polylineCoordinates.isNotEmpty) {
-          bool isOnRoute = _transitMonitor!
-              .checkPosition(rawPos, homeController.polylineCoordinates);
-
-          if (!isOnRoute && _transitOffRouteSince != null) {
-            final offRouteDuration =
-                DateTime.now().difference(_transitOffRouteSince!);
-
-            if (offRouteDuration.inSeconds > 60) {
-              print(
-                  "🚨 TRICHE TRANSIT : Hors du tracé depuis plus de 60s. ARRÊT IMMÉDIAT.");
-              _triggerCheatDetection("Vous avez quitté le trajet du bus.");
-              return;
-            }
-
-            if (offRouteDuration.inSeconds > 30 &&
-                !_transitOffRouteLongWarning) {
-              _transitOffRouteLongWarning = true;
-              homeController._safeSnackbar(
-                "⚠️ Hors itinéraire",
-                "Vous avez quitté le trajet du bus. Retournez-y vite !",
-                backgroundColor: Colors.orange.shade700,
-                duration: const Duration(seconds: 5),
-              );
-            }
-          }
-        }
-
-        // Gestion du pop-up horaire du bus (retard / avance)
-        if (distanceToStop <= 10.0 &&
-            !_isScheduleDialogOpen &&
-            !_hasReachedBusStop) {
-          _checkBusStopArrivalLogic();
-        }
-      }
-
-      _lastPositionTime = now;
-      _lastSnappedPos = snappedPos;
-      _checkRouteLogic(rawPos, snappedPos);
-
-      // ⏱️ 4. FIN DU CHRONO : Temps de traitement du code
-      final finishTime = DateTime.now();
-      gpsProcessingMs.value = finishTime.difference(receiveTime).inMilliseconds;
-    });
+    // 🔋 RÉGLAGES GPS TEMPS RÉEL (Intervalle dynamique selon la vitesse)
+    _currentGpsIntervalMs = 1000; // Initialisation à 1 seconde
+    _startPositionStream();
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -3807,9 +4389,21 @@ class NavigationController extends GetxController {
   }
 
   void _checkRouteLogic(LatLng raw, LatLng snapped) {
+    // CORRIGÉ : on utilise la position "snapped" (filtrée/projetée sur la
+    // route) plutôt que la position GPS brute pour détecter l'arrivée. Un
+    // fix brut aberrant (précision dégradée en ville, tunnel, etc.) pouvait
+    // tomber par hasard à moins de 40m de la destination et déclencher une
+    // arrivée prématurée. On ajoute aussi un filtre de précision GPS,
+    // cohérent avec le filtre qualité déjà utilisé dans le moteur de
+    // prédiction (predictNextPosition).
+    final kf = homeController.kinematicFilter;
+    final double maxAccuracy =
+        kf.isWalking ? kf.maxAccuracyWalking : kf.maxAccuracyVehicle;
+    if (kf.lastRawAccuracy > maxAccuracy) return;
+
     double distDest = Geolocator.distanceBetween(
-        raw.latitude,
-        raw.longitude,
+        snapped.latitude,
+        snapped.longitude,
         homeController.destinationCoordinates.latitude,
         homeController.destinationCoordinates.longitude);
 
@@ -4004,6 +4598,7 @@ class NavigationController extends GetxController {
   void stopNavigation({bool keepChallengeCallbacks = false}) {
     positionStream?.cancel();
     _lastGpsReceiveTime = null;
+    homeController.kinematicFilter.accelDetector.stop(); // ← AJOUT
     homeController.stopFluidNavigation();
     _lastPositionTime = null;
     _lastSnappedPos = null;
@@ -4042,8 +4637,11 @@ class NavigationController extends GetxController {
     _isScheduleDialogOpen = false;
     _currentStepIndex = 0;
     _cumulatedDeviationMeters = 0.0;
-    FlutterBackgroundService().invoke("resume_background_tracking");
-    print("📡 Envoi signal: resume_background_tracking");
+    // Arrêter le suivi de navigation
+    FlutterBackgroundService().invoke("stop_navigation_tracking");
+    // Éteindre complètement le service pour économiser la batterie
+    FlutterBackgroundService().invoke("stop_service");
+    print("📡 Envoi signal: stop_navigation_tracking & stop_service");
   }
 
   void _finishTripWithRecap() {
@@ -4067,6 +4665,7 @@ class NavigationController extends GetxController {
     final bool isChallengeTrip = activeChallenge != null;
     int lamesGagnees = homeController.activeRouteEstimatedGain.value;
 
+    _lastCompletedTripId = _activeTripId;
     _endTripLog(
         status: 'completed',
         finalDistanceMeters: homeController.activeRouteRawDistanceMeters.value,
@@ -4174,7 +4773,7 @@ class NavigationController extends GetxController {
       // CORRECTION : On donne le gain de trajet seulement si ce n'est pas un défi
       int gain = homeController.activeRouteEstimatedGain.value;
       if (onNormalDestinationReached != null) {
-        onNormalDestinationReached!(gain);
+        onNormalDestinationReached!(gain, _lastCompletedTripId);
       }
     }
 
@@ -4236,22 +4835,37 @@ class TransitMonitor {
 
   TransitMonitor({required this.onWarning, this.onBackOnRoute});
 
-  /// Vérifie si l'utilisateur est sur le tracé.
-  /// Retourne `true` si sur la route, `false` si dévié.
-  bool checkPosition(LatLng userPosition, List<LatLng> routePolyline) {
+  // ✅ AJOUT DU PARAMÈTRE currentSpeedKmh
+  bool checkPosition(
+      LatLng userPosition, List<LatLng> routePolyline, double currentSpeedKmh) {
+    // 1. Tolérance réduite à 15m (couvre la largeur de la rue + 1 trottoir)
     bool isOnRoute = gmaps_utils.PolyUtils.isLocationOnEdgeTolerance(
         gmaps_utils.Point(userPosition.latitude, userPosition.longitude),
         routePolyline
             .map((p) => gmaps_utils.Point(p.latitude, p.longitude))
             .toList(),
         false,
-        30.0 // Tolérance de 30 mètres
+        15.0 // 🔥 RÉDUIT DE 30.0 À 15.0
         );
 
+    // 2. 🔥 ANTI-EXPLOIT TROTTOIR PARALLÈLE
+    if (!isOnRoute) {
+      // Si l'utilisateur est hors route ET qu'il se déplace à une vitesse de marcheur (entre 1 et 8 km/h)
+      // Alors il n'est pas dans le bus, il marche à côté.
+      if (currentSpeedKmh > 1.0 && currentSpeedKmh < 8.0) {
+        if (_lastWarningSent != TransitIssue.offRoute) {
+          onWarning(
+              "⚠️ Vous semblez être à pied en parallèle du trajet. Montez dans le bus !");
+          _lastWarningSent = TransitIssue.offRoute;
+        }
+        return false; // Retourne false pour déclencher le timer de triche de 60s
+      }
+    }
+
+    // 3. Logique d'avertissement standard
     if (!isOnRoute) {
       if (_lastWarningSent != TransitIssue.offRoute) {
-        onWarning(
-            "Attention, vous semblez avoir dévié de l'itinéraire du transport en commun.");
+        onWarning("Attention, vous avez dévié de l'itinéraire du transport.");
         _lastWarningSent = TransitIssue.offRoute;
       }
     } else {
@@ -4309,7 +4923,8 @@ class SpeedometerDisplay extends StatelessWidget {
       else if (gpsIntervalMs > 1200) gpsColor = Colors.orangeAccent;
 
       return Positioned(
-        top: MediaQuery.of(context).padding.top + 120,
+        top: MediaQuery.of(context).padding.top +
+            200, // Augmenté pour éviter le chevauchement avec les infos Transit
         left: 20,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -5693,12 +6308,14 @@ class UserProfile {
   }
 
   factory UserProfile.fromFirestore(
-      DocumentSnapshot<Map<String, dynamic>> snapshot) {
+      DocumentSnapshot<Map<String, dynamic>> snapshot,
+      {DocumentSnapshot<Map<String, dynamic>>? statsSnapshot}) {
     final data = snapshot.data();
     if (data == null) {
       throw Exception(
           "User profile data is null for snapshot ID: ${snapshot.id}");
     }
+    final statsData = statsSnapshot?.data();
 
     latlong.LatLng? parseCoordinates(dynamic coordsData) {
       if (coordsData is Map<String, dynamic> &&
@@ -5717,14 +6334,16 @@ class UserProfile {
 
     return UserProfile(
       id: snapshot.id,
-      storeBoosts: data?['store_boosts'] ?? {}, // Récupération de la map
+      storeBoosts: statsData?['store_boosts'] ?? data['store_boosts'] ?? {},
 
       lamePoints: _parseFirestoreInt(data['lame_points'], 0, 'lame_points'),
       isVip: _parseFirestoreBool(data['is_vip'], false, 'is_vip'),
       currentCashbackBoost:
           (data['current_cashback_boost'] as num?)?.toDouble() ?? 0.0,
-      lastBoostUpdate: data['last_boost_update'],
-      loyaltyProgress: data['loyalty_progress'] ?? {},
+      lastBoostUpdate:
+          statsData?['last_boost_update'] ?? data['last_boost_update'],
+      loyaltyProgress:
+          statsData?['loyalty_progress'] ?? data['loyalty_progress'] ?? {},
 
       // 📊 Statistiques
       totalDistanceKm: (data['total_distance_km'] as num?)?.toDouble() ?? 0.0,
@@ -5746,12 +6365,16 @@ class UserProfile {
               [],
 
       consecutiveLogins: _parseFirestoreInt(
-          data['consecutive_logins'], 0, 'consecutive_logins'),
+          statsData?['consecutive_logins'] ?? data['consecutive_logins'],
+          0,
+          'consecutive_logins'),
       username: data['username'] as String? ?? 'Utilisateur Anonyme',
       currentLevel:
           _parseFirestoreInt(data['current_level'], 1, 'current_level'),
       nextLevelBoost: _parseFirestoreDouble(
-          data['next_level_boost'], 1.0, 'next_level_boost'),
+          statsData?['next_level_boost'] ?? data['next_level_boost'],
+          1.0,
+          'next_level_boost'),
       updatedAt: data['updated_at'] as Timestamp?,
       homeAddressString: data['home_address_string'] as String?,
       homeAddressCoordinates:
@@ -5768,13 +6391,18 @@ class UserProfile {
       lastWorkCommuteTimestamp:
           data['last_work_commute_timestamp'] as Timestamp?,
       lastCommuteType: data['last_commute_type'] as String?,
-      adPoints: _parseFirestoreInt(data['ad_points'], 0, 'ad_points'),
-      adBoostEndTime: data['ad_boost_end_time'] as Timestamp?,
-      lastAdPointDecayTime: data['last_ad_point_decay_time'] as Timestamp?,
-      lastLoginDate: data['last_login_date'] as Timestamp?,
+      adPoints: _parseFirestoreInt(
+          statsData?['ad_points'] ?? data['ad_points'], 0, 'ad_points'),
+      adBoostEndTime: (statsData?['ad_boost_end_time'] ??
+          data['ad_boost_end_time']) as Timestamp?,
+      lastAdPointDecayTime: (statsData?['last_ad_point_decay_time'] ??
+          data['last_ad_point_decay_time']) as Timestamp?,
+      lastLoginDate: (statsData?['last_login_date'] ?? data['last_login_date'])
+          as Timestamp?,
       lastDailyRewardCollectedDate:
-          data['last_daily_reward_collected_date'] as Timestamp?,
-      country: data['country'] as String?, // NOUVEAU
+          (statsData?['last_daily_reward_collected_date'] ??
+              data['last_daily_reward_collected_date']) as Timestamp?,
+      country: data['country'] as String?,
       favoriteStores:
           (data['favorite_stores'] as List<dynamic>?)?.cast<String>() ?? [],
       favoriteRoutes: (data['favorite_routes'] as List<dynamic>?)
@@ -6791,6 +7419,22 @@ const bool ENABLE_SECURITY_CHECKS = false;
 void onBackgroundServiceStart(ServiceInstance service) async {
   WidgetsFlutterBinding.ensureInitialized();
 
+  // Nettoyage proactif des anciennes clés SharedPreferences non sécurisées
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('bg_is_navigating');
+    await prefs.remove('bg_travel_mode');
+    await prefs.remove('bg_elevation_factor');
+    await prefs.remove('bg_max_deviation');
+    await prefs.remove('bg_route_polyline');
+    await prefs.remove('bg_destination_lat');
+    await prefs.remove('bg_destination_lng');
+    await prefs.remove('bg_cumulated_deviation');
+    await prefs.remove('bg_recent_speeds');
+    await prefs.remove('bg_high_speed_burst_start');
+    await prefs.remove('bg_transit_off_route_since');
+  } catch (_) {}
+
   const int HOME_RADIUS_METERS = 150;
   const int NAV_CHECK_INTERVAL_SECONDS = 5;
   const int HOME_CHECK_INTERVAL_SECONDS = 60;
@@ -6930,15 +7574,19 @@ void onBackgroundServiceStart(ServiceInstance service) async {
     }
   }
 
+  late void Function(bool isNavigating) startBackgroundTracking;
+
   Future<void> checkNavigationAndSecurity(
       SharedPreferences prefs, Position position) async {
     try {
       await prefs.reload();
-      final bool isNavigating = prefs.getBool('bg_is_navigating') ?? false;
+      final bool isNavigating =
+          (await SecureBgStorage.getBool('bg_is_navigating')) ?? false;
       final bool isAppInForeground =
           prefs.getBool('is_app_in_foreground') ?? false;
 
       if (!isNavigating) return;
+
       if (isAppInForeground) {
         // L'application gère déjà l'anti-triche et la navigation au premier plan.
         return;
@@ -6954,29 +7602,69 @@ void onBackgroundServiceStart(ServiceInstance service) async {
         }
       } catch (_) {}
 
-      // Restituer l'état anti-triche depuis SharedPreferences (résistance au kill Android)
-      bgCumulatedDeviationMeters = prefs.getDouble('bg_cumulated_deviation') ??
-          bgCumulatedDeviationMeters;
-      final savedSpeeds = prefs.getStringList('bg_recent_speeds');
-      if (savedSpeeds != null &&
-          savedSpeeds.isNotEmpty &&
+      // Restituer l'état anti-triche depuis FlutterSecureStorage (Keystore Android / Keychain iOS)
+      bgCumulatedDeviationMeters =
+          (await SecureBgStorage.getDouble('bg_cumulated_deviation')) ??
+              bgCumulatedDeviationMeters;
+
+      final String? savedSpeedsStr =
+          await SecureBgStorage.getString('bg_recent_speeds');
+      if (savedSpeedsStr != null &&
+          savedSpeedsStr.isNotEmpty &&
           bgRecentSpeeds.isEmpty) {
-        bgRecentSpeeds =
-            savedSpeeds.map((s) => double.tryParse(s) ?? 0.0).toList();
+        try {
+          List<dynamic> decodedList = jsonDecode(savedSpeedsStr);
+          bgRecentSpeeds =
+              decodedList.map((s) => (s as num).toDouble()).toList();
+        } catch (_) {}
       }
 
-      final double speedKmh = position.speed * 3.6;
-      final String modeStr = prefs.getString('bg_travel_mode') ?? 'walking';
+      final int? savedBurstStart =
+          await SecureBgStorage.getInt('bg_high_speed_burst_start');
+      if (savedBurstStart != null && bgHighSpeedBurstStartTime == null) {
+        bgHighSpeedBurstStartTime =
+            DateTime.fromMillisecondsSinceEpoch(savedBurstStart);
+      }
+      final int? savedTransitOff =
+          await SecureBgStorage.getInt('bg_transit_off_route_since');
+      if (savedTransitOff != null && bgTransitOffRouteSince == null) {
+        bgTransitOffRouteSince =
+            DateTime.fromMillisecondsSinceEpoch(savedTransitOff);
+      }
+
+      double speedKmh = position.speed * 3.6;
+
+      // ✅ AJOUT : Fallback si le GPS en veille renvoie une vitesse nulle ou aberrante
+      if ((speedKmh <= 0.0 || speedKmh == 1.0) &&
+          _lastNavPosition != null &&
+          _lastNavTime != null) {
+        double distMeters = Geolocator.distanceBetween(
+          _lastNavPosition!.latitude,
+          _lastNavPosition!.longitude,
+          position.latitude,
+          position.longitude,
+        );
+        double dtSeconds =
+            position.timestamp.difference(_lastNavTime!).inMilliseconds /
+                1000.0;
+        if (dtSeconds > 0.5) {
+          speedKmh = (distMeters / dtSeconds) * 3.6;
+        }
+      }
+
+      final String modeStr =
+          (await SecureBgStorage.getString('bg_travel_mode')) ?? 'walking';
 
       // --- CORRECTION 1 : Facteur de dénivelé intelligent ---
-      final double elevFactor = prefs.getDouble('bg_elevation_factor') ?? 1.0;
+      final double elevFactor =
+          (await SecureBgStorage.getDouble('bg_elevation_factor')) ?? 1.0;
 
       // --- CORRECTION 5 : Détection Robot (Variance de vitesse) ---
       if (speedKmh > 3.0 && modeStr == 'walking') {
         bgRecentSpeeds.add(speedKmh);
         if (bgRecentSpeeds.length > 20) bgRecentSpeeds.removeAt(0);
-        await prefs.setStringList('bg_recent_speeds',
-            bgRecentSpeeds.map((s) => s.toString()).toList());
+        await SecureBgStorage.setString(
+            'bg_recent_speeds', jsonEncode(bgRecentSpeeds));
 
         if (bgRecentSpeeds.length >= 15) {
           double mean =
@@ -7014,7 +7702,11 @@ void onBackgroundServiceStart(ServiceInstance service) async {
             }
 
             // Si > 60km/h pendant plus de 15s en marchant (Grosse triche)
-            bgHighSpeedBurstStartTime ??= DateTime.now();
+            if (bgHighSpeedBurstStartTime == null) {
+              bgHighSpeedBurstStartTime = DateTime.now();
+              await SecureBgStorage.setInt('bg_high_speed_burst_start',
+                  bgHighSpeedBurstStartTime!.millisecondsSinceEpoch);
+            }
             if (DateTime.now()
                     .difference(bgHighSpeedBurstStartTime!)
                     .inSeconds >
@@ -7025,10 +7717,15 @@ void onBackgroundServiceStart(ServiceInstance service) async {
             }
           } else {
             bgHighSpeedBurstStartTime = null;
+            await SecureBgStorage.remove('bg_high_speed_burst_start');
           }
         } else if (modeStr.contains('bicycling')) {
           if (speedKmh > maxSpeedBike) {
-            bgHighSpeedBurstStartTime ??= DateTime.now();
+            if (bgHighSpeedBurstStartTime == null) {
+              bgHighSpeedBurstStartTime = DateTime.now();
+              await SecureBgStorage.setInt('bg_high_speed_burst_start',
+                  bgHighSpeedBurstStartTime!.millisecondsSinceEpoch);
+            }
             int tolerance =
                 elevFactor < 0.95 ? 30 : 20; // Plus tolérant en descente
             if (DateTime.now()
@@ -7046,12 +7743,13 @@ void onBackgroundServiceStart(ServiceInstance service) async {
             }
           } else {
             bgHighSpeedBurstStartTime = null;
+            await SecureBgStorage.remove('bg_high_speed_burst_start');
           }
         }
       }
 
       // --- CORRECTIONS 3 & 4 : DÉVIATION ET TRANSIT ---
-      String? polyStr = prefs.getString('bg_route_polyline');
+      String? polyStr = await SecureBgStorage.getString('bg_route_polyline');
       if (polyStr != null && polyStr.isNotEmpty) {
         List<dynamic> decoded = jsonDecode(polyStr);
         double minDistToRoute = double.infinity;
@@ -7077,7 +7775,11 @@ void onBackgroundServiceStart(ServiceInstance service) async {
         // CORRECTION 4 : Triche spécifique aux Transports en commun
         if (modeStr == 'transit') {
           if (minDistToRoute > 30.0) {
-            bgTransitOffRouteSince ??= DateTime.now();
+            if (bgTransitOffRouteSince == null) {
+              bgTransitOffRouteSince = DateTime.now();
+              await SecureBgStorage.setInt('bg_transit_off_route_since',
+                  bgTransitOffRouteSince!.millisecondsSinceEpoch);
+            }
             if (DateTime.now().difference(bgTransitOffRouteSince!).inSeconds >
                 60) {
               await _safeServiceInvoke(
@@ -7086,11 +7788,13 @@ void onBackgroundServiceStart(ServiceInstance service) async {
             }
           } else {
             bgTransitOffRouteSince = null;
+            await SecureBgStorage.remove('bg_transit_off_route_since');
           }
         }
         // CORRECTION 3 : Déviation Marche / Vélo
         else {
-          double maxDevAllowed = prefs.getDouble('bg_max_deviation') ?? 3000.0;
+          double maxDevAllowed =
+              (await SecureBgStorage.getDouble('bg_max_deviation')) ?? 3000.0;
 
           if (minDistToRoute > 30.0) {
             Map<String, double> refPoint =
@@ -7103,7 +7807,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
 
             if (distSinceLastOnRoute > bgCumulatedDeviationMeters) {
               bgCumulatedDeviationMeters = distSinceLastOnRoute;
-              await prefs.setDouble(
+              await SecureBgStorage.setDouble(
                   'bg_cumulated_deviation', bgCumulatedDeviationMeters);
             }
 
@@ -7116,8 +7820,36 @@ void onBackgroundServiceStart(ServiceInstance service) async {
           } else {
             bgLastOnRoutePosition = closestPoint;
             bgCumulatedDeviationMeters = 0.0;
-            await prefs.setDouble('bg_cumulated_deviation', 0.0);
+            await SecureBgStorage.setDouble('bg_cumulated_deviation', 0.0);
           }
+        }
+      }
+
+      // --- 🏁 DÉTECTION D'ARRIVÉE EN ARRIÈRE-PLAN ---
+      final double? destLat =
+          await SecureBgStorage.getDouble('bg_destination_lat');
+      final double? destLng =
+          await SecureBgStorage.getDouble('bg_destination_lng');
+
+      if (destLat != null && destLng != null) {
+        double distToDest = Geolocator.distanceBetween(
+            position.latitude, position.longitude, destLat, destLng);
+
+        // Seuil de 40m (cohérent avec le premier plan)
+        if (distToDest < 40.0) {
+          print('[BG] 🏁 Arrivée détectée en arrière-plan !');
+
+          // 1. Notifier le premier plan (si l'app est en arrière-plan mais pas tuée)
+          await _safeServiceInvoke(service, 'bg_arrival_detected', {
+            'lat': position.latitude,
+            'lng': position.longitude,
+          });
+
+          // 2. Stopper la navigation pour économiser la batterie
+          await SecureBgStorage.setBool('bg_is_navigating', false);
+          startBackgroundTracking(
+              false); // Repasse en mode éco (vérif domicile uniquement)
+          return;
         }
       }
 
@@ -7140,7 +7872,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
   StreamSubscription<Position>? iosKeepAliveStream;
   StreamSubscription<Position>? bgPositionStream;
 
-  void startBackgroundTracking(bool isNavigating) {
+  startBackgroundTracking = (bool isNavigating) {
     bgTimer?.cancel();
     bgPositionStream?.cancel();
     iosKeepAliveStream?.cancel();
@@ -7191,11 +7923,11 @@ void onBackgroundServiceStart(ServiceInstance service) async {
       await checkHomeDistance(prefs, position);
       await checkNavigationAndSecurity(prefs, position);
     });
-  }
+  };
 
   startBackgroundTracking(false);
 
-  service.on('stop_background_trip').listen((event) async {
+  service.on('start_navigation_tracking').listen((event) async {
     startBackgroundTracking(true);
 
     bgRecentSpeeds.clear();
@@ -7205,19 +7937,50 @@ void onBackgroundServiceStart(ServiceInstance service) async {
     bgHighSpeedBurstStartTime = null;
 
     final prefs = await SharedPreferences.getInstance();
+    await SecureBgStorage.remove('bg_cumulated_deviation');
+    await SecureBgStorage.remove('bg_high_speed_burst_start');
+    await SecureBgStorage.remove('bg_transit_off_route_since');
+    await SecureBgStorage.remove('bg_recent_speeds');
     await prefs.remove('bg_cumulated_deviation');
     await prefs.remove('bg_recent_speeds');
+    await prefs.remove('bg_high_speed_burst_start');
+    await prefs.remove('bg_transit_off_route_since');
 
     print('[BG] Navigation démarrée (surveillance accrue)');
   });
 
-  service.on('resume_background_tracking').listen((event) async {
+  service.on('stop_navigation_tracking').listen((event) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('bg_is_navigating', false);
+    await SecureBgStorage.setBool('bg_is_navigating', false);
+    await SecureBgStorage.remove('bg_cumulated_deviation');
+    await SecureBgStorage.remove('bg_high_speed_burst_start');
+    await SecureBgStorage.remove('bg_transit_off_route_since');
+    await SecureBgStorage.remove('bg_destination_lat');
+    await SecureBgStorage.remove('bg_destination_lng');
+    await SecureBgStorage.remove('bg_travel_mode');
+    await SecureBgStorage.remove('bg_elevation_factor');
+    await SecureBgStorage.remove('bg_max_deviation');
+    await SecureBgStorage.remove('bg_route_polyline');
+    await SecureBgStorage.remove('bg_recent_speeds');
+
+    await prefs.remove('bg_is_navigating');
     await prefs.remove('bg_cumulated_deviation');
     await prefs.remove('bg_recent_speeds');
-    startBackgroundTracking(false);
-    print('[BG] Navigation terminée → surveillance domicile économe');
+    await prefs.remove('bg_high_speed_burst_start');
+    await prefs.remove('bg_transit_off_route_since');
+    await prefs.remove('bg_destination_lat');
+    await prefs.remove('bg_destination_lng');
+    await prefs.remove('bg_travel_mode');
+    await prefs.remove('bg_elevation_factor');
+    await prefs.remove('bg_max_deviation');
+    await prefs.remove('bg_route_polyline');
+    print('[BG] Navigation terminée, nettoyage effectué.');
+  });
+
+  // NOUVEAU : Écouter la demande d'arrêt complet du service pour économiser la batterie
+  service.on('stop_service').listen((event) async {
+    print('[BG] Arrêt complet du service en arrière-plan demandé.');
+    service.stopSelf();
   });
 }
 
@@ -7261,7 +8024,7 @@ Future<void> _initBackgroundService() async {
   await service.configure(
     androidConfiguration: AndroidConfiguration(
       onStart: onBackgroundServiceStart,
-      autoStart: true,
+      autoStart: false, // Désactivé : démarrage manuel lors de la navigation
       isForegroundMode: true,
       notificationChannelId: 'walkmoney_bg_channel',
       initialNotificationTitle: 'WalkMoney',
@@ -7269,13 +8032,12 @@ Future<void> _initBackgroundService() async {
       foregroundServiceNotificationId: 888,
     ),
     iosConfiguration: IosConfiguration(
-      autoStart: true,
+      autoStart: false, // Désactivé : démarrage manuel lors de la navigation
       onForeground: onBackgroundServiceStart,
       onBackground: _onIosBackground,
     ),
   );
-
-  await service.startService();
+  // Le service n'est plus démarré ici. Il le sera uniquement dans NavigationController.navigateToDestination()
 }
 
 @pragma('vm:entry-point')
@@ -7304,14 +8066,20 @@ void main() async {
   // 2. Bloquer l'orientation portrait
   await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
 
-  // 3. Initialiser Firebase
+  // 3. Initialiser Firebase & App Check
   try {
     await Firebase.initializeApp(
       options: DefaultFirebaseOptions.currentPlatform,
     );
-    debugPrint("✅ Firebase initialisé");
+    await FirebaseAppCheck.instance.activate(
+      androidProvider:
+          kDebugMode ? AndroidProvider.debug : AndroidProvider.playIntegrity,
+      appleProvider:
+          kDebugMode ? AppleProvider.debug : AppleProvider.deviceCheck,
+    );
+    debugPrint("✅ Firebase & App Check initialisés");
   } catch (e) {
-    debugPrint("❌ Erreur Firebase : $e");
+    debugPrint("❌ Erreur Firebase / App Check : $e");
   }
 
   // 4. Initialiser la locale (fr_FR)
@@ -7347,6 +8115,71 @@ void main() async {
     }
   }
 
+  // =========================================================================
+  // 🌍 DÉTECTION AUTOMATIQUE DE LA LANGUE AU PREMIER LANCEMENT
+  // =========================================================================
+  final prefs = await SharedPreferences.getInstance();
+  final savedLang = prefs.getString('app_language');
+  Locale initialLocale = const Locale('fr', 'FR'); // Fallback par défaut
+
+  if (savedLang == null) {
+    // Premier lancement : on détermine la langue automatiquement
+    try {
+      // Étape A : Vérifier la langue du système d'exploitation
+      final systemLocale = ui.PlatformDispatcher.instance.locale;
+      final supportedLangs = ['fr', 'en', 'es', 'de', 'it', 'pt'];
+
+      if (supportedLangs.contains(systemLocale.languageCode)) {
+        initialLocale = systemLocale;
+        await prefs.setString('app_language', systemLocale.languageCode);
+        debugPrint(
+            "🌍 Langue du système détectée et appliquée : ${systemLocale.languageCode}");
+      } else {
+        // Étape B : Fallback sur l'adresse IP si la langue du système n'est pas supportée
+        debugPrint(
+            "⚠️ Langue système non supportée (${systemLocale.languageCode}), tentative via IP...");
+        final response = await http
+            .get(Uri.parse('http://ip-api.com/json?fields=countryCode'))
+            .timeout(const Duration(seconds: 5));
+
+        if (response.statusCode == 200) {
+          final data = json.decode(response.body);
+          final countryCode = data['countryCode'] as String?;
+
+          String inferredLang = 'fr'; // Défaut
+          if (countryCode != null) {
+            if (['FR', 'BE', 'CH', 'CA', 'LU', 'MC', 'SN', 'CI', 'CM']
+                .contains(countryCode)) {
+              inferredLang = 'fr';
+            } else if (['US', 'GB', 'IE', 'AU', 'NZ', 'ZA']
+                .contains(countryCode)) {
+              inferredLang = 'en';
+            } else if (['ES', 'MX', 'AR', 'CO', 'PE', 'CL', 'VE']
+                .contains(countryCode)) {
+              inferredLang = 'es';
+            } else if (['DE', 'AT'].contains(countryCode)) {
+              inferredLang = 'de';
+            } else if (['IT', 'VA'].contains(countryCode)) {
+              inferredLang = 'it';
+            } else if (['PT', 'BR'].contains(countryCode)) {
+              inferredLang = 'pt';
+            }
+          }
+          initialLocale = Locale(inferredLang);
+          await prefs.setString('app_language', inferredLang);
+          debugPrint(
+              "🌍 Langue déduite par IP ($countryCode) et appliquée : $inferredLang");
+        }
+      }
+    } catch (e) {
+      debugPrint("❌ Erreur lors de la détection automatique de la langue : $e");
+    }
+  } else {
+    initialLocale = Locale(savedLang);
+    debugPrint("🌍 Langue restaurée depuis les préférences : $savedLang");
+  }
+  // =========================================================================
+
   // 7. Injection des dépendances GetX
   Get.put(HomeController());
   Get.put(SpeedController());
@@ -7365,17 +8198,21 @@ void main() async {
     }
   }
 
-  // 9. Lancement de l'application
-  runApp(EcoNavApp());
+  // 9. Lancement de l'application avec la locale détectée
+  runApp(EcoNavApp(initialLocale: initialLocale));
 }
 
 class EcoNavApp extends StatelessWidget {
+  final Locale initialLocale;
+
+  const EcoNavApp({super.key, required this.initialLocale});
+
   @override
   Widget build(BuildContext context) {
     return GetMaterialApp(
       title: 'EcoNav',
       translations: AppTranslations(),
-      locale: Get.deviceLocale,
+      locale: initialLocale,
       fallbackLocale: const Locale('fr', 'FR'),
       theme: ThemeData(
         primaryColor: primaryGreen,
@@ -8470,9 +9307,12 @@ class _MainScreenControllerState extends State<MainScreenController>
     try {
       final userDoc =
           await _firestore.collection('users').doc(_currentUserId).get();
+      final statsDoc =
+          await _firestore.collection('user_stats').doc(_currentUserId).get();
 
       if (userDoc.exists) {
-        UserProfile profile = UserProfile.fromFirestore(userDoc);
+        UserProfile profile = UserProfile.fromFirestore(userDoc,
+            statsSnapshot: statsDoc.exists ? statsDoc : null);
         // Gestion du login quotidien
         UserProfile updatedProfile = await _processDailyLogin(profile);
         // Appliquer la décroissance des Ad Points si nécessaire
@@ -8669,23 +9509,32 @@ class _MainScreenControllerState extends State<MainScreenController>
 
     if (currentPoints == profile.adPoints) return profile; // Pas de changement
 
-    try {
-      await _firestore.collection('users').doc(_currentUserId).update({
-        'ad_points': currentPoints,
-        'last_ad_point_decay_time': FieldValue.serverTimestamp(),
-        'updated_at': FieldValue.serverTimestamp(),
-      });
-      return profile.copyWith(
-        adPoints: currentPoints,
-        lastAdPointDecayTime: () => Timestamp.fromDate(now),
-      );
-    } catch (e) {
-      print("Erreur application decay AD Points: $e");
-      return profile;
-    }
+    return profile.copyWith(
+      adPoints: currentPoints,
+      lastAdPointDecayTime: () => Timestamp.fromDate(now),
+    );
   }
 
-// MODIFIÉ: Centralisation de l'ajout de points ET de l'historique
+  /// Wrapper sécurisé pour appeler les Cloud Functions avec un token toujours à jour
+  Future<dynamic> _safeCallCloudFunction(String functionName,
+      [Map<String, dynamic>? params]) async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) throw Exception("Utilisateur non authentifié");
+
+    try {
+      await user.getIdToken(true); // Refresh token
+    } catch (e) {
+      debugPrint(
+          "⚠️ Erreur rafraîchissement token dans _safeCallCloudFunction: $e");
+      rethrow;
+    }
+
+    final callable = FirebaseFunctions.instance.httpsCallable(functionName);
+    final result = await callable.call(params);
+    return result.data;
+  }
+
+  // MODIFIÉ: Centralisation de l'ajout de points ET de l'historique
   void _addLame(
     int amountToAdd, {
     String? source,
@@ -8693,23 +9542,66 @@ class _MainScreenControllerState extends State<MainScreenController>
     double? distanceMeters,
     double? durationSeconds,
     String? travelMode,
+    String? challengeId,
+    String? tripId,
+    Map<String, dynamic>? tripMetadata,
   }) async {
-    if (_userProfile == null || _currentUserId == null || amountToAdd <= 0)
+    if (_userProfile == null || _currentUserId == null || amountToAdd <= 0) {
       return;
+    }
 
-    final sourceText = source ?? 'Inconnue';
+    // 1. VÉRIFICATION ET RAFRAÎCHISSEMENT OBLIGATOIRE DU TOKEN
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text("Session expirée. Veuillez vous reconnecter."),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+      return; // On arrête tout, pas de token = pas d'appel
+    }
 
     try {
+      // Force le rafraîchissement du token. Si ça échoue, on lève une erreur
+      // pour éviter d'envoyer un token périmé au serveur.
+      await user.getIdToken(true);
+    } catch (e) {
+      debugPrint("⚠️ Échec critique du rafraîchissement du token : $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text("Erreur de connexion. Veuillez vous reconnecter."),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+      return; // On arrête tout pour éviter l'erreur "unauthenticated"
+    }
+
+    final sourceText = source ?? 'Inconnue';
+    try {
       final callable = FirebaseFunctions.instance.httpsCallable('validateTrip');
+
       final Map<String, dynamic> payload = {
         'amountToAdd': amountToAdd,
         'source': sourceText,
         'isSpecialBonus': isSpecialBonus || amountToAdd > 500,
       };
-
       if (distanceMeters != null) payload['distanceMeters'] = distanceMeters;
       if (durationSeconds != null) payload['durationSeconds'] = durationSeconds;
       if (travelMode != null) payload['travelMode'] = travelMode;
+      if (challengeId != null) payload['challengeId'] = challengeId;
+      if (tripId != null) payload['tripId'] = tripId;
+      if (tripMetadata != null) {
+        payload['avgSpeedKmh'] = tripMetadata['avgSpeedKmh'];
+        payload['cheatDetected'] = tripMetadata['cheatDetected'];
+        payload['cheatReason'] = tripMetadata['cheatReason'];
+        payload['startLocation'] = tripMetadata['startLocation'];
+        payload['endLocation'] = tripMetadata['endLocation'];
+      }
 
       await callable.call(payload);
 
@@ -8721,12 +9613,7 @@ class _MainScreenControllerState extends State<MainScreenController>
       final levelData = _calculateUserLevel(newTotalLame);
       final newLevel = (levelData['currentLevel'] as num?)?.toInt() ?? 1;
 
-      if (newLevel >= 30 && !(_userProfile?.isVip ?? false)) {
-        // Activer le Premium gratuit
-        await _firestore.collection('users').doc(_currentUserId!).update({
-          'is_vip': true,
-        });
-
+      if (newLevel >= 30 && (_userProfile?.isVip ?? false)) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
@@ -8740,16 +9627,19 @@ class _MainScreenControllerState extends State<MainScreenController>
       }
 
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text("+$amountToAdd Lames ! (Source: $sourceText)"),
-          backgroundColor: Colors.green,
-        ));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text("+$amountToAdd Lames ! (Source: $sourceText)"),
+            backgroundColor: Colors.green,
+          ),
+        );
       }
     } catch (e) {
       print("Error updating Lame points and history: $e");
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("Erreur sauvegarde Lames: $e")));
+          SnackBar(content: Text("Erreur sauvegarde Lames: $e")),
+        );
       }
     }
   }
@@ -8896,7 +9786,8 @@ class _MainScreenControllerState extends State<MainScreenController>
       await userChallengeDocRef.set(userChallengeData, SetOptions(merge: true));
 
       if (challenge.status == ChallengeStatus.rewardClaimed) {
-        _addLame(rewardAmount, source: "Défi: ${challenge.title}");
+        _addLame(rewardAmount,
+            source: "Défi: ${challenge.title}", challengeId: challenge.id);
       }
       if (mounted) setState(() {});
     } catch (e) {
@@ -11946,8 +12837,37 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
     _setupWidgetIntentListener();
 
     // Câbler le callback pour les trajets normaux (sans magasin/défi/travail)
-    navigationController.setOnNormalDestinationReachedCallback((int gain) {
-      widget.addLamePoints(gain, source: "Trajet");
+    navigationController
+        .setOnNormalDestinationReachedCallback((int gain, String? tripId) {
+      final tripMeta = {
+        'avgSpeedKmh': navigationController._speedHistory.isNotEmpty
+            ? navigationController._speedHistory.reduce((a, b) => a + b) /
+                navigationController._speedHistory.length
+            : 0.0,
+        'cheatDetected': speedController.cheatStatus.value ==
+            CheatModeStatus.exceededSpeedCheating,
+        'cheatReason': speedController.cheatWarningMessage.value,
+        'startLocation': navigationController._tripStartPos != null
+            ? {
+                'lat': navigationController._tripStartPos!.latitude,
+                'lng': navigationController._tripStartPos!.longitude
+              }
+            : {'lat': 0.0, 'lng': 0.0},
+        'endLocation': {
+          'lat': homeController.destinationCoordinates.latitude,
+          'lng': homeController.destinationCoordinates.longitude
+        }
+      };
+
+      (widget.addLamePoints as dynamic)(
+        gain,
+        source: "Trajet",
+        tripId: tripId,
+        tripMetadata: tripMeta,
+        distanceMeters: homeController.activeRouteRawDistanceMeters.value,
+        durationSeconds: homeController.activeRouteRawDurationSeconds.value,
+        travelMode: homeController.currentTravelMode.value.toString(),
+      );
     });
 
     // Listener d'arrivée générique (stocké pour libération dans dispose)
@@ -12964,14 +13884,15 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
     }
 
     int oldAdPoints = widget.userProfile.adPoints;
-    int newAdPoints = (oldAdPoints + 1).clamp(0, 50);
-    bool justUnlockedBoost = oldAdPoints < 10 && newAdPoints >= 10;
 
     try {
-      await _firestore.collection('users').doc(widget.userProfile.id).update({
-        'ad_points': newAdPoints,
-        'last_ad_point_decay_time': FieldValue.serverTimestamp(),
-      });
+      final callable = FirebaseFunctions.instance.httpsCallable('addAdPoint');
+      final result = await callable.call();
+      final data = result.data as Map<String, dynamic>?;
+      int newAdPoints =
+          (data?['newAdPoints'] as num?)?.toInt() ?? (oldAdPoints + 1);
+      bool justUnlockedBoost = oldAdPoints < 10 && newAdPoints >= 10;
+
       widget.onProfileModified();
       if (mounted) {
         if (justUnlockedBoost) {
@@ -13809,31 +14730,10 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
                                       _hasClaimedLocally = true;
                                     });
                                     try {
-                                      WriteBatch batch = _firestore.batch();
-                                      DocumentReference userRef = _firestore
-                                          .collection('users')
-                                          .doc(widget.userProfile.id);
-                                      batch.update(userRef, {
-                                        'lame_points': FieldValue.increment(1),
-                                        'total_lame_earned':
-                                            FieldValue.increment(1),
-                                        'last_daily_reward_collected_date':
-                                            Timestamp.now(),
-                                        'updated_at':
-                                            FieldValue.serverTimestamp()
-                                      });
-
-                                      DocumentReference historyRef = userRef
-                                          .collection('lame_history')
-                                          .doc();
-                                      batch.set(historyRef, {
-                                        'amount': 1,
-                                        'source': 'Récompense Quotidienne',
-                                        'timestamp':
-                                            FieldValue.serverTimestamp(),
-                                      });
-
-                                      await batch.commit();
+                                      final callable = FirebaseFunctions
+                                          .instance
+                                          .httpsCallable('claimDailyReward');
+                                      await callable.call();
 
                                       widget.onProfileModified();
                                       setDialogState(() {
@@ -13847,7 +14747,7 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
                                         _isClaimingReward = false;
                                         _hasClaimedLocally = false;
                                       });
-                                      _showSnackBar("Erreur: $e",
+                                      _showSnackBar("Erreur: ${e.toString()}",
                                           backgroundColor: Colors.red);
                                     }
                                   }
@@ -17228,98 +18128,50 @@ class _StoreCardState extends State<StoreCard> {
   }
 
   Future<void> _watchAdForBoost() async {
-// 1. Simulation Visionnage Pub (remplacer par AdMob si nécessaire)
     showDialog(
       context: context,
       barrierDismissible: false,
       builder: (c) => const Center(child: CircularProgressIndicator()),
     );
     await Future.delayed(const Duration(seconds: 2));
-    if (Get.isDialogOpen ?? false)
-      Get.back(); // Fermer loader de manière sécurisée
-
-// 2. Calcul du Gain "Intelligent"
-    bool userIsActuallyPremium = widget.userProfile.isVip;
-    bool storeHasBoostEnabled = widget.store.isPremiumAdBoostEnabled;
-
-// Logique demandée :
-// - Si StoreBoost ON et User Standard -> User devient Premium pour ce store
-// - Si StoreBoost ON et User Premium -> User devient Super Premium (x2)
-// - Si StoreBoost OFF : User garde son statut normal
-
-    bool effectivelyPremium = userIsActuallyPremium || storeHasBoostEnabled;
-    bool effectivelySuperPremium =
-        userIsActuallyPremium && storeHasBoostEnabled;
-
-// Gain de base pour une pub standard
-    double gain = 0.01;
-
-// Application des multiplicateurs
-    if (effectivelySuperPremium) {
-      gain = 0.04; // Super Premium (Double du Premium standard 0.02)
-    } else if (effectivelyPremium) {
-      gain = 0.02; // Premium Standard (Double du standard 0.01)
-    }
-
-// Gestion du mode "Spécial" (si le boost est déjà > 1.0)
-// Règle : Les gains explosent pour maintenir un haut niveau
-    if (_currentBoostVal >= 1.0) {
-      if (effectivelySuperPremium) {
-        gain = 0.8; // Enorme boost
-      } else if (effectivelyPremium) {
-        gain = 0.4;
-      } else {
-        gain = 0.2;
-      }
-    }
-
-    double newAmount = _currentBoostVal + gain;
-
-// Max Cap (Double du cashback de base du store, min 1.0)
-    double maxCap = widget.store.cashbackRate * 100.0;
-    if (maxCap < 1.0) maxCap = 1.0;
-
-    if (newAmount > maxCap) {
-      newAmount = maxCap;
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text("Maximum atteint ! Maintenez ce niveau.")));
-    } else {
-      String statusMsg = "";
-      if (effectivelySuperPremium)
-        statusMsg = " (SUPER PREMIUM !)";
-      else if (storeHasBoostEnabled && !userIsActuallyPremium)
-        statusMsg = " (Offert par le magasin)";
-
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content:
-              Text("Boost activé ! +${gain.toStringAsFixed(2)}%$statusMsg"),
-          backgroundColor:
-              effectivelySuperPremium ? Colors.amber[800] : Colors.green));
-    }
-
-// 3. Mise à jour Firestore (Map Specifique pour ce magasin)
-    Map<String, dynamic> updateData = {
-      'amount': newAmount,
-      'last_update': FieldValue.serverTimestamp(),
-    };
+    if (Get.isDialogOpen ?? false) Get.back();
 
     try {
-// On utilise set avec merge pour créer l'entrée si elle n'existe pas sans écraser le reste
-      await FirebaseFirestore.instance
-          .collection('users')
-          .doc(widget.userProfile.id)
-          .set({
-        'store_boosts': {widget.store.id: updateData}
-      }, SetOptions(merge: true));
+      final callable =
+          FirebaseFunctions.instance.httpsCallable('addStoreBoost');
+      final result = await callable.call({'storeId': widget.store.id});
+      final data = result.data as Map<String, dynamic>?;
 
-// 4. Update Local Immédiat pour l'UI
+      final double newAmount = (data?['newAmount'] as num?)?.toDouble() ?? 0.0;
+      final double gain = (data?['gain'] as num?)?.toDouble() ?? 0.01;
+      final bool maxReached = data?['maxReached'] == true;
+      final bool effectivelySuperPremium =
+          data?['effectivelySuperPremium'] == true;
+
+      if (maxReached) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text("Maximum atteint ! Maintenez ce niveau.")));
+      } else {
+        String statusMsg = effectivelySuperPremium ? " (SUPER PREMIUM !)" : "";
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content:
+                Text("Boost activé ! +${gain.toStringAsFixed(2)}%$statusMsg"),
+            backgroundColor:
+                effectivelySuperPremium ? Colors.amber[800] : Colors.green));
+      }
+
       setState(() {
         _localBoostAmount = newAmount;
         _localLastUpdate = DateTime.now();
       });
-      _recalcBoostDisplay(); // Met à jour le timer de perte
+      _recalcBoostDisplay();
     } catch (e) {
-      print("Erreur sauvegarde boost: $e");
+      debugPrint("Erreur addStoreBoost: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text("Erreur boost: ${e.toString()}"),
+            backgroundColor: Colors.red));
+      }
     }
   }
 
@@ -17982,12 +18834,12 @@ class _StoreCardState extends State<StoreCard> {
 
   void _startReceiptScan() async {
     final ImagePicker picker = ImagePicker();
-    // Caméra uniquement (anti-triche)
     final XFile? photo = await picker.pickImage(
       source: ImageSource.camera,
       imageQuality: 85,
       preferredCameraDevice: CameraDevice.rear,
     );
+
     if (photo == null || !mounted) return;
 
     showDialog(
@@ -17997,7 +18849,7 @@ class _StoreCardState extends State<StoreCard> {
         content: Column(mainAxisSize: MainAxisSize.min, children: [
           CircularProgressIndicator(),
           SizedBox(height: 16),
-          Text("Analyse du ticket (serveur sécurisé)..."),
+          Text("Analyse du ticket par IA..."),
         ]),
       ),
     );
@@ -18007,31 +18859,41 @@ class _StoreCardState extends State<StoreCard> {
       final rawText = ocrResult['text'] as String? ?? '';
       final bool serverValid = ocrResult['serverValid'] == true;
       final String serverReason = ocrResult['serverReason'] as String? ?? '';
+      final String? receiptToken = ocrResult['receiptToken'] as String?;
+      final double? extractedAmount = (ocrResult['amount'] as num?)?.toDouble();
+      final String? storeNameFound = ocrResult['storeNameFound'] as String?;
 
-      if (rawText.isEmpty) {
+      if (rawText.isEmpty && !serverValid) {
         if (Get.isDialogOpen ?? false) Get.back();
         _showReceiptRejectedDialog(
-            '❌ Erreur OCR: Impossible de lire le ticket. Veuillez réessayer.');
+            '❌ Erreur d\'analyse: Impossible de lire le ticket. Veuillez réessayer.');
         return;
       }
 
       if (Get.isDialogOpen ?? false) Get.back();
       if (!mounted) return;
 
-      // Vérification finale (règles serveur Gemini + validation locale de date/heure)
-      final check =
-          await _verifyReceiptWithGemini(rawText, serverValid, serverReason);
+      // Vérification finale
+      final check = await _verifyReceiptWithGemini(
+          rawText, serverValid, serverReason,
+          extractedAmount: extractedAmount, storeNameFound: storeNameFound);
 
       if (!(check['valid'] as bool)) {
         _showReceiptRejectedDialog(check['reason'] as String);
         return;
       }
 
-      final amount = _parseReceiptAmount(rawText);
+      // Utiliser le montant extrait par le LLM, ou fallback sur le parsing local
+      double? amount = extractedAmount;
+      if (amount == null || amount <= 0) {
+        amount = _parseReceiptAmount(rawText);
+      }
+
       if (amount == null) {
-        _showManualAmountEntry(rawText);
+        _showReceiptRejectedDialog(
+            "Impossible de lire le montant automatiquement. Veuillez reprendre une photo avec le total bien visible.");
       } else {
-        _showCashbackPopup(amount, rawText);
+        _showCashbackPopup(amount, rawText, receiptToken: receiptToken);
       }
     } catch (e) {
       if (Get.isDialogOpen ?? false) Get.back();
@@ -18044,204 +18906,124 @@ class _StoreCardState extends State<StoreCard> {
     }
   }
 
-  Future<Map<String, dynamic>> _verifyReceiptWithGemini(
-      String rawText, bool serverValid, String serverReason) async {
-    if (!serverValid) {
-      return {
-        'valid': false,
-        'reason':
-            '❌ Refusé par l\'IA: ${serverReason.isNotEmpty ? serverReason : 'Ticket invalide ou falsifié.'}'
-      };
-    }
-    // Effectuer la vérification locale de date et d'enseigne
-    return _verifyReceiptValidity(rawText);
-  }
-
-  /// Secure OCR & Gemini AI via Firebase Cloud Function (Server-side)
-  /// The Cloud Function handles Document AI & Gemini processing with server credentials
+  /// Secure OCR via NVIDIA NIM (Cloud Function)
   Future<Map<String, dynamic>> _performSecureOCR(String imagePath) async {
     try {
       final File imageFile = File(imagePath);
       final bytes = await imageFile.readAsBytes();
       final base64Image = base64Encode(bytes);
 
-      // Call Firebase Cloud Function (secure, server-side processing)
+      // Appel à la Cloud Function (qui utilise NVIDIA NIM)
       final HttpsCallable callable =
           FirebaseFunctions.instance.httpsCallable('processReceiptOCR');
+
       final response = await callable.call({
         'imageBase64': base64Image,
         'mimeType': 'image/jpeg',
         'storeName': widget.store.name,
       });
 
-      if (response.data != null && response.data['text'] != null) {
-        final extractedText = response.data['text'] as String;
+      if (response.data != null) {
+        final extractedText = response.data['text'] as String? ?? '';
         final bool serverValid = response.data['valid'] == true;
         final String serverReason = response.data['reason'] as String? ?? '';
+        final String? receiptToken = response.data['receiptToken'] as String?;
+        final double? extractedAmount =
+            (response.data['amount'] as num?)?.toDouble();
+        final String? extractedDate = response.data['date'] as String?;
+        final String? storeNameFound =
+            response.data['storeNameFound'] as String?;
+
         debugPrint(
-            '[OCR & Gemini] Recognized text via Cloud Function: ${extractedText.length} chars (Valid: $serverValid)');
+            '[NVIDIA NIM] Analyse terminée: Valid=$serverValid, Montant=$extractedAmount');
+
         return {
           'text': extractedText,
           'serverValid': serverValid,
           'serverReason': serverReason,
+          'receiptToken': receiptToken,
+          'amount': extractedAmount,
+          'date': extractedDate,
+          'storeNameFound': storeNameFound,
         };
       }
 
-      final fallbackText = await _fallbackMLKitOCR(imagePath);
       return {
-        'text': fallbackText,
-        'serverValid': true,
-        'serverReason': '',
+        'text': '',
+        'serverValid': false,
+        'serverReason': 'Réponse vide du serveur.',
       };
     } catch (e) {
-      debugPrint(
-          '[OCR] Cloud Function error: $e. Falling back to local ML Kit.');
-      final fallbackText = await _fallbackMLKitOCR(imagePath);
+      debugPrint('[NVIDIA NIM] Erreur: $e');
       return {
-        'text': fallbackText,
-        'serverValid': true,
-        'serverReason': '',
+        'text': '',
+        'serverValid': false,
+        'serverReason': 'Erreur de connexion: $e',
       };
     }
   }
 
-  /// Fallback: Local Google ML Kit OCR (device-only, no external calls)
-  Future<String?> _fallbackMLKitOCR(String imagePath) async {
-    try {
-      final inputImage = InputImage.fromFilePath(imagePath);
-      final textRecognizer =
-          TextRecognizer(script: TextRecognitionScript.latin);
-      final RecognizedText recognized =
-          await textRecognizer.processImage(inputImage);
-      await textRecognizer.close();
-      debugPrint(
-          '[MLKit] Local OCR completed: ${recognized.text.length} characters');
-      return recognized.text;
-    } catch (e) {
-      debugPrint('[MLKit] Local OCR failed: $e');
-      return null;
-    }
-  }
-
-  Map<String, dynamic> _verifyReceiptValidity(String rawText) {
-    final textLower = rawText.toLowerCase();
-    final now = DateTime.now();
-
-    // ── 1. Vérification du nom de l'enseigne ──────────────────────────────
-    // On cherche au moins 1 mot significatif du nom ou de l'adresse dans le ticket
-    bool storeFound = false;
-
-    // Mots du nom du magasin (>3 lettres)
-    final storeWords = widget.store.name
-        .toLowerCase()
-        .split(RegExp(r'[\s\-\./,]+'))
-        .where((w) => w.length > 3)
-        .toList();
-    if (storeWords.any((w) => textLower.contains(w))) storeFound = true;
-
-    // Mots de l'adresse (>4 lettres) — plan B
-    if (!storeFound) {
-      final addrWords = widget.store.address
-          .toLowerCase()
-          .split(RegExp(r'[\s\-\./,]+'))
-          .where((w) => w.length > 4)
-          .toList();
-      if (addrWords.any((w) => textLower.contains(w))) storeFound = true;
-    }
-
-    if (!storeFound) {
+  /// Vérification finale du reçu (simplifiée - le LLM a déjà fait le gros du travail)
+  Future<Map<String, dynamic>> _verifyReceiptWithGemini(
+      String rawText, bool serverValid, String serverReason,
+      {double? extractedAmount, String? storeNameFound}) async {
+    // Si le LLM a déjà rejeté, on rejette
+    if (!serverValid) {
       return {
         'valid': false,
-        'reason':
-            '❌ Ce ticket ne correspond pas au magasin "${widget.store.name}".\n\nAssurez-vous de scanner le ticket du bon magasin.'
+        'reason': serverReason.isNotEmpty
+            ? '❌ Ticket invalide: $serverReason'
+            : '❌ Ticket jugé non valide par l\'analyse IA.'
       };
     }
 
-    // ── 2. Extraction de la date et heure du ticket ───────────────────────
-    // Pattern 1 : date complète  DD/MM/YYYY HH:MM  ou  DD/MM/YYYY HH:MM:SS
-    final patternDateFull = RegExp(
-        r'(\d{2})[/\-\.](\d{2})[/\-\.](\d{2,4})\s+(\d{1,2})[h:hH](\d{2})(?:[:\s](\d{2}))?');
-    // Pattern 2 : heure seule  HH:MM  ou  HHhMM
-    final patternTimeOnly = RegExp(r'\b(\d{1,2})[hH:](\d{2})(?::(\d{2}))?\b');
+    // Vérification locale supplémentaire : cohérence du nom de magasin
+    final storeName = widget.store.name.toLowerCase();
+    final foundName = (storeNameFound ?? '').toLowerCase();
 
-    DateTime? receiptDateTime;
+    if (foundName.isNotEmpty &&
+        !storeName.contains(foundName.split(' ').first) &&
+        !foundName.contains(storeName.split(' ').first)) {
+      // Tolérance : si les premiers mots correspondent, c'est OK
+      final storeWords = storeName
+          .split(RegExp(r'[\s\-]+'))
+          .where((w) => w.length > 3)
+          .toList();
+      final foundWords = foundName
+          .split(RegExp(r'[\s\-]+'))
+          .where((w) => w.length > 3)
+          .toList();
 
-    // Essai pattern date complète
-    for (final m in patternDateFull.allMatches(rawText)) {
-      try {
-        int day = int.parse(m.group(1)!);
-        int month = int.parse(m.group(2)!);
-        int year = int.parse(m.group(3)!);
-        int hour = int.parse(m.group(4)!);
-        int minute = int.parse(m.group(5)!);
-        if (year < 100) year += 2000;
-        if (day >= 1 &&
-            day <= 31 &&
-            month >= 1 &&
-            month <= 12 &&
-            hour >= 0 &&
-            hour < 24 &&
-            minute >= 0 &&
-            minute < 60) {
-          final candidate = DateTime(year, month, day, hour, minute);
-          // Prend la date la plus récente trouvée (évite dates de péremption etc.)
-          if (receiptDateTime == null || candidate.isAfter(receiptDateTime)) {
-            receiptDateTime = candidate;
-          }
-        }
-      } catch (_) {}
-    }
-
-    // Essai pattern heure seule (si pas de date complète trouvée)
-    if (receiptDateTime == null) {
-      // Cherche toutes les heures et prend la dernière (souvent l'heure de passage)
-      DateTime? lastTime;
-      for (final m in patternTimeOnly.allMatches(rawText)) {
-        try {
-          int h = int.parse(m.group(1)!);
-          int min = int.parse(m.group(2)!);
-          if (h >= 0 && h < 24 && min >= 0 && min < 60) {
-            // Ignore les heures qui ressemblent à des dates (ex: 20:02)
-            final candidate = DateTime(now.year, now.month, now.day, h, min);
-            // On ignore si ça ressemble à une date jj:mm (ex: 20/02 → 20h02 faux positif)
-            if (h <= 23 && min <= 59) {
-              if (lastTime == null ||
-                  candidate.hour > lastTime.hour ||
-                  (candidate.hour == lastTime.hour &&
-                      candidate.minute > lastTime.minute)) {
-                lastTime = candidate;
-              }
-            }
-          }
-        } catch (_) {}
-      }
-      if (lastTime != null) {
-        receiptDateTime = lastTime;
-        // Si l'heure ticket est dans le futur, c'est un ticket de la veille
-        if (receiptDateTime!.isAfter(now)) {
-          receiptDateTime = receiptDateTime!.subtract(const Duration(days: 1));
+      bool hasCommonWord = false;
+      for (var sw in storeWords) {
+        if (foundWords.any((fw) => fw.contains(sw) || sw.contains(fw))) {
+          hasCommonWord = true;
+          break;
         }
       }
-    }
 
-    // ── 3. Vérification délai ≤ 2h ────────────────────────────────────────
-    if (receiptDateTime != null) {
-      final diff = now.difference(receiptDateTime!);
-      if (diff.isNegative) {
-        // Ticket dans le futur — probablement mauvaise date, on accepte avec bénéfice du doute
-      } else if (diff.inMinutes > 120) {
-        final ticketStr =
-            '${receiptDateTime!.day.toString().padLeft(2, '0')}/${receiptDateTime!.month.toString().padLeft(2, '0')}/${receiptDateTime!.year} '
-            '${receiptDateTime!.hour.toString().padLeft(2, '0')}:${receiptDateTime!.minute.toString().padLeft(2, '0')}';
+      if (!hasCommonWord &&
+          rawText.toLowerCase().contains(storeName.split(' ').first) == false) {
         return {
           'valid': false,
           'reason':
-              '⏱ Ce ticket date de plus de 2 heures.\n\nHeure sur le ticket : $ticketStr\nHeure actuelle : ${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}\n\nSeuls les achats des 2 dernières heures sont acceptés.'
+              '❌ Le nom du magasin sur le ticket ne correspond pas à "${widget.store.name}".'
         };
       }
-      // Entre 0 et 120 min → OK
     }
-    // Si aucune heure trouvée → accepté (bénéfice du doute)
+
+    // Vérification du montant extrait
+    if (extractedAmount == null || extractedAmount <= 0) {
+      // Essayer d'extraire le montant du texte brut en fallback
+      final parsedAmount = _parseReceiptAmount(rawText);
+      if (parsedAmount == null) {
+        return {
+          'valid': false,
+          'reason':
+              '❌ Impossible de lire le montant total sur le ticket. Veuillez reprendre une photo plus nette.'
+        };
+      }
+    }
 
     return {'valid': true, 'reason': ''};
   }
@@ -18294,41 +19076,8 @@ class _StoreCardState extends State<StoreCard> {
   }
 
   void _showManualAmountEntry(String rawText) {
-    final ctrl = TextEditingController();
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text("Montant non détecté"),
-        content: Column(mainAxisSize: MainAxisSize.min, children: [
-          const Text("Saisissez le montant total de l'achat :"),
-          const SizedBox(height: 16),
-          TextField(
-            controller: ctrl,
-            keyboardType: const TextInputType.numberWithOptions(decimal: true),
-            decoration: const InputDecoration(
-              labelText: "Montant (€)",
-              prefixIcon: Icon(Icons.euro),
-              border: OutlineInputBorder(),
-            ),
-          ),
-        ]),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text("Annuler")),
-          ElevatedButton(
-            onPressed: () {
-              final v = double.tryParse(ctrl.text.replaceAll(',', '.'));
-              if (v != null && v > 0) {
-                Navigator.pop(ctx);
-                _showCashbackPopup(v, rawText);
-              }
-            },
-            child: const Text("Valider"),
-          ),
-        ],
-      ),
-    );
+    _showReceiptRejectedDialog(
+        "Impossible de lire le montant automatiquement sur le ticket. Veuillez reprendre une photo bien nette avec le total visible.");
   }
 // Add this method inside class _StoreCardState
 
@@ -18364,7 +19113,8 @@ class _StoreCardState extends State<StoreCard> {
     };
   }
 
-  void _showCashbackPopup(double amountSpent, String rawText) {
+  void _showCashbackPopup(double amountSpent, String rawText,
+      {String? receiptToken}) {
     final store = widget.store;
     final profile = widget.userProfile;
 
@@ -18477,7 +19227,8 @@ class _StoreCardState extends State<StoreCard> {
                     onPressed: () {
                       Navigator.pop(ctx);
                       _saveCashback(amountSpent, cashbackAmount, lameBonus,
-                          totalRate, rawText, loyaltyTierLabel);
+                          totalRate, rawText, loyaltyTierLabel,
+                          receiptToken: receiptToken);
                     },
                   ),
                 )
@@ -18502,79 +19253,32 @@ class _StoreCardState extends State<StoreCard> {
     );
   }
 
-  Future<void> _saveCashback(
-      double amountSpent,
-      double cashbackAmount,
-      int lameBonus,
-      double rateApplied,
-      String rawText,
-      String loyaltyTier) async {
+  Future<void> _saveCashback(double amountSpent, double cashbackAmount,
+      int lameBonus, double rateApplied, String rawText, String loyaltyTier,
+      {String? receiptToken}) async {
     try {
-      final uid = widget.userProfile.id;
-      final storeId = widget.store.id;
-      final now = Timestamp.now();
-      final batch = FirebaseFirestore.instance.batch();
-
-      // 1. Historique cashback utilisateur
-      batch.set(
-        FirebaseFirestore.instance
-            .collection('users')
-            .doc(uid)
-            .collection('cashback_history')
-            .doc(),
-        {
-          'store_id': storeId,
-          'store_name': widget.store.name,
-          'amount_spent': amountSpent,
-          'cashback_amount': cashbackAmount,
-          'cashback_rate_applied': rateApplied,
-          'lame_points_earned': lameBonus,
-          'loyalty_tier_applied': loyaltyTier.isEmpty ? null : loyaltyTier,
-          'receipt_text_raw': rawText,
-          'timestamp': now,
-        },
-      );
-
-      // 2. Transaction dans le magasin (espace commerçant)
-      batch.set(
-        FirebaseFirestore.instance
-            .collection('stores')
-            .doc(storeId)
-            .collection('store_transactions')
-            .doc(),
-        {
-          'user_id': uid,
-          'username': widget.userProfile.username,
-          'amount_spent': amountSpent,
-          'cashback_given': cashbackAmount,
-          'rate_applied': rateApplied,
-          'loyalty_tier': loyaltyTier.isEmpty ? null : loyaltyTier,
-          'timestamp': now,
-        },
-      );
-
-      // 3. Stats globales magasin
-      batch.update(
-          FirebaseFirestore.instance.collection('stores').doc(storeId), {
-        'totalAmountSpentByUser': FieldValue.increment(amountSpent),
-        'totalCashbackGiven': FieldValue.increment(cashbackAmount),
+      final callable =
+          FirebaseFunctions.instance.httpsCallable('claimCashback');
+      final response = await callable.call({
+        'storeId': widget.store.id,
+        'amountSpent': amountSpent,
+        'rawText': rawText,
+        if (receiptToken != null) 'receiptToken': receiptToken,
       });
 
-      // 4. Fidélité utilisateur
-      batch.update(FirebaseFirestore.instance.collection('users').doc(uid), {
-        'loyalty_progress.$storeId.visits': FieldValue.increment(1),
-        'loyalty_progress.$storeId.spend': FieldValue.increment(amountSpent),
-      });
+      final data = response.data as Map<String, dynamic>?;
+      final double finalCb =
+          (data?['cashbackAmount'] as num?)?.toDouble() ?? cashbackAmount;
+      final int finalLames = (data?['lameBonus'] as num?)?.toInt() ?? lameBonus;
 
-      await batch.commit();
-
-      if (lameBonus > 0)
-        widget.onAddLame(lameBonus, source: "Cashback ${widget.store.name}");
+      if (finalLames > 0) {
+        widget.onAddLame(finalLames, source: "Cashback ${widget.store.name}");
+      }
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
           content: Text(
-              "✅ Cashback ${cashbackAmount.toStringAsFixed(2)}€ enregistré !${lameBonus > 0 ? ' +$lameBonus Lames' : ''}"),
+              "✅ Cashback ${finalCb.toStringAsFixed(2)}€ enregistré !${finalLames > 0 ? ' +$finalLames Lames' : ''}"),
           backgroundColor: Colors.green,
           duration: const Duration(seconds: 4),
         ));
@@ -18582,7 +19286,9 @@ class _StoreCardState extends State<StoreCard> {
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Erreur: $e"), backgroundColor: Colors.red),
+          SnackBar(
+              content: Text("Erreur cashback: ${e.toString()}"),
+              backgroundColor: Colors.red),
         );
       }
     }
@@ -18799,28 +19505,16 @@ class ShopScreen extends StatelessWidget {
 
     if (confirmed == true) {
       try {
-        // 1. Enregistrement de l'offre réclamée (la déduction des Lames est gérée par le serveur via purchaseShopItem)
-        WriteBatch batch = FirebaseFirestore.instance.batch();
-
-        DocumentReference historyRef =
-            FirebaseFirestore.instance.collection('user_claimed_offers').doc();
-        batch.set(historyRef, {
-          'user_id': userProfile.id,
-          'reward_id': item.id,
-          'details': {
-            'offer_title': "Achat Boutique : ${item.name}",
-            'claimed_for_lame': item.costLame.toDouble(),
-          },
-          'claimed_at': FieldValue.serverTimestamp(),
-          'status':
-              'approved', // Validé automatiquement car c'est un achat boutique
+        final callable =
+            FirebaseFunctions.instance.httpsCallable('purchaseShopItem');
+        await callable.call({
+          'itemId': item.id,
+          'itemTitle': item.name,
         });
-
-        await batch.commit();
 
         if (context.mounted) {
           ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-              content: Text('${item.name} acheté!'),
+              content: Text('${item.name} acheté !'),
               backgroundColor: Colors.green));
         }
 
@@ -18831,7 +19525,7 @@ class ShopScreen extends StatelessWidget {
       } catch (e) {
         if (context.mounted) {
           ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-              content: Text('Erreur lors de l\'achat: $e'),
+              content: Text('Erreur lors de l\'achat: ${e.toString()}'),
               backgroundColor: Colors.red));
         }
       }
@@ -19240,16 +19934,14 @@ class ProfileBottomSheet extends StatelessWidget {
                 style: ElevatedButton.styleFrom(
                     backgroundColor: const Color(0xFFFFB300),
                     foregroundColor: Colors.black),
-                onPressed: () async {
+                onPressed: () {
                   Navigator.of(dialogContext).pop();
-                  await FirebaseFirestore.instance
-                      .collection('users')
-                      .doc(userProfile.id)
-                      .update({'is_vip': true});
                   ScaffoldMessenger.of(context).showSnackBar(
                     const SnackBar(
-                        content: Text("✅ Premium activé !"),
-                        backgroundColor: Colors.green),
+                      content: Text(
+                          "Passez au Niveau 30 ou souscrivez un abonnement pour débloquer le statut Premium !"),
+                      backgroundColor: Colors.blue,
+                    ),
                   );
                 },
               ),
@@ -19501,183 +20193,178 @@ class ProfileBottomSheet extends StatelessWidget {
     const Color accentGold = Color(0xFFFFB300);
     const Color textGrey = Color(0xFF757575);
 
-    return Container(
+    return SingleChildScrollView(
+      controller: scrollController,
       padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
-      // CORRIGÉ: Suppression de BoxConstraints(maxHeight) pour laisser le DraggableScrollableSheet gérer la taille
-      child: SingleChildScrollView(
-        controller: scrollController, // CORRIGÉ: Lier le scroll
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            // --- NOUVEAU : BOUTON ENGRENAGE ---
-            Align(
-              alignment: Alignment.topRight,
-              child: IconButton(
-                icon: const Icon(Icons.settings, color: Colors.grey, size: 28),
-                onPressed: () => _showSettingsSheet(context),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // --- NOUVEAU : BOUTON ENGRENAGE ---
+          Align(
+            alignment: Alignment.topRight,
+            child: IconButton(
+              icon: const Icon(Icons.settings, color: Colors.grey, size: 28),
+              onPressed: () => _showSettingsSheet(context),
+            ),
+          ),
+
+          // 1. AVATAR ET NOM
+          CircleAvatar(
+            radius: 40,
+            backgroundColor: primaryGreen,
+            child: Text(
+                userProfile.username.isNotEmpty
+                    ? userProfile.username.substring(0, 1).toUpperCase()
+                    : "U",
+                style: const TextStyle(fontSize: 30, color: Colors.white)),
+          ),
+          const SizedBox(height: 12),
+          Text(userProfile.username,
+              style: Theme.of(context).textTheme.headlineMedium),
+
+          // 2. STATUT VIP
+          if (userProfile.isVip)
+            Padding(
+              padding: const EdgeInsets.only(top: 8.0),
+              child: ElevatedButton.icon(
+                onPressed: () => _showVipDetailsDialog(context),
+                icon:
+                    const Icon(Icons.workspace_premium, color: Colors.black87),
+                label: const Text("Membre VIP",
+                    style: TextStyle(
+                        color: Colors.black87, fontWeight: FontWeight.bold)),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: accentGold,
+                  minimumSize: const Size(200, 45),
+                ),
+              ),
+            )
+          else
+            Padding(
+              padding: const EdgeInsets.only(top: 8.0),
+              child: OutlinedButton.icon(
+                onPressed: () => _showPremiumDialog(context),
+                icon: const Icon(Icons.workspace_premium_outlined,
+                    color: accentGold),
+                label: const Text("Obtenir Premium",
+                    style: TextStyle(color: accentGold)),
+                style: OutlinedButton.styleFrom(
+                    side: const BorderSide(color: accentGold),
+                    backgroundColor: accentGold.withOpacity(0.1)),
               ),
             ),
 
-            // 1. AVATAR ET NOM
-            CircleAvatar(
-              radius: 40,
-              backgroundColor: primaryGreen,
-              child: Text(
-                  userProfile.username.isNotEmpty
-                      ? userProfile.username.substring(0, 1).toUpperCase()
-                      : "U",
-                  style: const TextStyle(fontSize: 30, color: Colors.white)),
-            ),
-            const SizedBox(height: 12),
-            Text(userProfile.username,
-                style: Theme.of(context).textTheme.headlineMedium),
+          const SizedBox(height: 15),
+          const Divider(),
 
-            // 2. STATUT VIP
-            if (userProfile.isVip)
-              Padding(
-                padding: const EdgeInsets.only(top: 8.0),
-                child: ElevatedButton.icon(
-                  onPressed: () => _showVipDetailsDialog(context),
-                  icon: const Icon(Icons.workspace_premium,
-                      color: Colors.black87),
-                  label: const Text("Membre VIP",
-                      style: TextStyle(
-                          color: Colors.black87, fontWeight: FontWeight.bold)),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: accentGold,
-                    minimumSize: const Size(200, 45),
-                  ),
-                ),
-              )
-            else
-              Padding(
-                padding: const EdgeInsets.only(top: 8.0),
-                child: OutlinedButton.icon(
-                  onPressed: () => _showPremiumDialog(context),
-                  icon: const Icon(Icons.workspace_premium_outlined,
-                      color: accentGold),
-                  label: const Text("Obtenir Premium",
-                      style: TextStyle(color: accentGold)),
-                  style: OutlinedButton.styleFrom(
-                      side: const BorderSide(color: accentGold),
-                      backgroundColor: accentGold.withOpacity(0.1)),
-                ),
+          // 📊 STATISTIQUES UTILISATEUR
+          const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              child: Text('Statistiques',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold))),
+          SizedBox(
+            height: 110,
+            child: ListView(scrollDirection: Axis.horizontal, children: [
+              _buildStatCard(
+                  '📍',
+                  '${userProfile.totalDistanceKm.toStringAsFixed(1)}',
+                  'Distance'),
+              _buildStatCard('🚗', '${userProfile.totalTripsCount}', 'Trajets'),
+              _buildStatCard(
+                  '🔥', '${userProfile.totalCaloriesBurned}', 'Calories'),
+              _buildStatCard('👥', '${userProfile.friendIds.length}', 'Amis'),
+            ]),
+          ),
+
+          // 🏅 BADGES D'ACCOMPLISSEMENT
+          const SizedBox(height: 15),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Text('Badges d\'accomplissement',
+                      style:
+                          TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                  Text('${userProfile.unlockedBadges.length}/10',
+                      style: const TextStyle(
+                          color: accentGold, fontWeight: FontWeight.bold)),
+                ]),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+            child: Wrap(spacing: 8, runSpacing: 8, children: [
+              for (final achievement in Achievement.all)
+                _buildBadge(achievement,
+                    userProfile.unlockedBadges.contains(achievement.id)),
+            ]),
+          ),
+
+          // 👥 GESTION DES AMIS
+          const SizedBox(height: 15),
+          Wrap(
+            alignment: WrapAlignment.spaceEvenly,
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              ElevatedButton.icon(
+                icon: const Icon(Icons.person_add, size: 18),
+                label: const Text('Ajouter'),
+                onPressed: () {
+                  Navigator.pop(context);
+                  _showAddFriendDialog(context);
+                },
               ),
-
-            const SizedBox(height: 15),
-            const Divider(),
-
-            // 📊 STATISTIQUES UTILISATEUR
-            const Padding(
-                padding: EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                child: Text('Statistiques',
-                    style:
-                        TextStyle(fontSize: 16, fontWeight: FontWeight.bold))),
-            SizedBox(
-              height: 110,
-              child: ListView(scrollDirection: Axis.horizontal, children: [
-                _buildStatCard(
-                    '📍',
-                    '${userProfile.totalDistanceKm.toStringAsFixed(1)}',
-                    'Distance'),
-                _buildStatCard(
-                    '🚗', '${userProfile.totalTripsCount}', 'Trajets'),
-                _buildStatCard(
-                    '🔥', '${userProfile.totalCaloriesBurned}', 'Calories'),
-                _buildStatCard('👥', '${userProfile.friendIds.length}', 'Amis'),
-              ]),
-            ),
-
-            // 🏅 BADGES D'ACCOMPLISSEMENT
-            const SizedBox(height: 15),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Text('Badges d\'accomplissement',
-                        style: TextStyle(
-                            fontSize: 16, fontWeight: FontWeight.bold)),
-                    Text('${userProfile.unlockedBadges.length}/10',
-                        style: const TextStyle(
-                            color: accentGold, fontWeight: FontWeight.bold)),
-                  ]),
-            ),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-              child: Wrap(spacing: 8, runSpacing: 8, children: [
-                for (final achievement in Achievement.all)
-                  _buildBadge(achievement,
-                      userProfile.unlockedBadges.contains(achievement.id)),
-              ]),
-            ),
-
-            // 👥 GESTION DES AMIS
-            const SizedBox(height: 15),
-            Wrap(
-              alignment: WrapAlignment.spaceEvenly,
-              spacing: 8,
-              runSpacing: 8,
-              children: [
+              ElevatedButton.icon(
+                icon: const Icon(Icons.people, size: 18),
+                label: Text('${userProfile.friendIds.length} Amis'),
+                onPressed: () => _showFriendsList(context, userProfile),
+              ),
+              if (userProfile.friendRequestsReceived.isNotEmpty)
                 ElevatedButton.icon(
-                  icon: const Icon(Icons.person_add, size: 18),
-                  label: const Text('Ajouter'),
+                  icon: const Icon(Icons.mail, size: 18),
+                  label: Text(
+                      '${userProfile.friendRequestsReceived.length} Demandes'),
+                  style:
+                      ElevatedButton.styleFrom(backgroundColor: Colors.orange),
                   onPressed: () {
                     Navigator.pop(context);
-                    _showAddFriendDialog(context);
+                    _showFriendRequestsDialog(context, userProfile);
                   },
                 ),
-                ElevatedButton.icon(
-                  icon: const Icon(Icons.people, size: 18),
-                  label: Text('${userProfile.friendIds.length} Amis'),
-                  onPressed: () => _showFriendsList(context, userProfile),
-                ),
-                if (userProfile.friendRequestsReceived.isNotEmpty)
-                  ElevatedButton.icon(
-                    icon: const Icon(Icons.mail, size: 18),
-                    label: Text(
-                        '${userProfile.friendRequestsReceived.length} Demandes'),
-                    style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.orange),
-                    onPressed: () {
-                      Navigator.pop(context);
-                      _showFriendRequestsDialog(context, userProfile);
-                    },
-                  ),
-              ],
-            ),
+            ],
+          ),
 
-            const Divider(),
+          const Divider(),
 
-            // 3. SYSTÈME DE NIVEAUX
-            _buildLevelProgressSection(userProfile, context),
+          // 3. SYSTÈME DE NIVEAUX
+          _buildLevelProgressSection(userProfile, context),
 
-            const Divider(),
+          const Divider(),
 
-            // 4. STATISTIQUES UTILISATEUR
-            ListTile(
-                leading: const Icon(Icons.eco_rounded, color: accentGold),
-                title: Text('${userProfile.lamePoints} Lame Points')),
-            ListTile(
-                leading: const Icon(Icons.login_rounded, color: textGrey),
-                title: Text(
-                    '${userProfile.consecutiveLogins} jours de connexion')),
+          // 4. STATISTIQUES UTILISATEUR
+          ListTile(
+              leading: const Icon(Icons.eco_rounded, color: accentGold),
+              title: Text('${userProfile.lamePoints} Lame Points')),
+          ListTile(
+              leading: const Icon(Icons.login_rounded, color: textGrey),
+              title:
+                  Text('${userProfile.consecutiveLogins} jours de connexion')),
 
-            const Divider(),
+          const Divider(),
 
-            // 5. BOUTIQUE
-            const SizedBox(height: 10),
-            ElevatedButton.icon(
-                icon: const Icon(Icons.shopping_bag_outlined),
-                label: const Text('Ouvrir la Boutique'),
-                onPressed: onOpenShop,
-                style: ElevatedButton.styleFrom(
-                    minimumSize: const Size(double.infinity, 45))),
+          // 5. BOUTIQUE
+          const SizedBox(height: 10),
+          ElevatedButton.icon(
+              icon: const Icon(Icons.shopping_bag_outlined),
+              label: const Text('Ouvrir la Boutique'),
+              onPressed: onOpenShop,
+              style: ElevatedButton.styleFrom(
+                  minimumSize: const Size(double.infinity, 45))),
 
-            const SizedBox(height: 20),
-            // Les boutons Espace Pro, Domicile et Déconnexion ont été déplacés dans les paramètres !
-          ],
-        ),
+          const SizedBox(height: 20),
+          // Les boutons Espace Pro, Domicile et Déconnexion ont été déplacés dans les paramètres !
+        ],
       ),
     );
   }
@@ -21016,7 +21703,6 @@ class _RewardScreenState extends State<RewardScreen>
       {bool isInstantApproval = false}) async {
     final currentUser = FirebaseAuth.instance.currentUser;
 
-    // 1. Vérifications de base
     if (currentUser == null) {
       if (mounted)
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
@@ -21033,54 +21719,24 @@ class _RewardScreenState extends State<RewardScreen>
       return false;
     }
 
-    final userRef = firestore.collection('users').doc(currentUser.uid);
-
-    // Création d'une nouvelle référence pour l'historique des demandes
-    final claimedOfferRef = firestore.collection('user_claimed_offers').doc();
-
     try {
-      await firestore.runTransaction((transaction) async {
-        // 2. Débiter les points de l'utilisateur
-        transaction
-            .update(userRef, {'lame_points': FieldValue.increment(-amount)});
-
-        // 3. Enregistrer la demande dans l'historique avec le statut
-        transaction.set(claimedOfferRef, {
-          'user_id': currentUser.uid,
-          'user_email_contact': email,
-          'reward_id': offerIdContext,
-          'details': {
-            'claimed_for_lame': amount,
-            'offer_title': offerTitleContext
-          },
-          'claimed_at': FieldValue.serverTimestamp(),
-
-          // --- AJOUT CLÉ POUR LE SUIVI ---
-          'status': isInstantApproval
-              ? 'approved'
-              : 'pending', // Dons = validé immédiatement, autres = en attente
-          // -----------------------------
-
-          // Champs pour l'envoi d'email (facultatif selon votre config backend)
-          'to': 'corentinparrel2@gmail.com',
-          'message': {
-            'subject': 'Nouvelle demande de récompense EcoNav !',
-            'text':
-                'L\'utilisateur $email a réclamé la récompense "$offerTitleContext" pour $amount Lames. ID Utilisateur: ${currentUser.uid}',
-            'html':
-                '<h1>Nouvelle Récompense Réclamée</h1><p><b>Utilisateur:</b> $email</p><p><b>Récompense:</b> $offerTitleContext</p><p><b>Coût:</b> $amount Lames</p><p><b>ID User:</b> ${currentUser.uid}</p>',
-          }
-        });
+      final callable =
+          FirebaseFunctions.instance.httpsCallable('processDonation');
+      await callable.call({
+        'amount': amount,
+        'offerId': offerIdContext,
+        'offerTitle': offerTitleContext,
+        'email': email,
+        'isInstantApproval': isInstantApproval,
       });
 
-      // 4. Mettre à jour l'interface locale via le callback parent
       await widget.onPurchase(amount.toInt());
       return true;
     } catch (error) {
-      print("Erreur de transaction Firestore: $error");
+      debugPrint("Erreur processDonation: $error");
       if (mounted)
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-            content: Text("Erreur serveur: $error"),
+            content: Text("Erreur serveur: ${error.toString()}"),
             backgroundColor: Colors.red));
       return false;
     }
@@ -22219,10 +22875,15 @@ class _AuctionScreenState extends State<AuctionScreen> {
     try {
       final docSnapshot =
           await _firestore.collection('contests').doc(_contestIdRef).get();
+      final stateSnapshot =
+          await _firestore.collection('contest_state').doc(_contestIdRef).get();
 
       if (mounted) {
         if (docSnapshot.exists && docSnapshot.data() != null) {
-          final data = docSnapshot.data()!;
+          final data = Map<String, dynamic>.from(docSnapshot.data()!);
+          if (stateSnapshot.exists && stateSnapshot.data() != null) {
+            data.addAll(stateSnapshot.data()!);
+          }
 
           String? highestBidderUsername;
           if (data['highest_bidder_user_id'] != null) {
@@ -23705,280 +24366,1431 @@ class _NotificationHistorySheetState extends State<NotificationHistorySheet> {
   }
 }
 
-// ===========================================================================
-// 🚀 FILTRE KINÉMATIQUE FLUIDE (AVANCÉE CONTINUE SANS RALENTISSEMENT)
-// ===========================================================================
+// ══════════════════════════════════════════════════════════════════════════
+// 🚀 FILTRE KINÉMATIQUE FLUIDE (AVANCÉE CONTINUE SANS RALENTISSEMENT NI RECUL)
+// ══════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════
+// 🚀 FILTRE KINÉMATIQUE FLUIDE : VITESSE CONSTANTE (AUCUN RALENTISSEMENT)
+// ══════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════
+// 🚀 FILTRE KINÉMATIQUE : RÉGULATEUR DE VITESSE DYNAMIQUE (RUBBER BANDING)
+// ══════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════
+// 🚀 FILTRE KINÉMATIQUE : VITESSE FIXÉE SUR 1 SECONDE (CINÉMATIQUE PURE)
+// ══════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════
+// 🚀 FILTRE KINÉMATIQUE : LA FLÈCHE CHASSE LA PROJECTION BLEUE EN 1 SECONDE
+// ══════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════
+// 📱 DÉTECTEUR ACCÉLÉROMÈTRE (fusionné avec le GPS existant)
+// ══════════════════════════════════════════════════════════════
+class AccelerometerBrakeDetector {
+  StreamSubscription<UserAccelerometerEvent>? _sub;
+  bool _listening = false;
+
+  // État freinage
+  double _deceleration = 0.0; // m/s² positif = freinage
+  bool _isBraking = false;
+  DateTime? _brakeCandidateStart; // début du pic candidat (avant confirmation)
+  DateTime? _brakeCooldownUntil; // anti-rebond après un freinage
+
+  // État accélération (symétrique)
+  double _acceleration = 0.0; // m/s² positif = accélération
+  bool _isAccelerating = false;
+  DateTime? _accelCandidateStart;
+  DateTime? _accelCooldownUntil;
+
+  // Lissage
+  final List<double> _buffer = [];
+  static const int _bufSize = 8;
+
+  // Seuils
+  static const double _walkBrakeThresh = 1.0;
+  static const double _vehicBrakeThresh = 2.0;
+  static const double _walkAccelThresh = 0.8;
+  static const double _vehicAccelThresh = 1.5;
+
+  // Debounce / anti-rebond (en ms)
+  static const int _minSustainMs = 60; // durée mini avant confirmation
+  static const int _cooldownMs = 150; // délai avant de pouvoir re-déclencher
+
+  bool _isWalking = false;
+
+  // Getters
+  double get deceleration => _deceleration;
+  double get acceleration => _acceleration;
+  bool get isBraking => _isBraking;
+  bool get isAccelerating => _isAccelerating;
+
+  void start({bool isWalking = false}) {
+    if (_listening) return;
+    _isWalking = isWalking;
+    _listening = true;
+    _buffer.clear();
+
+    // 🔧 userAccelerometerEvents retire la gravité (contrairement à
+    // accelerometerEvents), donc un téléphone incliné (support voiture,
+    // main) ne fausse plus la magnitude x/y.
+    _sub = userAccelerometerEventStream(
+      samplingPeriod: SensorInterval.uiInterval, // ~60Hz
+    ).listen(
+      _onAccel,
+      onError: (Object e) {
+        // 🔧 Certains devices/émulateurs n'ont pas d'accéléromètre :
+        // on désactive proprement plutôt que de laisser planter le stream.
+        debugPrint('⚠️ AccelerometerBrakeDetector stream error: $e');
+        stop();
+      },
+      cancelOnError: true,
+    );
+  }
+
+  void stop() {
+    _sub?.cancel();
+    _sub = null;
+    _listening = false;
+    _isBraking = false;
+    _isAccelerating = false;
+    _deceleration = 0.0;
+    _acceleration = 0.0;
+    _brakeCandidateStart = null;
+    _brakeCooldownUntil = null;
+    _accelCandidateStart = null;
+    _accelCooldownUntil = null;
+    _buffer.clear();
+  }
+
+  void setWalkingMode(bool w) => _isWalking = w;
+
+  void _onAccel(UserAccelerometerEvent e) {
+    // Magnitude horizontale (x,y) — on ignore z (déjà sans gravité ici,
+    // mais on garde le filtrage horizontal pour ignorer les à-coups
+    // verticaux type nid-de-poule / pas de marche).
+    final double mag = math.sqrt(e.x * e.x + e.y * e.y);
+
+    _buffer.add(mag);
+    if (_buffer.length > _bufSize) _buffer.removeAt(0);
+
+    final double smoothed = _buffer.reduce((a, b) => a + b) / _buffer.length;
+
+    double instDeceleration = 0.0;
+    double instAcceleration = 0.0;
+
+    // Dérivée : différence entre les 2 dernières valeurs lissées
+    if (_buffer.length >= 2) {
+      final double prev = _buffer[_buffer.length - 2];
+      final double delta = smoothed - prev;
+
+      // delta < 0 → on ralentit (freinage)
+      // delta > 0 → on accélère
+      instDeceleration = delta < 0 ? -delta : 0.0;
+      instAcceleration = delta > 0 ? delta : 0.0;
+    }
+
+    final DateTime now = DateTime.now();
+
+    // ═══ FREINAGE (avec debounce + cooldown) ═══
+    final double brakeThresh =
+        _isWalking ? _walkBrakeThresh : _vehicBrakeThresh;
+
+    if (instDeceleration > brakeThresh) {
+      final bool inCooldown =
+          _brakeCooldownUntil != null && now.isBefore(_brakeCooldownUntil!);
+
+      if (!inCooldown) {
+        _brakeCandidateStart ??= now;
+        final int sustainedMs =
+            now.difference(_brakeCandidateStart!).inMilliseconds;
+
+        if (sustainedMs >= _minSustainMs) {
+          // 🔧 Confirmé : on ne déclenche isBraking qu'après la durée mini,
+          // ça filtre les à-coups isolés (nid de poule, vibration support).
+          _isBraking = true;
+          _deceleration = instDeceleration;
+        }
+      }
+    } else {
+      if (_isBraking) {
+        // 🔧 Cooldown : évite qu'un bruit juste après le relâchement du
+        // frein ne redéclenche immédiatement un nouveau freinage.
+        _brakeCooldownUntil =
+            now.add(const Duration(milliseconds: _cooldownMs));
+      }
+      _isBraking = false;
+      _brakeCandidateStart = null;
+      _deceleration = 0.0;
+    }
+
+    // ═══ ACCÉLÉRATION (symétrique, même logique) ═══
+    final double accelThresh =
+        _isWalking ? _walkAccelThresh : _vehicAccelThresh;
+
+    if (instAcceleration > accelThresh) {
+      final bool inCooldown =
+          _accelCooldownUntil != null && now.isBefore(_accelCooldownUntil!);
+
+      if (!inCooldown) {
+        _accelCandidateStart ??= now;
+        final int sustainedMs =
+            now.difference(_accelCandidateStart!).inMilliseconds;
+
+        if (sustainedMs >= _minSustainMs) {
+          _isAccelerating = true;
+          _acceleration = instAcceleration;
+        }
+      }
+    } else {
+      if (_isAccelerating) {
+        _accelCooldownUntil =
+            now.add(const Duration(milliseconds: _cooldownMs));
+      }
+      _isAccelerating = false;
+      _accelCandidateStart = null;
+      _acceleration = 0.0;
+    }
+  }
+
+  void dispose() => stop();
+}
+
 class KinematicFilter {
-  // Points clés de rendu
-  LatLng? simulatedPos; // Position actuelle de la flèche à l'écran
-  Position? lastRealPos; // Dernière position GPS lissée
+  // ═══ AJOUT : Accéléromètre ═══
+  final AccelerometerBrakeDetector accelDetector = AccelerometerBrakeDetector();
+  bool _accelBrakeActive = false;
+  double _accelBrakeIntensity = 0.0; // rafraîchi à 60fps (frame du ticker)
+  double _accelBoostIntensity = 0.0; // symétrique, pour l'accélération franche
+  double _gpsBrakeIntensity = 0.0; // spike GPS, rafraîchi 1x/tick GPS
 
-  // Chaîne des positions GPS brutes pour le diagnostic
-  Position? _currentRawGps; // 🟡 JAUNE = GPS actuel
-  Position? _previousRawGps; // 🟢 VERT  = GPS t-1
-  Position? _previousPreviousRawGps; // 🔴 ROUGE = GPS t-2
+  LatLng? simulatedPos; // Position de la flèche
+  Position? lastRealPos; // Dernier GPS brut
 
-  LatLng? _targetPos; // 🔵 BLEU = Cible future à +1.0s
-  DateTime? _lastGpsTime;
+  // Historique pour les points de diagnostic
+  Position? _currentRawGps; // 🟡 JAUNE (GPS actuel)
+  Position? _previousRawGps; // 🟢 VERT
+  Position? _previousPreviousRawGps; // 🔴 ROUGE
+
+  LatLng? _targetPos; // 🔵 BLEU (projection cible)
+  LatLng? _snappedGpsPos;
+
+  // 🔧 AJOUT : référence persistante pour recalage à chaque frame (60fps)
+  // au lieu d'une seule fois par fix GPS (~1x/sec). Avant, la flèche
+  // n'était recorrigée vers le jaune/bleu qu'une fois par seconde, puis
+  // continuait seule (dead-reckoning) à vitesse constante entre les deux
+  // — d'où la dérive en avance qui s'accumulait avant chaque correction.
+  LatLng? _lastReferencePos;
+  int _lastReferenceIndex = -1;
+  bool _lastIsStopped = false;
+
   DateTime? _lastPredictTime;
+  DateTime? _lastGpsUpdateTime;
 
-  double calculatedSpeedMps = 0.0;
+  bool _isNewGpsPoint = false;
+  bool _isWalking = false;
+
+  /// True quand la flèche recule pour rejoindre le GPS.
+  bool isBackwardRecovery = false;
+
+  double _vehicleSpeedMps = 0.0;
+  double _previousVehicleSpeedMps = 0.0;
+  double _arrowSpeedMps = 0.0;
+  double _brakingIntensity = 0.0;
+  double _lastGpsIntervalSeconds = 1.0;
+  double _stoppedForSeconds = 0.0;
+  double _lastRawSpeedMps = 0.0;
+
+  int _lastSimRouteIndex = 0;
+  int _snappedGpsIndex = 0;
   int lastRouteIndex = -1;
+
+  // 🔧 CORRECTIF ANTI-TÉLÉPORTATION ROND-POINT : index utilisé UNIQUEMENT
+  // par le lissage d'affichage 60fps (_getNearestRoutePoint / snapToRoute).
+  // Avant, cette fonction lisait ET écrivait dans `lastRouteIndex`, qui est
+  // censé être la propriété exclusive du pipeline GPS validé
+  // (_findRouteIndex, appelé ~1x/sec avec fenêtre bornée en mètres +
+  // anti-saut). Les deux fonctions se marchaient dessus sur la même
+  // variable : la version rapide (fenêtre étroite, +5 segments EN AVANT
+  // seulement, sans retour arrière) pouvait accrocher le mauvais côté d'un
+  // rond-point (points très rapprochés), corrompre `lastRouteIndex`, et
+  // faire "sauter" le point bleu au fix GPS suivant.
+  int displaySnapIndex = -1;
+
+  // ═══ AJOUT : Filtrage qualité GPS (anti-téléportation / anti-fix aberrant) ═══
+  double _lastRawAccuracy = 999.0;
+  LatLng? _lastConfirmedSnappedPos;
+  int _lastConfirmedRouteIndex = -1;
+  DateTime? _lastGoodGpsFixTime;
+  int _consecutiveRejectedFixes = 0;
+
+  // CORRIGÉ : getters publics pour permettre à NavigationController de
+  // réutiliser le même filtre qualité GPS (accuracy) lors de la détection
+  // d'arrivée, au lieu de dupliquer/oublier la logique ailleurs.
+  double get lastRawAccuracy => _lastRawAccuracy;
+  double get maxAccuracyWalking => _maxAccuracyWalking;
+  double get maxAccuracyVehicle => _maxAccuracyVehicle;
+  bool get isWalking => _isWalking;
+
+  double get speedMps => _vehicleSpeedMps;
+
+  bool get isStationary {
+    final double stopThreshold =
+        _isWalking ? _walkingStopSpeed : _vehicleStopSpeed;
+
+    // Vitesse lissée sous laquelle on considère que le véhicule est quasi arrêté.
+    final double smoothedLimit = _isWalking ? 0.80 : 1.40;
+
+    return _stoppedForSeconds >= _stopConfirmSeconds ||
+        _vehicleSpeedMps < stopThreshold ||
+        (_lastRawSpeedMps < stopThreshold && _vehicleSpeedMps < smoothedLimit);
+  }
+
+  // ══════════════════════════════════════════════════════════════
+  // ⚙️ RÉGLAGES DU COMPORTEMENT
+  // ══════════════════════════════════════════════════════════════
+
+  static const double _normalLookaheadSeconds = 0.95;
+  static const double _brakingLookaheadSeconds = 0.45;
+
+  static const double _walkingStopSpeed = 0.18; // ~0.65 km/h
+  static const double _vehicleStopSpeed = 0.35; // ~1.26 km/h
+
+  static const double _hardBrakeDecel = 1.6; // m/s²
+
+  static const double _maxForwardCorrection = 10.0; // m/s
+  static const double _maxReverseWalking = 1.7; // m/s
+  static const double _maxReverseVehicle = 3.8; // m/s
+
+  static const double _snapDistanceWalking = 25.0; // mètres
+  static const double _snapDistanceVehicle = 70.0; // mètres
+
+  static const double _maxStoppedRecoverySeconds = 2.0;
+
+  // ═══ AJOUT : seuils qualité/cohérence GPS ═══
+  // Précision au-delà de laquelle un fix est jugé trop mauvais pour
+  // resnapper la position (bâtiments, arbres, routes sinueuses encaissées).
+  static const double _maxAccuracyWalking = 30.0; // mètres
+  static const double _maxAccuracyVehicle = 45.0; // mètres
+
+  // Précision au-delà de laquelle on se méfie (utilisé pour le filtre de
+  // cohérence ci-dessous, en plus du filtre de précision pur).
+  static const double _degradedAccuracyWalking = 15.0; // mètres
+  static const double _degradedAccuracyVehicle = 25.0; // mètres
+
+  // Plancher de bruit GPS à l'arrêt : un déplacement snappé plus petit que
+  // ça n'est pas considéré comme un vrai mouvement (jitter du capteur).
+  static const double _gpsNoiseFloorWalking = 3.0; // mètres
+  static const double _gpsNoiseFloorVehicle = 6.0; // mètres
+
+  // Vitesse plausible max (avec marge) pour juger si un saut le long de
+  // l'itinéraire entre 2 fixes GPS est réaliste ou aberrant.
+  static const double _maxPlausibleSpeedWalking = 4.5; // m/s (~16 km/h)
+  static const double _maxPlausibleSpeedVehicle = 40.0; // m/s (~144 km/h)
+
+  // Filet de sécurité : si on rejette trop de fixes d'affilée, on finit
+  // par accepter quand même (mieux vaut ça qu'un point bleu figé pour de
+  // bon si le déplacement était réel dans une zone GPS difficile).
+  static const int _maxConsecutiveRejectedFixes = 4;
+
+  // ══════════════════════════════════════════════════════════════
+  // 🎯 PALIERS DE COMPORTEMENT (AJOUT)
+  // ══════════════════════════════════════════════════════════════
+
+  /// Petit écart : la flèche CONTINUE d'avancer mais plus lentement
+  static const double _smallGapAheadWalking = 5.0; // mètres
+  static const double _smallGapAheadVehicle = 10.0; // mètres
+
+  /// Écart moyen : la flèche S'ARRÊTE et attend le GPS
+  static const double _mediumGapAheadWalking = 15.0; // mètres
+  static const double _mediumGapAheadVehicle = 35.0; // mètres
+
+  /// Gros écart : la flèche RECULE (seulement si vraiment nécessaire)
+  static const double _hardReverseGapWalking = 25.0; // mètres
+  static const double _hardReverseGapVehicle = 70.0; // mètres
+
+  /// Détection d'arrêt confirmé
+  static const double _stopConfirmSeconds = 0.9;
 
   // ── GETTERS DIAGNOSTIC ──
   LatLng? get pointA => _previousPreviousRawGps != null
       ? LatLng(
           _previousPreviousRawGps!.latitude, _previousPreviousRawGps!.longitude)
-      : null; // 🔴 ROUGE
+      : null;
 
-  LatLng? get pointB => _targetPos; // 🔵 BLEU (Cible visée à 1s)
+  LatLng? get pointB => _targetPos;
 
   LatLng? get pointC => _previousRawGps != null
       ? LatLng(_previousRawGps!.latitude, _previousRawGps!.longitude)
-      : null; // 🟢 VERT
+      : null;
 
   LatLng? get rawGpsPos => _currentRawGps != null
       ? LatLng(_currentRawGps!.latitude, _currentRawGps!.longitude)
-      : null; // 🟡 JAUNE
+      : null;
 
-  /// Réception d'un nouveau point GPS réel (Intervalle ~1 seconde)
+  /// Réception du GPS (chaque seconde environ)
   void updateRealPosition(Position rawPos, {bool isWalkingMode = false}) {
-    // 1. Décalage de la chaîne d'historique GPS
+    final Position? oldLastRealPos = lastRealPos;
+
     _previousPreviousRawGps = _previousRawGps;
     _previousRawGps = _currentRawGps;
     _currentRawGps = rawPos;
-
-    // 2. Calcul de la vitesse Doppler / secours distance
-    double vInst = rawPos.speed;
-    if (vInst <= 0 || vInst == 1.0) {
-      if (lastRealPos != null) {
-        double d = Geolocator.distanceBetween(
-          lastRealPos!.latitude,
-          lastRealPos!.longitude,
-          rawPos.latitude,
-          rawPos.longitude,
-        );
-        double dt =
-            rawPos.timestamp.difference(lastRealPos!.timestamp).inMilliseconds /
-                1000.0;
-        if (dt > 0.05) vInst = d / dt;
-      }
-    }
-
-    // Lissage progressif de la vitesse (EMA)
-    if (calculatedSpeedMps == 0.0) {
-      calculatedSpeedMps = vInst;
-    } else {
-      calculatedSpeedMps = (calculatedSpeedMps * 0.3) + (vInst * 0.7);
-    }
-
-    // 🚀 SEUIL DE MARCHE LENTE : 0.14 m/s ~= 0.5 km/h
-    double minSpeedMps = isWalkingMode ? 0.14 : 0.4;
-    if (calculatedSpeedMps < minSpeedMps) {
-      calculatedSpeedMps = 0.0;
-    }
-
     lastRealPos = rawPos;
-    _lastGpsTime = DateTime.now();
 
-    // Première initialisation si la carte vient de s'ouvrir
+    _isWalking = isWalkingMode;
+
+    // ═══ AJOUT : mémorise la précision du fix pour le filtre qualité ═══
+    _lastRawAccuracy = (rawPos.accuracy.isNaN || rawPos.accuracy.isInfinite)
+        ? 999.0
+        : rawPos.accuracy;
+
+    final DateTime now = rawPos.timestamp;
+    double dt = 1.0;
+
+    if (_lastGpsUpdateTime != null) {
+      dt = now.difference(_lastGpsUpdateTime!).inMilliseconds / 1000.0;
+      // CORRIGÉ : on clamp le vrai intervalle au lieu de le remplacer par une
+      // valeur fixe arbitraire de 1.0s. Un dt fixe faussait le calcul de
+      // gpsDeceleration (ligne _vehicleSpeedMps / dt plus bas) et pouvait
+      // déclencher un faux freinage brusque si le vrai dt était très petit.
+      dt = dt.clamp(0.1, 5.0);
+    }
+
+    _lastGpsUpdateTime = now;
+    _lastGpsIntervalSeconds = dt;
+
+    double vInst = rawPos.speed;
+
+    // Fallback si la vitesse native est invalide
+    if ((vInst <= 0.0 || vInst == 1.0) && oldLastRealPos != null) {
+      final double d = Geolocator.distanceBetween(
+        oldLastRealPos.latitude,
+        oldLastRealPos.longitude,
+        rawPos.latitude,
+        rawPos.longitude,
+      );
+
+      final double dtPos =
+          rawPos.timestamp.difference(oldLastRealPos.timestamp).inMilliseconds /
+              1000.0;
+
+      if (dtPos > 0.05) vInst = d / dtPos;
+    }
+
+    if (vInst.isNaN || vInst.isInfinite) vInst = 0.0;
+    vInst = _clamp(vInst, 0.0, 55.0);
+
+    _previousVehicleSpeedMps = _vehicleSpeedMps;
+
+    // ═══ AJOUT : rafraîchit l'accéléromètre AVANT de lisser la vitesse ═══
+    // Pour combiner correctement position/vitesse GPS et accéléromètre, on a
+    // besoin de savoir "est-ce qu'on est déjà en train de freiner/accélérer
+    // fort" avant de calculer le lissage de _vehicleSpeedMps ci-dessous.
+    _refreshAccelFusion();
+
+    // ═══ AJOUT : lissage ADAPTATIF de la vitesse (au lieu d'un poids fixe) ═══
+    // Avec un lissage fixe (45/55), _vehicleSpeedMps met plusieurs cycles à
+    // "rattraper" une vraie décélération brutale : pendant ce temps, la
+    // prédiction (point bleu) continue d'avancer avec une vitesse surestimée
+    // → elle part trop loin en avant lors d'un freinage d'un coup.
+    // On donne donc plus de poids à la mesure instantanée (vInst) dès que
+    // l'accéléromètre OU le delta GPS brut suggèrent un freinage/accél en
+    // cours, ce qui fait chuter _vehicleSpeedMps aussi vite que la réalité.
+    // 🔧 PRIORITÉ À L'ACCÉLÉROMÈTRE : il tourne à 60Hz et réagit quasi
+    // instantanément à un vrai freinage/redémarrage, alors que le GPS ne se
+    // met à jour qu'~1x/sec et est bruité à basse vitesse (vélo). On lui
+    // fait donc confiance en premier ; le delta GPS (rawInstantDecel) ne
+    // sert que de solution de secours quand l'accéléromètre ne détecte
+    // rien (ex: freinage très progressif, capteur indisponible).
+    final double rawInstantDecel =
+        dt > 0.1 ? (_vehicleSpeedMps - vInst) / dt : 0.0;
+    final bool likelyBraking =
+        _accelBrakeActive || rawInstantDecel > (_hardBrakeDecel * 0.5);
+    final bool likelyAccelerating = accelDetector.isAccelerating ||
+        rawInstantDecel < -(_hardBrakeDecel * 0.5);
+
+    double speedSmoothing = 0.55; // poids "normal" donné à vInst
+    if (_accelBrakeActive) {
+      // 🔧 L'accéléromètre détecte un vrai freinage → confiance maximale,
+      // on ne dépend plus du prochain fix GPS (qui peut arriver dans
+      // presque 1s) pour faire chuter la vitesse.
+      speedSmoothing = 0.88;
+    } else if (likelyBraking) {
+      speedSmoothing = 0.80; // on fait confiance vite à la chute de vitesse
+    } else if (accelDetector.isAccelerating) {
+      speedSmoothing = 0.75; // idem, priorité accéléromètre pour la reprise
+    } else if (likelyAccelerating) {
+      speedSmoothing = 0.65; // on suit un peu plus vite une reprise franche
+    }
+
+    if (_vehicleSpeedMps <= 0.01) {
+      _vehicleSpeedMps = vInst;
+    } else {
+      _vehicleSpeedMps = (_vehicleSpeedMps * (1.0 - speedSmoothing)) +
+          (vInst * speedSmoothing);
+    }
+
+    // ═══════════════════════════════════════════════════
+    // 🛑 DÉTECTION FREINAGE : SPIKE GPS (1 Hz)
+    // ═══════════════════════════════════════════════════
+    // Le calcul précis de decel/fusion/decay est fait à chaque frame
+    // (60fps) dans predictNextPosition() via _refreshAccelFusion() et
+    // _applyBrakingFusion(), pour une réactivité et une décroissance
+    // beaucoup plus fluides que si tout n'était mis à jour qu'1x/sec.
+    double gpsDeceleration = 0.0;
+    if (dt > 0.1) {
+      gpsDeceleration = (_previousVehicleSpeedMps - _vehicleSpeedMps) / dt;
+    }
+    if (gpsDeceleration > _hardBrakeDecel) {
+      _gpsBrakeIntensity = _clamp(
+        (gpsDeceleration - _hardBrakeDecel) / 3.5,
+        0.35,
+        1.0,
+      );
+    } else {
+      _gpsBrakeIntensity = 0.0;
+    }
+
+    // Rafraîchit à nouveau l'accéléromètre (au cas où il aurait changé
+    // pendant les calculs ci-dessus) + applique la fusion GPS+accéléro.
+    _refreshAccelFusion();
+    _applyBrakingFusion(dt);
+
+    // ── DÉTECTION D'ARRÊT CONFIRMÉ (AJOUT) ──
+    _lastRawSpeedMps = vInst;
+    final double stopThresh =
+        _isWalking ? _walkingStopSpeed : _vehicleStopSpeed;
+    final bool instantStopped =
+        vInst < stopThresh && _vehicleSpeedMps < stopThresh;
+
+    if (instantStopped) {
+      _stoppedForSeconds += dt;
+    } else {
+      _stoppedForSeconds = 0.0;
+    }
+
     if (simulatedPos == null) {
       simulatedPos = LatLng(rawPos.latitude, rawPos.longitude);
     }
 
-    _lastPredictTime ??= DateTime.now();
+    _isNewGpsPoint = true;
   }
 
-  /// Appelée à chaque frame (60 / 120 FPS via le Ticker VSync)
-  LatLng? predictNextPosition(List<LatLng> routePolyline) {
-    if (lastRealPos == null) return null;
-
-    // Première initialisation
-    if (simulatedPos == null) {
-      simulatedPos = LatLng(lastRealPos!.latitude, lastRealPos!.longitude);
+  /// 🔧 Relit l'état accéléromètre (mis à jour en continu à 60Hz par son
+  /// propre stream) et convertit en intensité 0→1. Appelé chaque frame
+  /// pour ne jamais avoir plus d'un tick de retard (~16ms).
+  void _refreshAccelFusion() {
+    _accelBrakeActive = accelDetector.isBraking;
+    if (_accelBrakeActive) {
+      final double maxExpected = _isWalking ? 4.0 : 9.0;
+      _accelBrakeIntensity = _clamp(
+        accelDetector.deceleration / maxExpected,
+        0.0,
+        1.0,
+      );
+    } else {
+      _accelBrakeIntensity = 0.0;
     }
 
-    DateTime now = DateTime.now();
+    // Symétrique : accélération franche → utilisé pour laisser la flèche
+    // repartir plus vite (ex: feu qui passe au vert, dépassement).
+    if (accelDetector.isAccelerating) {
+      final double maxExpectedAccel = _isWalking ? 3.0 : 6.0;
+      _accelBoostIntensity = _clamp(
+        accelDetector.acceleration / maxExpectedAccel,
+        0.0,
+        1.0,
+      );
+    } else {
+      _accelBoostIntensity = 0.0;
+    }
+  }
+
+  /// 🔧 FUSION GPS + ACCÉLÉROMÈTRE : prend le MAX des deux sources, avec
+  /// une décroissance douce répartie sur chaque frame (au lieu d'un seul
+  /// gros pas 1x/sec) → beaucoup plus fluide visuellement.
+  /// 🔧 FUSION GPS + ACCÉLÉROMÈTRE — PRIORITÉ À L'ACCÉLÉROMÈTRE : il tourne
+  /// à 60Hz et détecte un vrai freinage/redémarrage quasi instantanément,
+  /// alors que le GPS ne se met à jour qu'~1x/sec et est souvent trop
+  /// bruité à basse vitesse (vélo) pour être réactif. L'accéléromètre est
+  /// donc la source de vérité principale ; le GPS ne sert que de solution
+  /// de secours quand l'accéléromètre ne détecte rien (freinage trop
+  /// progressif pour être vu par l'accéléromètre, ou capteur indisponible).
+  void _applyBrakingFusion(double dt) {
+    final double fusedBrake =
+        _accelBrakeIntensity > 0.0 ? _accelBrakeIntensity : _gpsBrakeIntensity;
+
+    if (fusedBrake > 0.0) {
+      _brakingIntensity = math.max(_brakingIntensity, fusedBrake);
+    } else {
+      _brakingIntensity = math.max(0.0, _brakingIntensity - (dt * 0.65));
+    }
+  }
+
+  /// ═══ AJOUT : distance de projection KINÉMATIQUE ═══
+  /// Calcule combien de mètres parcourir "en avant" sur la route pendant
+  /// [t] secondes, en partant de la vitesse [v0], mais en tenant compte de
+  /// la décélération ou accélération EN COURS (issue de la fusion
+  /// GPS + accéléromètre : _brakingIntensity / _accelBoostIntensity).
+  ///
+  /// Physique de base (mouvement uniformément décéléré/accéléré) :
+  ///   d(t) = v0·t − ½·a·t²      (a > 0 = on ralentit, a < 0 = on accélère)
+  ///
+  /// Sans ça, la projection utilisait d = v0·t (vitesse constante), ce qui
+  /// surestime systématiquement la distance dès qu'on freine : la cible
+  /// (point bleu) part alors "trop en avant" pendant un freinage brusque,
+  /// avant que _vehicleSpeedMps n'ait eu le temps de redescendre.
+  double _kinematicLookaheadDistance(double v0, double t) {
+    if (t <= 0.0 || v0 <= 0.0) return 0.0;
+
+    double a = 0.0; // a > 0 : décélération. a < 0 : accélération.
+
+    if (_brakingIntensity > 0.0) {
+      // Décélération de référence à pleine intensité (m/s²), plausible pour
+      // un freinage franc en voiture / un arrêt net à pied.
+      final double maxDecelRef = _isWalking ? 3.0 : 7.0;
+      a = _brakingIntensity * maxDecelRef;
+    } else if (_accelBoostIntensity > 0.0) {
+      final double maxAccelRef = _isWalking ? 1.5 : 3.5;
+      a = -_accelBoostIntensity * maxAccelRef;
+    }
+
+    // Temps auquel la vitesse atteindrait 0 avec cette décélération : au-delà,
+    // le véhicule est arrêté, donc il ne parcourt plus de distance.
+    double effectiveT = t;
+    if (a > 0.0) {
+      final double tStop = v0 / a;
+      if (tStop < effectiveT) effectiveT = tStop;
+    }
+
+    final double d = (v0 * effectiveT) - (0.5 * a * effectiveT * effectiveT);
+
+    // Jamais négatif : ce calcul ne fait jamais reculer la cible.
+    return d.isNaN || d.isInfinite
+        ? (v0 * t).clamp(0.0, double.infinity)
+        : math.max(0.0, d);
+  }
+
+  /// 🚀 MOTEUR DE PROJECTION (60 FPS)
+  LatLng? predictNextPosition(List<LatLng> routePolyline) {
+    if (lastRealPos == null || _currentRawGps == null || simulatedPos == null) {
+      return null;
+    }
+
+    final DateTime now = DateTime.now();
     double dt = now.difference(_lastPredictTime ?? now).inMilliseconds / 1000.0;
     _lastPredictTime = now;
 
-    // Normalisation de la frame (évite les sauts de temps au réveil)
-    if (dt <= 0 || dt > 0.2) dt = 1.0 / 60.0;
+    // 🔧 CORRECTION CRITIQUE :
+    // L'ancien clamp (0.2) autorisait un lag de 200ms, calculant un déplacement géant d'un coup -> Saccade.
+    // On bride dt à 33ms (30 FPS max) pour lisser les baisses de régime et éviter les téléportations.
+    if (dt <= 0.0 || dt > 0.033) dt = 0.016; // 0.016 = ~60 FPS stable
 
-    // ──────────────────────────────────────────────────────────────
-    // 1. OÙ DOIT ÊTRE LA VOITURE DANS 0.5 SECONDE ? (Point Bleu)
-    // ──────────────────────────────────────────────────────────────
-    LatLng yellowPos = _currentRawGps != null
-        ? LatLng(_currentRawGps!.latitude, _currentRawGps!.longitude)
-        : LatLng(lastRealPos!.latitude, lastRealPos!.longitude);
+    // ═══ AJOUT : fusion GPS+accéléromètre rafraîchie à chaque frame ═══
+    _refreshAccelFusion();
+    _applyBrakingFusion(dt);
 
-    int gpsIndex = _findForwardRouteIndex(yellowPos,
-        _currentRawGps?.heading ?? lastRealPos!.heading, routePolyline);
+    if (routePolyline.length < 2) {
+      isBackwardRecovery = false;
+      return simulatedPos;
+    }
 
-    // On prédit la position future selon la vitesse (lookahead d'une demi-seconde)
-    double lookaheadDist = calculatedSpeedMps * 0.5;
+    // Si on vient de recevoir un nouveau point GPS, on recalcule la cible
+    if (_isNewGpsPoint) {
+      _isNewGpsPoint = false;
 
-    _targetPos = _advanceForwardFromGps(
-      yellowPos,
-      lookaheadDist,
-      _currentRawGps?.heading ?? lastRealPos!.heading,
-      routePolyline,
-      gpsIndex,
-    );
-
-    // ──────────────────────────────────────────────────────────────
-    // 2. L'ÉLASTIQUE : LA FLÈCHE CHASSE LE POINT BLEU (SANS SAUTS)
-    // ──────────────────────────────────────────────────────────────
-    if (_targetPos != null) {
-      double distError = Geolocator.distanceBetween(
-        simulatedPos!.latitude,
-        simulatedPos!.longitude,
-        _targetPos!.latitude,
-        _targetPos!.longitude,
+      final LatLng rawPos = LatLng(
+        _currentRawGps!.latitude,
+        _currentRawGps!.longitude,
       );
 
-      // Si erreur massive (téléportation GPS > 100m), on coupe l'élastique et on téléporte
-      if (distError > 100.0) {
-        simulatedPos = _targetPos;
-      } else {
-        // La vitesse de l'élastique. Plus c'est haut, plus c'est réactif.
-        // 4.0 signifie qu'on rattrape 40% du retard en 1/10 de seconde = très fluide.
-        double chaseFactor = (4.0 * dt).clamp(0.01, 1.0);
+      final double heading = lastRealPos!.heading;
+      final int hint = lastRouteIndex < 0 ? 0 : lastRouteIndex;
 
-        // La flèche glisse vers le point Bleu (vers l'avant OU vers l'arrière !)
-        simulatedPos = _lerpPosition(simulatedPos!, _targetPos!, chaseFactor);
+      // 🔧 Budget de déplacement réaliste depuis le dernier fix GPS : empêche
+      // le snap de se verrouiller loin en avant "par-dessus" un virage.
+      final double moveBudget = _vehicleSpeedMps * _lastGpsIntervalSeconds;
+      final double maxAhead = moveBudget + (_isWalking ? 6.0 : 20.0);
+      final double maxBehind = _isWalking ? 12.0 : 35.0;
 
-        // On "colle" la flèche sur la route pour éviter qu'elle coupe par l'herbe pendant le retour en arrière
-        int simIndex = _findForwardRouteIndex(
-            simulatedPos!, lastRealPos!.heading, routePolyline);
-        if (simIndex >= 0 && simIndex < routePolyline.length - 1) {
-          simulatedPos = _projectOnSegment(simulatedPos!,
-              routePolyline[simIndex], routePolyline[simIndex + 1]);
+      int rawIndex = _findRouteIndex(
+        rawPos,
+        heading,
+        routePolyline,
+        hint,
+        maxAheadMeters: maxAhead,
+        maxBehindMeters: maxBehind,
+      );
+
+      final LatLng candidateSnapped = _projectOnSegment(
+        rawPos,
+        routePolyline[rawIndex],
+        routePolyline[rawIndex + 1],
+      );
+
+      // ═══════════════════════════════════════════════════════════
+      // 🔍 AJOUT : FILTRE QUALITÉ / COHÉRENCE GPS
+      // ═══════════════════════════════════════════════════════════
+      // Objectif : le point bleu ne doit jamais "sauter" loin à cause
+      // d'un fix GPS aberrant (route sinueuse, arbres, immeubles, rebond
+      // multi-trajet). On vérifie 2 choses avant d'accepter un fix :
+      //   1. Sa précision (accuracy) n'est pas trop mauvaise
+      //   2. Le saut par rapport au dernier point confirmé le long de
+      //      l'ITINÉRAIRE (pas à vol d'oiseau) reste physiquement possible
+      final double maxAccuracyAllowed =
+          _isWalking ? _maxAccuracyWalking : _maxAccuracyVehicle;
+      final double degradedAccuracy =
+          _isWalking ? _degradedAccuracyWalking : _degradedAccuracyVehicle;
+      final double maxPlausibleSpeed =
+          _isWalking ? _maxPlausibleSpeedWalking : _maxPlausibleSpeedVehicle;
+
+      bool acceptFix = true;
+
+      // 1. Précision GPS trop mauvaise → fix suspect
+      if (_lastRawAccuracy > maxAccuracyAllowed) {
+        acceptFix = false;
+      }
+
+      // 2. Cohérence : saut trop rapide pour être réel par rapport au
+      //    dernier point confirmé le long de l'itinéraire
+      if (acceptFix &&
+          _lastConfirmedSnappedPos != null &&
+          _lastConfirmedRouteIndex >= 0) {
+        // 🔧 CORRECTIF ATTENTE GPS : filtre SIGNÉ au lieu de .abs(). L'ancien
+        // filtre utilisait une valeur absolue, donc un vrai fix GPS arrivant
+        // LÉGÈREMENT DERRIÈRE la dernière position confirmée (normal après
+        // que la flèche ait sauté trop loin en avant dans un virage) était
+        // rejeté comme si c'était un saut aberrant. La flèche restait alors
+        // bloquée devant, en attendant que le GPS "la rattrape". On laisse
+        // maintenant plus de mou vers l'arrière (récupération) que vers
+        // l'avant (saut aberrant).
+        final double jumpSigned = _signedRouteDistance(
+          _lastConfirmedSnappedPos!,
+          _lastConfirmedRouteIndex,
+          candidateSnapped,
+          rawIndex,
+          routePolyline,
+        );
+
+        final double elapsed = _lastGpsIntervalSeconds.clamp(0.2, 5.0);
+        final double margin = _isWalking ? 4.0 : 12.0;
+        final double limitAhead = (maxPlausibleSpeed * elapsed) + margin;
+        final double limitBehind = limitAhead + (_isWalking ? 10.0 : 30.0);
+
+        // On n'applique ce veto que si la précision n'est pas excellente :
+        // un fix très précis qui indique un grand saut est probablement
+        // un vrai déplacement rapide (voiture qui accélère par ex.).
+        if ((jumpSigned > limitAhead || jumpSigned < -limitBehind) &&
+            _lastRawAccuracy > degradedAccuracy) {
+          acceptFix = false;
         }
       }
+
+      // 3. Filet de sécurité anti-blocage : si on rejette trop de fixes
+      //    d'affilée, on finit par accepter (mieux vaut ça qu'un point
+      //    bleu figé indéfiniment si le déplacement était en fait réel).
+      if (!acceptFix) {
+        _consecutiveRejectedFixes++;
+        if (_consecutiveRejectedFixes > _maxConsecutiveRejectedFixes) {
+          acceptFix = true;
+        }
+      }
+
+      if (!acceptFix) {
+        // Fix ignoré : la flèche continue sur sa lancée avec la dernière
+        // cible fiable, au lieu d'être tirée vers un point aberrant.
+        return simulatedPos;
+      }
+
+      _consecutiveRejectedFixes = 0;
+      _lastGoodGpsFixTime = DateTime.now();
+
+      lastRouteIndex = rawIndex;
+      _snappedGpsIndex = rawIndex;
+      _snappedGpsPos = candidateSnapped;
+
+      final double stopThreshold =
+          _isWalking ? _walkingStopSpeed : _vehicleStopSpeed;
+
+      final bool isStopped = _vehicleSpeedMps < stopThreshold;
+
+      // ═══════════════════════════════════════════════════════════
+      // 🔍 AJOUT : PLANCHER DE BRUIT GPS À L'ARRÊT
+      // ═══════════════════════════════════════════════════════════
+      // À l'arrêt, un léger jitter GPS peut sembler être une petite
+      // avancée réelle et faire "ramper" la flèche en avant peu à peu.
+      // Si le déplacement snappé est plus petit que le bruit GPS typique,
+      // on garde l'ancienne référence au lieu de suivre le jitter.
+      if (isStopped &&
+          _lastConfirmedSnappedPos != null &&
+          _lastConfirmedRouteIndex >= 0) {
+        final double noiseFloor =
+            _isWalking ? _gpsNoiseFloorWalking : _gpsNoiseFloorVehicle;
+
+        final double driftFromLastConfirmed = _signedRouteDistance(
+          _lastConfirmedSnappedPos!,
+          _lastConfirmedRouteIndex,
+          _snappedGpsPos!,
+          rawIndex,
+          routePolyline,
+        ).abs();
+
+        if (driftFromLastConfirmed < noiseFloor) {
+          _snappedGpsPos = _lastConfirmedSnappedPos;
+          rawIndex = _lastConfirmedRouteIndex;
+          lastRouteIndex = rawIndex;
+          _snappedGpsIndex = rawIndex;
+        }
+      }
+
+      _lastConfirmedSnappedPos = _snappedGpsPos;
+      _lastConfirmedRouteIndex = lastRouteIndex;
+
+      double lookahead = _normalLookaheadSeconds;
+
+      if (isStopped) {
+        lookahead = 0.0;
+      } else {
+        lookahead = _brakingLookaheadSeconds +
+            (1.0 - _brakingIntensity) *
+                (_normalLookaheadSeconds - _brakingLookaheadSeconds);
+      }
+
+      // ═══ AJOUT : projection KINÉMATIQUE (et non plus vitesse constante) ═══
+      // Point bleu : projection du GPS dans le futur, en tenant compte de la
+      // décélération/accélération mesurée (fusion GPS+accéléromètre) via
+      // d(t) = v0*t − ½·a·t² au lieu du simple d = v·t. Ça évite que la
+      // cible ne parte trop loin en avant pendant un freinage brusque,
+      // puisqu'elle "sait" que la vitesse est en train de chuter.
+      final double lookaheadDistance = _kinematicLookaheadDistance(
+        _vehicleSpeedMps,
+        lookahead,
+      );
+
+      // ═══ VÉRIFICATION DE COHÉRENCE BLEU ↔ JAUNE (distance itinéraire) ═══
+      // Le point bleu (cible) ne doit jamais être avancé, le long de la
+      // route, plus loin que ce que la vitesse réellement mesurée justifie.
+      // Comme la cible est construite en avançant sur le tracé depuis le
+      // point jaune (GPS brut snappé), la distance "logique" à comparer
+      // est directement la distance parcourue sur l'itinéraire
+      // (lookaheadDistance), jamais une distance à vol d'oiseau : sur un
+      // virage ou un rond-point, le vol d'oiseau sous-estime l'écart réel
+      // et laissait passer des cas incohérents.
+      final double maxCoherentGap =
+          (_vehicleSpeedMps * _normalLookaheadSeconds) +
+              (_isWalking ? 4.0 : 8.0); // marge de sécurité (bruit GPS)
+
+      final double coherentLookaheadDistance =
+          lookaheadDistance > maxCoherentGap
+              ? maxCoherentGap
+              : lookaheadDistance;
+
+      _targetPos = _advanceForwardAlongRoute(
+        _snappedGpsPos!,
+        coherentLookaheadDistance,
+        routePolyline,
+        rawIndex,
+      );
+
+      // Si on est arrêté, la cible redevient le point GPS projeté
+      final LatLng referencePos = isStopped ? _snappedGpsPos! : _targetPos!;
+
+      final int referenceIndex = isStopped
+          ? rawIndex
+          : _findRouteIndex(referencePos, heading, routePolyline, rawIndex);
+
+      // 🔧 On mémorise la référence (recalculée uniquement au rythme du GPS,
+      // ~1x/sec, ancrée sur le point jaune) pour que la correction de
+      // vitesse ci-dessous puisse s'exécuter à CHAQUE FRAME (60fps) au lieu
+      // d'une seule fois par fix GPS.
+      _lastReferencePos = referencePos;
+      _lastReferenceIndex = referenceIndex;
+      _lastIsStopped = isStopped;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // 🔧 CORRECTION DE VITESSE DE LA FLÈCHE — À CHAQUE FRAME (60fps)
+    // ═══════════════════════════════════════════════════════════
+    // AVANT : tout ce bloc était À L'INTÉRIEUR du "if (_isNewGpsPoint)",
+    // donc exécuté une seule fois par seconde. Entre deux fixs GPS, la
+    // flèche avançait seule (dead-reckoning) à _arrowSpeedMps constant,
+    // en repartant toujours de sa PROPRE position précédente (le "bleu")
+    // au lieu d'être recomparée au jaune. Résultat : dès que la vitesse de
+    // la flèche était même légèrement surestimée, l'écart s'accumulait
+    // pendant toute la seconde avant d'être corrigé → avance excessive.
+    // MAINTENANT : on recompare la flèche à sa référence (dérivée du
+    // jaune) à chaque frame, donc la correction est quasi instantanée et
+    // ne peut plus dériver loin avant d'être rattrapée.
+    if (_lastReferencePos != null && simulatedPos != null) {
+      final LatLng referencePos = _lastReferencePos!;
+      final int referenceIndex = _lastReferenceIndex;
+      final bool isStopped = _lastIsStopped;
+      final double heading = lastRealPos?.heading ?? 0.0;
+      final double stopThreshold =
+          _isWalking ? _walkingStopSpeed : _vehicleStopSpeed;
+
+      final int simIndex = _findRouteIndex(
+        simulatedPos!,
+        heading,
+        routePolyline,
+        _lastSimRouteIndex,
+      );
+
+      _lastSimRouteIndex = simIndex;
+
+      // signedError > 0 : la cible est devant la flèche
+      // signedError < 0 : la cible est derrière la flèche
+      final double signedError = _signedRouteDistance(
+        simulatedPos!,
+        simIndex,
+        referencePos,
+        referenceIndex,
+        routePolyline,
+      );
+
+      final double absError = signedError.abs();
+
+      final double maxReverse =
+          _isWalking ? _maxReverseWalking : _maxReverseVehicle;
+
+      double snapLimit =
+          _isWalking ? _snapDistanceWalking : _snapDistanceVehicle;
+
+      if (_brakingIntensity > 0.65) snapLimit *= 0.70;
+
+      final bool tooLongToRecover = isStopped &&
+          maxReverse > 0.0 &&
+          (absError / maxReverse) > _maxStoppedRecoverySeconds;
+
+      // Si l’écart est trop grand, on téléporte proprement la flèche
+      if (absError > snapLimit || tooLongToRecover) {
+        simulatedPos = referencePos;
+        _lastSimRouteIndex = referenceIndex;
+        _arrowSpeedMps = isStopped ? 0.0 : _vehicleSpeedMps;
+
+        // ✅ Si la référence est derrière la flèche, on considère que l'on recule.
+        isBackwardRecovery = signedError < -0.35;
+
+        return simulatedPos;
+      }
+
+      final double catchupTime = _computeCatchupTime(absError, isStopped);
+      double desiredSpeed = 0.0;
+
+      // ── Détection d'arrêt confirmé ──
+      // 🔧 PRIORITÉ À L'ACCÉLÉROMÈTRE, marche ET vélo/véhicule : il détecte
+      // l'absence de mouvement quasi instantanément, alors que le GPS seul
+      // (surtout à basse vitesse, ou bruité) peut mettre jusqu'à 1s à
+      // confirmer un arrêt réel → la flèche "rampait" en avant en attendant.
+      final bool accelConfirmsStill =
+          !accelDetector.isBraking && !accelDetector.isAccelerating;
+      final bool isReallyStopped = _stoppedForSeconds >= _stopConfirmSeconds ||
+          (_vehicleSpeedMps < stopThreshold &&
+              _lastRawSpeedMps < stopThreshold) ||
+          (accelConfirmsStill &&
+              _vehicleSpeedMps < stopThreshold &&
+              _stoppedForSeconds >= 0.3);
+
+      // ── GAP = distance entre flèche et GPS (positif = flèche devant) ──
+      final double gapAhead = -signedError; // positif si flèche DEVANT le GPS
+
+      if (signedError < -0.35) {
+        // ═══════════════════════════════════════════════════
+        // LA FLÈCHE EST DEVANT LE GPS
+        // ═══════════════════════════════════════════════════
+        final double smallGap =
+            _isWalking ? _smallGapAheadWalking : _smallGapAheadVehicle;
+        final double mediumGap =
+            _isWalking ? _mediumGapAheadWalking : _mediumGapAheadVehicle;
+        final double reverseGap =
+            _isWalking ? _hardReverseGapWalking : _hardReverseGapVehicle;
+
+        if (isReallyStopped) {
+          // ── ARRÊTÉ : reculer si écart significatif ──
+          // 🔧 Tolérance réduite : la flèche doit se superposer au point
+          // jaune à l'arrêt, pas rester visiblement devant.
+          final double tolerance = _isWalking ? 0.6 : 1.2;
+          if (gapAhead <= tolerance) {
+            desiredSpeed = 0.0; // trop petit, on bouge pas
+          } else {
+            final double ratio = _clamp(
+              (gapAhead - tolerance) / math.max(reverseGap - tolerance, 1.0),
+              0.15,
+              1.0,
+            );
+            // 🔧 Retour en arrière plus franc dès le début (0.50 au lieu de
+            // 0.30) pour que la flèche rattrape le jaune plus vite au lieu
+            // de "traîner" en avant après l'arrêt.
+            desiredSpeed = -maxReverse * (0.50 + (0.50 * ratio));
+
+            // Si trop long → snap
+            final double recoveryTime = gapAhead / math.max(maxReverse, 0.1);
+            if (recoveryTime > _maxStoppedRecoverySeconds) {
+              simulatedPos = referencePos;
+              _lastSimRouteIndex = referenceIndex;
+              _arrowSpeedMps = 0.0;
+              isBackwardRecovery = false;
+              return simulatedPos;
+            }
+          }
+        } else {
+          // ── EN MOUVEMENT : logique par paliers ──
+          if (gapAhead <= smallGap) {
+            // ✅ PETIT ÉCART : avancer mais plus lentement
+            final double gapRatio =
+                _clamp(gapAhead / math.max(smallGap, 0.1), 0.0, 1.0);
+            double slowFactor =
+                0.70 - (0.35 * gapRatio) - (0.25 * _brakingIntensity);
+            slowFactor = _clamp(slowFactor, 0.20, 0.80);
+            desiredSpeed = _vehicleSpeedMps * slowFactor;
+
+            if (_brakingIntensity > 0.70) {
+              desiredSpeed = math.min(desiredSpeed, _vehicleSpeedMps * 0.25);
+            }
+          } else if (gapAhead <= mediumGap) {
+            // 🔧 ÉCART MOYEN : rampe douce vers l'arrêt au lieu d'un arrêt
+            // sec (l'ancien comportement donnait l'impression que la flèche
+            // "attendait" brutalement le GPS).
+            final double t = _clamp(
+              (gapAhead - smallGap) / math.max(mediumGap - smallGap, 0.1),
+              0.0,
+              1.0,
+            );
+            desiredSpeed = _vehicleSpeedMps * (0.35 * (1.0 - t));
+          } else {
+            // 🔙 GROS ÉCART : reculer proportionnellement
+            final double ratio = _clamp(
+              (gapAhead - mediumGap) / math.max(reverseGap - mediumGap, 1.0),
+              0.0,
+              1.0,
+            );
+            final double reverseFactor =
+                (0.30 + (0.70 * ratio)) * (0.55 + (0.45 * _brakingIntensity));
+            desiredSpeed = -maxReverse * _clamp(reverseFactor, 0.0, 1.0);
+          }
+        }
+      } else {
+        // ═══════════════════════════════════════════════════
+        // LA FLÈCHE EST DERRIÈRE OU SUR LE GPS → rattraper
+        // ═══════════════════════════════════════════════════
+        if (isReallyStopped) {
+          desiredSpeed = signedError / catchupTime;
+          desiredSpeed = _clamp(desiredSpeed, 0.0, _isWalking ? 1.2 : 2.5);
+        } else {
+          double correction = signedError / catchupTime;
+          // 🔧 10 m/s de correction à pied équivaut à un téléport visible ;
+          // on plafonne beaucoup plus bas dans ce mode.
+          final double maxCorr = _isWalking ? 3.0 : _maxForwardCorrection;
+          correction = _clamp(correction, 0.0, maxCorr);
+          desiredSpeed = _vehicleSpeedMps + correction;
+          desiredSpeed = _clamp(desiredSpeed, 0.0, _vehicleSpeedMps + maxCorr);
+        }
+      }
+
+      // Lissage de la vitesse de la flèche : accélération / freinage progressif
+      double maxAccel = _isWalking ? 2.2 : 4.5;
+      double maxDecel = _isWalking ? 3.8 : 8.0;
+
+      if (_brakingIntensity > 0.5) maxDecel *= 1.35;
+
+      // ═══ AJOUT : boost symétrique quand l'accéléromètre détecte une
+      // accélération franche (redémarrage, dépassement) → la flèche
+      // rattrape la vitesse réelle plus vite au lieu de traîner.
+      if (_accelBoostIntensity > 0.5) maxAccel *= 1.35;
+
+      double delta = desiredSpeed - _arrowSpeedMps;
+
+      // 🔧 On utilise le dt de LA FRAME (~1/60s) et non plus l'intervalle
+      // GPS (~1s), puisque ce bloc tourne maintenant à chaque frame : avec
+      // l'ancien _lastGpsIntervalSeconds, maxDelta aurait été ~60x trop
+      // grand ici et aurait autorisé un changement de vitesse quasi
+      // instantané à chaque frame (à-coups).
+      final double maxDelta = delta >= 0.0 ? maxAccel * dt : maxDecel * dt;
+
+      if (delta > maxDelta) delta = maxDelta;
+      if (delta < -maxDelta) delta = -maxDelta;
+
+      _arrowSpeedMps += delta;
+
+      // Si on est arrêté et très proche du GPS, on stoppe complètement
+      if (absError < 0.75 && isStopped) {
+        _arrowSpeedMps = 0.0;
+      }
+
+      _arrowSpeedMps = _clamp(
+        _arrowSpeedMps,
+        -maxReverse,
+        math.max(30.0, _vehicleSpeedMps + 8.0),
+      );
+    }
+
+    // Sécurité : si plus de GPS depuis un moment, on ralentit la flèche
+    if (_lastGpsUpdateTime != null) {
+      final double gpsAge =
+          DateTime.now().difference(_lastGpsUpdateTime!).inMilliseconds /
+              1000.0;
+
+      if (gpsAge > 2.5) {
+        _arrowSpeedMps *= 0.82;
+        if (_arrowSpeedMps.abs() < 0.05) _arrowSpeedMps = 0.0;
+      }
+    }
+
+    final double moveDistance = _arrowSpeedMps * dt;
+    isBackwardRecovery = moveDistance < -0.02;
+
+    if (moveDistance.abs() > 0.008) {
+      final double heading = lastRealPos?.heading ?? 0.0;
+
+      final int simIndex = _findRouteIndex(
+        simulatedPos!,
+        heading,
+        routePolyline,
+        _lastSimRouteIndex,
+      );
+
+      _lastSimRouteIndex = simIndex;
+
+      simulatedPos = _moveAlongRouteSigned(
+        simulatedPos!,
+        moveDistance,
+        routePolyline,
+        simIndex,
+      );
     }
 
     return simulatedPos;
   }
 
-  // ══════════════════════════════════════════════════════════════
-  // 🎯 Outils de projection géométrique sur polyline
-  // ══════════════════════════════════════════════════════════════
+  double _computeCatchupTime(double absError, bool isStopped) {
+    if (isStopped) {
+      return _clamp(
+        0.75 + (absError / 28.0),
+        0.75,
+        1.8,
+      );
+    }
 
-  int _findForwardRouteIndex(
-      LatLng gpsPos, double heading, List<LatLng> polyline) {
+    if (_brakingIntensity > 0.75) return 0.55;
+    if (_brakingIntensity > 0.45) return 0.85;
+
+    // 🔧 Rattrapage légèrement plus rapide en régime normal (flèche en
+    // retard sur sa cible) : avant 0.85–1.35s, maintenant 0.70–1.10s.
+    return _clamp(
+      1.05 - (absError / 120.0),
+      0.70,
+      1.10,
+    );
+  }
+
+  double _clamp(double value, double min, double max) {
+    if (value.isNaN) return min;
+    if (value < min) return min;
+    if (value > max) return max;
+    return value;
+  }
+
+  int _findRouteIndex(
+    LatLng pos,
+    double heading,
+    List<LatLng> polyline,
+    int hintIndex, {
+    // 🔧 CORRECTIF SAUT DANS LES VIRAGES : fenêtre bornée en MÈTRES au lieu
+    // d'un nombre fixe de segments (+70 segments pouvait représenter des
+    // centaines de mètres sur des routes avec de petits segments, et la
+    // projection euclidienne "coupait" alors le virage en se verrouillant
+    // trop loin en avant).
+    double maxAheadMeters = double.infinity,
+    double maxBehindMeters = double.infinity,
+  }) {
     if (polyline.length < 2) return 0;
+    if (heading.isNaN || heading.isInfinite) heading = 0.0;
 
-    int bestIndex = math.max(0, lastRouteIndex);
-    double minScore = double.infinity;
+    final int maxSeg = polyline.length - 2;
+    final int hint = hintIndex.clamp(0, maxSeg);
 
-    // MODIFICATION ICI : On permet de chercher 15 points en arrière au cas où on a freiné brutalement
-    int searchStart = math.max(0, lastRouteIndex - 15);
-    int searchEnd = math.min(polyline.length - 2, lastRouteIndex + 50);
-
-    for (int i = searchStart; i <= searchEnd; i++) {
-      LatLng proj = _projectOnSegment(gpsPos, polyline[i], polyline[i + 1]);
-      double d = Geolocator.distanceBetween(
-          gpsPos.latitude, gpsPos.longitude, proj.latitude, proj.longitude);
-
-      double segBearing = Geolocator.bearingBetween(
+    double segLen(int i) => Geolocator.distanceBetween(
           polyline[i].latitude,
           polyline[i].longitude,
           polyline[i + 1].latitude,
-          polyline[i + 1].longitude);
-      double angleDiff = (segBearing - heading).abs();
-      if (angleDiff > 180) angleDiff = 360 - angleDiff;
-      double penalty = angleDiff > 90 ? 100.0 : 0.0;
+          polyline[i + 1].longitude,
+        );
 
-      double score = d + penalty;
+    int start = hint;
+    double accBehind = 0.0;
+    while (start > 0 && accBehind < maxBehindMeters) {
+      accBehind += segLen(start - 1);
+      start--;
+    }
+
+    int end = hint;
+    double accAhead = 0.0;
+    while (end < maxSeg && accAhead < maxAheadMeters) {
+      accAhead += segLen(end);
+      end++;
+    }
+
+    int bestIndex = start;
+    double minScore = double.infinity;
+
+    for (int i = start; i <= end; i++) {
+      if (i < 0 || i > maxSeg) continue;
+
+      final LatLng proj = _projectOnSegment(
+        pos,
+        polyline[i],
+        polyline[i + 1],
+      );
+
+      final double d = Geolocator.distanceBetween(
+        pos.latitude,
+        pos.longitude,
+        proj.latitude,
+        proj.longitude,
+      );
+
+      final double segBearing = Geolocator.bearingBetween(
+        polyline[i].latitude,
+        polyline[i].longitude,
+        polyline[i + 1].latitude,
+        polyline[i + 1].longitude,
+      );
+
+      double angleDiff = (segBearing - heading).abs();
+      if (angleDiff > 180.0) angleDiff = 360.0 - angleDiff;
+
+      double penalty = 0.0;
+      if (angleDiff > 100.0) {
+        penalty = 80.0;
+      } else if (angleDiff > 60.0) {
+        penalty = 25.0;
+      }
+
+      final double score = d + penalty;
+
       if (score < minScore) {
         minScore = score;
         bestIndex = i;
       }
     }
-    lastRouteIndex = bestIndex;
+
     return bestIndex;
   }
 
-  LatLng _advanceForwardFromGps(
-    LatLng startPos,
-    double distanceMeters,
-    double heading,
+  /// Retourne une distance signée le long de la route.
+  /// Positif si [to] est devant [from], négatif si [to] est derrière.
+  double _signedRouteDistance(
+    LatLng from,
+    int fromIndex,
+    LatLng to,
+    int toIndex,
+    List<LatLng> polyline,
+  ) {
+    if (polyline.length < 2) return 0.0;
+
+    final int maxSeg = polyline.length - 2;
+    fromIndex = fromIndex.clamp(0, maxSeg);
+    toIndex = toIndex.clamp(0, maxSeg);
+
+    if (fromIndex == toIndex) {
+      final double fromToNext = Geolocator.distanceBetween(
+        from.latitude,
+        from.longitude,
+        polyline[fromIndex + 1].latitude,
+        polyline[fromIndex + 1].longitude,
+      );
+
+      final double toToNext = Geolocator.distanceBetween(
+        to.latitude,
+        to.longitude,
+        polyline[toIndex + 1].latitude,
+        polyline[toIndex + 1].longitude,
+      );
+
+      return fromToNext - toToNext;
+    }
+
+    if (toIndex > fromIndex) {
+      double dist = Geolocator.distanceBetween(
+        from.latitude,
+        from.longitude,
+        polyline[fromIndex + 1].latitude,
+        polyline[fromIndex + 1].longitude,
+      );
+
+      for (int i = fromIndex + 1; i < toIndex; i++) {
+        dist += Geolocator.distanceBetween(
+          polyline[i].latitude,
+          polyline[i].longitude,
+          polyline[i + 1].latitude,
+          polyline[i + 1].longitude,
+        );
+      }
+
+      dist += Geolocator.distanceBetween(
+        polyline[toIndex].latitude,
+        polyline[toIndex].longitude,
+        to.latitude,
+        to.longitude,
+      );
+
+      return dist;
+    }
+
+    double dist = Geolocator.distanceBetween(
+      from.latitude,
+      from.longitude,
+      polyline[fromIndex].latitude,
+      polyline[fromIndex].longitude,
+    );
+
+    for (int i = fromIndex; i > toIndex + 1; i--) {
+      dist += Geolocator.distanceBetween(
+        polyline[i].latitude,
+        polyline[i].longitude,
+        polyline[i - 1].latitude,
+        polyline[i - 1].longitude,
+      );
+    }
+
+    dist += Geolocator.distanceBetween(
+      polyline[toIndex + 1].latitude,
+      polyline[toIndex + 1].longitude,
+      to.latitude,
+      to.longitude,
+    );
+
+    return -dist;
+  }
+
+  LatLng _moveAlongRouteSigned(
+    LatLng start,
+    double signedDistance,
     List<LatLng> polyline,
     int startIndex,
   ) {
-    if (polyline.length < 2 ||
-        startIndex < 0 ||
-        startIndex >= polyline.length - 1) {
-      var newLoc = toolkit.SphericalUtil.computeOffset(
-        toolkit.LatLng(startPos.latitude, startPos.longitude),
-        distanceMeters,
-        heading,
-      );
-      return LatLng(newLoc.latitude, newLoc.longitude);
+    if (polyline.length < 2) return start;
+
+    final int maxSeg = polyline.length - 2;
+    final int idx = startIndex.clamp(0, maxSeg);
+
+    final LatLng proj = _projectOnSegment(
+      start,
+      polyline[idx],
+      polyline[idx + 1],
+    );
+
+    if (signedDistance >= 0.0) {
+      return _advanceForwardAlongRoute(proj, signedDistance, polyline, idx);
     }
 
+    return _retreatAlongRoute(proj, -signedDistance, polyline, idx);
+  }
+
+  LatLng _advanceForwardAlongRoute(
+    LatLng startPos,
+    double distanceMeters,
+    List<LatLng> polyline,
+    int startIndex,
+  ) {
+    if (distanceMeters <= 0.0 || polyline.length < 2) return startPos;
+
+    final int maxSeg = polyline.length - 2;
+    final int idx = startIndex.clamp(0, maxSeg);
+
     LatLng proj = _projectOnSegment(
-        startPos, polyline[startIndex], polyline[startIndex + 1]);
+      startPos,
+      polyline[idx],
+      polyline[idx + 1],
+    );
 
     double remainingDistance = distanceMeters;
     LatLng currentPos = proj;
 
-    for (int i = startIndex; i < polyline.length - 1; i++) {
-      LatLng pNext = polyline[i + 1];
+    for (int i = idx; i < polyline.length - 1; i++) {
+      final LatLng next = polyline[i + 1];
 
-      double dSeg = Geolocator.distanceBetween(
+      final double dSeg = Geolocator.distanceBetween(
         currentPos.latitude,
         currentPos.longitude,
-        pNext.latitude,
-        pNext.longitude,
+        next.latitude,
+        next.longitude,
       );
 
       if (dSeg < 0.001) continue;
 
       if (remainingDistance <= dSeg) {
-        double t = remainingDistance / dSeg;
-        return _lerpPosition(currentPos, pNext, t);
-      } else {
-        remainingDistance -= dSeg;
-        currentPos = pNext;
+        final double t = remainingDistance / dSeg;
+        return _lerpPosition(currentPos, next, t);
       }
+
+      remainingDistance -= dSeg;
+      currentPos = next;
     }
 
-    if (remainingDistance > 0 && polyline.length >= 2) {
-      double lastBearing = Geolocator.bearingBetween(
-        polyline[polyline.length - 2].latitude,
-        polyline[polyline.length - 2].longitude,
-        polyline.last.latitude,
-        polyline.last.longitude,
+    return currentPos;
+  }
+
+  LatLng _retreatAlongRoute(
+    LatLng startPos,
+    double distanceMeters,
+    List<LatLng> polyline,
+    int startIndex,
+  ) {
+    if (distanceMeters <= 0.0 || polyline.length < 2) return startPos;
+
+    final int maxSeg = polyline.length - 2;
+    final int idx = startIndex.clamp(0, maxSeg);
+
+    LatLng proj = _projectOnSegment(
+      startPos,
+      polyline[idx],
+      polyline[idx + 1],
+    );
+
+    double remainingDistance = distanceMeters;
+    LatLng currentPos = proj;
+
+    for (int i = idx; i >= 0; i--) {
+      final LatLng previous = polyline[i];
+
+      final double dSeg = Geolocator.distanceBetween(
+        currentPos.latitude,
+        currentPos.longitude,
+        previous.latitude,
+        previous.longitude,
       );
-      var newLoc = toolkit.SphericalUtil.computeOffset(
-        toolkit.LatLng(currentPos.latitude, currentPos.longitude),
-        remainingDistance,
-        lastBearing,
-      );
-      return LatLng(newLoc.latitude, newLoc.longitude);
+
+      if (dSeg < 0.001) continue;
+
+      if (remainingDistance <= dSeg) {
+        final double t = remainingDistance / dSeg;
+        return _lerpPosition(currentPos, previous, t);
+      }
+
+      remainingDistance -= dSeg;
+      currentPos = previous;
     }
 
     return currentPos;
   }
 
   LatLng _projectOnSegment(LatLng p, LatLng a, LatLng b) {
-    double latRad = (a.latitude + b.latitude) / 2.0 * (math.pi / 180.0);
-    double cosLat = math.cos(latRad);
+    final double latRad = ((a.latitude + b.latitude) / 2.0) * (math.pi / 180.0);
+    final double cosLat = math.cos(latRad);
 
-    double ax = a.longitude * cosLat;
-    double ay = a.latitude;
-    double bx = b.longitude * cosLat;
-    double by = b.latitude;
-    double px = p.longitude * cosLat;
-    double py = p.latitude;
+    final double ax = a.longitude * cosLat;
+    final double ay = a.latitude;
 
-    double l2 = (bx - ax) * (bx - ax) + (by - ay) * (by - ay);
+    final double bx = b.longitude * cosLat;
+    final double by = b.latitude;
+
+    final double px = p.longitude * cosLat;
+    final double py = p.latitude;
+
+    final double l2 = ((bx - ax) * (bx - ax)) + ((by - ay) * (by - ay));
+
     if (l2 == 0.0) return a;
 
-    double t = ((px - ax) * (bx - ax) + (py - ay) * (by - ay)) / l2;
-    t = t.clamp(0.0, 1.0);
+    double t = (((px - ax) * (bx - ax)) + ((py - ay) * (by - ay))) / l2;
+    t = t.clamp(0.0, 1.0).toDouble();
 
     return LatLng(
       a.latitude + t * (b.latitude - a.latitude),
@@ -23994,15 +25806,52 @@ class KinematicFilter {
   }
 
   void reset() {
+    accelDetector.stop();
+    _accelBrakeActive = false;
+    _accelBrakeIntensity = 0.0;
+    _accelBoostIntensity = 0.0;
+    _gpsBrakeIntensity = 0.0;
     simulatedPos = null;
     lastRealPos = null;
+
     _currentRawGps = null;
     _previousRawGps = null;
     _previousPreviousRawGps = null;
+
     _targetPos = null;
-    _lastGpsTime = null;
+    _snappedGpsPos = null;
+
+    // 🔧 AJOUT : reset de la référence persistante utilisée par la
+    // correction 60fps
+    _lastReferencePos = null;
+    _lastReferenceIndex = -1;
+    _lastIsStopped = false;
+
     _lastPredictTime = null;
-    calculatedSpeedMps = 0.0;
+    _lastGpsUpdateTime = null;
+
+    _isNewGpsPoint = false;
+    _isWalking = false;
+    isBackwardRecovery = false;
+
+    // ═══ AJOUT : reset du filtre qualité GPS ═══
+    _lastRawAccuracy = 999.0;
+    _lastConfirmedSnappedPos = null;
+    _lastConfirmedRouteIndex = -1;
+    _lastGoodGpsFixTime = null;
+    _consecutiveRejectedFixes = 0;
+
+    _vehicleSpeedMps = 0.0;
+    _previousVehicleSpeedMps = 0.0;
+    _arrowSpeedMps = 0.0;
+    _brakingIntensity = 0.0;
+    _lastGpsIntervalSeconds = 1.0;
+    _stoppedForSeconds = 0.0;
+    _lastRawSpeedMps = 0.0;
+
+    _lastSimRouteIndex = 0;
+    _snappedGpsIndex = 0;
     lastRouteIndex = -1;
+    displaySnapIndex = -1;
   }
 }

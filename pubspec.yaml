@@ -14,6 +14,8 @@ dependencies:
   # Icônes
   cupertino_icons: ^1.0.2
   safe_device: ^1.3.8
+  flutter_play_integrity_wrapper: ^0.0.2
+  flutter_secure_storage: ^11.0.0
   # Packages Google & Maps
   google_maps_utils: ^2.0.0
   google_navigation_flutter: ^0.8.1
@@ -36,6 +38,7 @@ dependencies:
   firebase_storage: ^12.0.0
   cloud_functions: ^5.0.0
   firebase_app_check: ^0.3.0
+  sensors_plus: ^7.1.0
 
   # Réseau et API
   dio: ^5.0.0
