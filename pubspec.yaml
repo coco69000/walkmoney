@@ -14,7 +14,6 @@ dependencies:
   # Icônes
   cupertino_icons: ^1.0.2
   safe_device: ^1.3.8
-  flutter_play_integrity_wrapper: ^0.0.2
   flutter_secure_storage: ^11.0.0
   # Packages Google & Maps
   google_maps_utils: ^2.0.0
@@ -65,7 +64,6 @@ dependencies:
   baseflow_plugin_template: ^2.2.1
   google_generative_ai: ^0.4.7
   talker_flutter: ^5.1.19
-  sensors_plus: ^6.0.1
 
 dev_dependencies:
   flutter_test:

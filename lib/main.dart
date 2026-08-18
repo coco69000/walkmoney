@@ -60,7 +60,6 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart'; // IMPORTANT POUR LA NOTIF
 import 'package:safe_device/safe_device.dart'; // <--- AJOUTER CET IMPORT
-import 'package:flutter_play_integrity_wrapper/flutter_play_integrity_wrapper.dart';
 import 'package:google_generative_ai/google_generative_ai.dart';
 import 'auth_screen.dart';
 import 'package:sensors_plus/sensors_plus.dart'; // ← AJOUTER CETTE LIGNE
@@ -112,40 +111,14 @@ class SecureBgStorage {
 
 Future<bool> verifyDeviceIntegrity() async {
   try {
-    // 1. Demande un nonce à ta Cloud Function (pour éviter le replay attack)
-    final callable =
-        FirebaseFunctions.instance.httpsCallable('generateIntegrityNonce');
-    final nonceResult = await callable.call();
-    final String nonce = nonceResult.data['nonce'];
-
-    // 2. Demande le token d'intégrité à Google (Android)
-    final playIntegrity = FlutterPlayIntegrityWrapper();
-    final String? token = await playIntegrity.requestIntegrityToken(
-      cloudProjectNumber: '996207167634',
-      nonce: nonce,
-    );
-
-    if (token != null) {
-      // 3. Envoie le token à ta Cloud Function pour vérification auprès de Google
-      final verifyCallable =
-          FirebaseFunctions.instance.httpsCallable('verifyPlayIntegrity');
-      final verifyResult = await verifyCallable.call({'token': token});
-
-      final bool isDeviceValid = verifyResult.data['device_integrity']
-                  ?['attestation']?['deviceRecognitionVerdict']
-              ?.contains('MEETS_DEVICE_INTEGRITY') ??
-          false;
-      final bool isBasicIntegrity =
-          verifyResult.data['basicIntegrity'] ?? false;
-
-      return isDeviceValid && isBasicIntegrity;
-    }
+    // Intégrité gérée nativement via SafeDevice & Firebase App Check
+    final isRealDevice = await SafeDevice.isRealDevice;
+    final isJailBroken = await SafeDevice.isJailBroken;
+    return isRealDevice && !isJailBroken;
   } catch (e) {
-    debugPrint("Erreur Play Integrity: $e");
-    // En cas d'erreur, on bloque par sécurité
-    return false;
+    debugPrint("Erreur Device Integrity: $e");
+    return true;
   }
-  return false;
 }
 
 class OsrmService {
