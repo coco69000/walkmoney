@@ -30,6 +30,8 @@
 	<string>WalkMoney nécessite de suivre votre position en arrière-plan pendant vos trajets pour détecter les triches et valider vos défis même écran éteint.</string>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
 	<string>WalkMoney nécessite de suivre votre position en arrière-plan pendant vos trajets pour détecter les triches et valider vos défis même écran éteint.</string>
+	<key>NSMotionUsageDescription</key>
+	<string>WalkMoney utilise les capteurs de mouvement pour améliorer la précision de la navigation et détecter le démarrage du véhicule instantanément.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>location</string>

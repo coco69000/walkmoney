@@ -1,16 +1,26 @@
-const functions = require('firebase-functions');
+const { onCall, HttpsError } = require('firebase-functions/v2/https');
+const { onSchedule } = require('firebase-functions/v2/scheduler');
 const admin = require('firebase-admin');
 const crypto = require('crypto');
-const { onSchedule } = require('firebase-functions/v2/scheduler');
 admin.initializeApp();
 
 // Helper : Vérification Firebase App Check
 const verifyAppCheck = (context) => {
     if (!context.app && process.env.FUNCTIONS_EMULATOR !== 'true') {
-        throw new functions.https.HttpsError(
+        throw new HttpsError(
             'failed-precondition',
             'L\'appel doit provenir d\'une application officielle authentifiée (App Check).'
         );
+    }
+};
+
+// 🔒 Helper : Vérification des droits Administrateur
+const verifyAdmin = (context) => {
+    if (!context.auth) {
+        throw new HttpsError('unauthenticated', 'Utilisateur non authentifié.');
+    }
+    if (!context.auth.token || context.auth.token.admin !== true) {
+        throw new HttpsError('permission-denied', 'Droits d\'administrateur requis pour réaliser cette action.');
     }
 };
 
@@ -49,23 +59,25 @@ const GOLD_PRICE_ID = 'price_1SgZkvJmX9VkIHA6tTa42iTY';
 
 
 // --- FONCTION 1 : CRÉATION DU MAGASIN ---
-exports.createStripeShop = functions.https.onCall(async (data, context) => {
+exports.createStripeShop = onCall(async (request) => {
+    const data = request.data;
+    const context = request;
     verifyAppCheck(context);
     console.log("🚀 [START] createStripeShop appelée !");
 
     if (!context.auth) {
-        throw new functions.https.HttpsError('unauthenticated', 'Utilisateur non authentifié.');
+        throw new HttpsError('unauthenticated', 'Utilisateur non authentifié.');
     }
 
     if (!stripe) {
-        throw new functions.https.HttpsError('failed-precondition', 'Le service Stripe n\'est pas configuré sur le serveur.');
+        throw new HttpsError('failed-precondition', 'Le service Stripe n\'est pas configuré sur le serveur.');
     }
 
     const userId = context.auth.uid;
     const userRef = admin.firestore().collection('users').doc(userId);
     const userDoc = await userRef.get();
     if (userDoc.exists && userDoc.data()?.stripe_subscription_id) {
-        throw new functions.https.HttpsError('already-exists', 'Vous possédez déjà un abonnement magasin actif.');
+        throw new HttpsError('already-exists', 'Vous possédez déjà un abonnement magasin actif.');
     }
 
     const paymentMethodId = data.paymentMethodId;
@@ -77,11 +89,11 @@ exports.createStripeShop = functions.https.onCall(async (data, context) => {
     console.log(`📦 Données : Nom=${name}, Email=${email}, OptionOr=${isVisibilityBoostEnabled}`);
 
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-        throw new functions.https.HttpsError('failed-precondition', 'Aucune adresse e-mail valide associée à ce compte Firebase Token.');
+        throw new HttpsError('failed-precondition', 'Aucune adresse e-mail valide associée à ce compte Firebase Token.');
     }
 
     if (!paymentMethodId) {
-        throw new functions.https.HttpsError('invalid-argument', 'Moyen de paiement manquant.');
+        throw new HttpsError('invalid-argument', 'Moyen de paiement manquant.');
     }
 
     try {
@@ -147,7 +159,7 @@ exports.createStripeShop = functions.https.onCall(async (data, context) => {
         };
     } catch (error) {
         console.error("❌ ERREUR CRITIQUE STRIPE :", error);
-        throw new functions.https.HttpsError('internal', error.message);
+        throw new HttpsError('internal', error.message);
     }
 });
 
@@ -159,37 +171,45 @@ exports.createStripeShop = functions.https.onCall(async (data, context) => {
 // Remplace Document AI + Gemini par NVIDIA NIM (OCR + Analyse en une requête)
 // ════════════════════════════════════════════════════════════════════════════
 
-const NVIDIA_API_KEY = (functions.config().nvidia && functions.config().nvidia.api_key) || process.env.NVIDIA_API_KEY || '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';
+const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY || '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';
 const NVIDIA_API_URL = 'https://integrate.api.nvidia.com/v1/chat/completions';
 
 async function analyzeReceiptWithNvidia(base64Image, mimeType, storeName) {
     if (!NVIDIA_API_KEY) {
         console.warn("⚠️ NVIDIA_API_KEY absente. Reçu refusé par précaution.");
-        return { valid: false, reason: 'Clé API NVIDIA non configurée.', extractedText: '', amount: null };
+        return { valid: false, reason: 'Clé API NVIDIA non configurée sur le serveur.', extractedText: '', amount: null, storeNameFound: '' };
     }
 
+    // Nettoyer le nom du magasin pour le prompt
     const safeStoreName = (storeName || 'Commerce').replace(/[^a-zA-Z0-9\s\-\.\'\&]/g, '').trim().substring(0, 50) || 'Commerce';
 
-    const prompt = `Tu es un expert en vérification de tickets de caisse pour une application de cashback.
-Analyse cette image de ticket de caisse qui devrait provenir du magasin "${safeStoreName}".
+    const prompt = `Tu es un expert strict en détection de fraude et en OCR de tickets de caisse pour une application de cashback. Ta mission est de valider ou rejeter ce document de manière rigoureuse.
 
-Tu dois :
-1. Extraire tout le texte visible du ticket (OCR)
-2. Vérifier si le ticket semble authentique (pas de montage, pas de retouche)
-3. Vérifier si le nom du magasin sur le ticket correspond à "${safeStoreName}"
-4. Extraire le montant total TTC/NET du ticket
-5. Extraire la date et l'heure du ticket
+Analyse l'image fournie qui est censée être un ticket de caisse du magasin : "${safeStoreName}".
 
-Réponds EXCLUSIVEMENT avec un objet JSON valide (sans balises markdown) :
+ÉVALUATION STRICTE (Tu dois rejeter le ticket si l'une de ces conditions n'est pas remplie) :
+1. EST-CE UN VRAI TICKET ? : Ce doit être un vrai ticket de caisse imprimé ou un reçu numérique officiel. Rejette immédiatement les captures d'écran d'applications, les notes manuscrites, les documents vierges ou les images manifestement retouchées.
+2. CORRESPONDANCE DU MAGASIN : Le nom du magasin imprimé sur le ticket doit correspondre clairement à "${safeStoreName}". Une légère variation orthographique est acceptable, mais si c'est un magasin complètement différent ou si le nom est "Inconnu", c'est un REJET IMMÉDIAT.
+3. MONTANT CLAIR : Il doit y avoir un montant total (TTC, Total, Net à payer) clairement identifiable et supérieur à 0.
+4. DATE : Une date doit être visible.
+
+Tu dois répondre EXCLUSIVEMENT avec un objet JSON valide (aucun texte avant ou après, aucune balise markdown comme \`\`\`json). 
+
+Format de réponse JSON strict :
 {
-  "valid": true/false,
-  "reason": "explication si invalide, sinon vide",
-  "extractedText": "tout le texte du ticket",
-  "storeNameFound": "nom du magasin trouvé sur le ticket",
-  "amount": nombre_decimal_ou_null,
-  "date": "JJ/MM/AAAA HH:MM ou null",
-  "isReceipt": true/false (est-ce bien un ticket de caisse ?)
-}`;
+  "valid": true ou false,
+  "reason": "Si valid est false, explique EXPLICITEMENT et en une phrase précise pourquoi (ex: 'Le magasin trouvé est X, pas Y', 'Aucun montant total lisible', 'Document suspecté d'être une capture d'écran'). Si valid est true, mets 'OK'.",
+  "extractedText": "Le texte brut extrait du ticket (concentre-toi sur l'en-tête avec le nom du magasin et le pied de page avec le total)",
+  "storeNameFound": "Le nom exact du magasin tel qu'il apparaît sur le ticket (ou 'Inconnu')",
+  "amount": nombre_decimal (ex: 15.50) ou null si introuvable,
+  "date": "Date trouvée au format JJ/MM/AAAA ou null",
+  "isReceipt": true ou false
+}
+
+Règles absolues :
+- Si le magasin ne correspond pas, valid DOIT être false et reason DOIT le mentionner explicitement.
+- Ne sois pas indulgent. En cas de doute sur l'authenticité ou le magasin, rejette (valid: false).
+- Ne génère AUCUN texte en dehors du JSON.`;
 
     try {
         const response = await fetch(NVIDIA_API_URL, {
@@ -215,65 +235,73 @@ Réponds EXCLUSIVEMENT avec un objet JSON valide (sans balises markdown) :
                     }
                 ],
                 max_tokens: 1024,
-                temperature: 0.1
+                temperature: 0.0 // Température à 0 pour une réponse déterministe et stricte
             })
         });
 
         if (!response.ok) {
             console.error(`❌ Erreur NVIDIA API: ${response.status}`);
-            const errorText = await response.text();
-            console.error('Détails:', errorText);
-            return { valid: false, reason: 'Service d\'analyse indisponible.', extractedText: '', amount: null };
+            return { valid: false, reason: 'Service d\'analyse indisponible ou erreur serveur.', extractedText: '', amount: null, storeNameFound: '' };
         }
 
         const data = await response.json();
         const responseText = data?.choices?.[0]?.message?.content || '';
 
-        // Nettoyer la réponse (enlever les balises markdown si présentes)
-        const cleanedText = responseText
-            .replace(/```json\s*/g, '')
-            .replace(/```\s*/g, '')
-            .trim();
+        // --- PARSING JSON ROBUSTE ---
+        // 1. Enlever les balises markdown ```json ... ``` si l'IA en ajoute quand même
+        let cleanedText = responseText.trim().replace(/^```json\s*/i, '').replace(/```\s*$/i, '');
+        
+        // 2. Extraire uniquement le bloc JSON si du texte parasite existe avant/après
+        const firstBrace = cleanedText.indexOf('{');
+        const lastBrace = cleanedText.lastIndexOf('}');
+        
+        if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+            cleanedText = cleanedText.substring(firstBrace, lastBrace + 1);
+        }
 
         let parsed;
         try {
             parsed = JSON.parse(cleanedText);
         } catch (jsonErr) {
-            console.error("❌ Échec parsing JSON NVIDIA:", cleanedText);
-            // Essayer d'extraire un JSON partiel
-            const jsonMatch = cleanedText.match(/\{[\s\S]*\}/);
-            if (jsonMatch) {
-                try {
-                    parsed = JSON.parse(jsonMatch[0]);
-                } catch (e) {
-                    return { valid: false, reason: 'Format de réponse invalide.', extractedText: '', amount: null };
-                }
-            } else {
-                return { valid: false, reason: 'Réponse non structurée.', extractedText: cleanedText, amount: null };
-            }
+            console.error("❌ Échec parsing JSON NVIDIA. Réponse brute:", cleanedText);
+            return { 
+                valid: false, 
+                reason: 'Erreur de format de la réponse de l\'IA. Veuillez réessayer avec une image plus nette.', 
+                extractedText: '', 
+                amount: null,
+                storeNameFound: ''
+            };
         }
 
+        // Validation stricte des champs
+        const isValid = (parsed.valid === true && parsed.isReceipt === true);
+        const reason = (parsed.reason && parsed.reason.trim().length > 0) 
+            ? parsed.reason 
+            : (isValid ? 'OK' : 'Le ticket ne respecte pas les critères de validation (magasin, authenticité ou montant).');
+
         return {
-            valid: parsed.valid === true && parsed.isReceipt === true,
-            reason: parsed.reason || '',
+            valid: isValid,
+            reason: reason,
             extractedText: parsed.extractedText || '',
-            storeNameFound: parsed.storeNameFound || '',
-            amount: parsed.amount || null,
+            storeNameFound: parsed.storeNameFound || 'Inconnu',
+            amount: typeof parsed.amount === 'number' ? parsed.amount : null,
             date: parsed.date || null
         };
 
     } catch (err) {
-        console.error("❌ Erreur NVIDIA NIM:", err.message);
-        return { valid: false, reason: 'Erreur de connexion au service d\'analyse.', extractedText: '', amount: null };
+        console.error("❌ Erreur critique NVIDIA NIM:", err.message);
+        return { valid: false, reason: 'Erreur de connexion au service d\'analyse.', extractedText: '', amount: null, storeNameFound: '' };
     }
 }
 
-exports.processReceiptOCR = functions.runWith({ memory: '1GB', timeoutSeconds: 120 }).https.onCall(async (data, context) => {
+exports.processReceiptOCR = onCall({ memory: '1GiB', timeoutSeconds: 120 }, async (request) => {
+    const data = request.data;
+    const context = request;
     verifyAppCheck(context);
     console.log("🛡️ [SECURE] processReceiptOCR via NVIDIA NIM");
 
     if (!context.auth) {
-        throw new functions.https.HttpsError('unauthenticated', 'Utilisateur non authentifié');
+        throw new HttpsError('unauthenticated', 'Utilisateur non authentifié');
     }
 
     const imageBase64 = data.imageBase64;
@@ -282,11 +310,11 @@ exports.processReceiptOCR = functions.runWith({ memory: '1GB', timeoutSeconds: 1
     const safeStoreName = rawStoreName.replace(/[^a-zA-Z0-9\s\-\.\'\&]/g, '').trim().substring(0, 50) || 'Commerce';
 
     if (!imageBase64) {
-        throw new functions.https.HttpsError('invalid-argument', 'Image base64 manquante');
+        throw new HttpsError('invalid-argument', 'Image base64 manquante');
     }
 
     if (imageBase64.length > 7 * 1024 * 1024) {
-        throw new functions.https.HttpsError('invalid-argument', 'Image trop volumineuse (maximum 5 Mo).');
+        throw new HttpsError('invalid-argument', 'Image trop volumineuse (maximum 5 Mo).');
     }
 
     const userId = context.auth.uid;
@@ -301,7 +329,7 @@ exports.processReceiptOCR = functions.runWith({ memory: '1GB', timeoutSeconds: 1
 
         if (lastOcrTime && (now - lastOcrTime.toMillis()) < 30000) {
             const remainingSec = Math.ceil((30000 - (now - lastOcrTime.toMillis())) / 1000);
-            throw new functions.https.HttpsError('resource-exhausted', `Patientez ${remainingSec}s avant un nouveau scan.`);
+            throw new HttpsError('resource-exhausted', `Patientez ${remainingSec}s avant un nouveau scan.`);
         }
 
         transaction.set(statsRef, {
@@ -352,7 +380,7 @@ exports.processReceiptOCR = functions.runWith({ memory: '1GB', timeoutSeconds: 1
 
     } catch (error) {
         console.error("❌ Erreur NVIDIA NIM:", error.message);
-        throw new functions.https.HttpsError('internal', 'Erreur d\'analyse. Veuillez réessayer.');
+        throw new HttpsError('internal', 'Erreur d\'analyse. Veuillez réessayer.');
     }
 });
 
@@ -361,27 +389,31 @@ exports.processReceiptOCR = functions.runWith({ memory: '1GB', timeoutSeconds: 1
 // ════════════════════════════════════════════════════════════════════════════
 
 // --- FONCTION 4 : VALIDATION SERVEUR DES TRAJETS & ATTRIBUTION DES LAMES (ENRICHI) ---
-exports.validateTrip = functions.https.onCall(async (data, context) => {
+exports.validateTrip = onCall(async (request) => {
+    const data = request.data;
+    const context = request;
     verifyAppCheck(context);
     console.log("🚀 [START] validateTrip appelée");
 
     // VÉRIFICATION D'AUTHENTIFICATION RENFORCÉE
     if (!context.auth || !context.auth.uid) {
         console.warn("⚠️ [AUTH] Requête rejetée : context.auth est null. Le client n'a pas envoyé de token valide (token expiré ou utilisateur déconnecté).");
-        throw new functions.https.HttpsError('unauthenticated', 'Session expirée. Veuillez vous reconnecter dans l\'application.');
+        throw new HttpsError('unauthenticated', 'Session expirée. Veuillez vous reconnecter dans l\'application.');
     }
 
     const userId = context.auth.uid;
     const source = data.source || 'Trajet';
     const challengeId = data.challengeId || null;
     const tripId = data.tripId || null; // 🆕 L'ID du document trip_logs
+    const isSpecialBonus = data.isSpecialBonus === true || (source && source.toLowerCase().includes('bonus'));
 
-    // 🚨 FIX 1 : tripId est STRICTEMENT OBLIGATOIRE pour les trajets normaux (hors défis)
-    if (!challengeId && !tripId) {
-        throw new functions.https.HttpsError('invalid-argument', 'ID de trajet manquant (tripId obligatoire).');
+    // 🚨 FIX 1 : tripId est STRICTEMENT OBLIGATOIRE pour les trajets normaux (hors défis et bonus spéciaux)
+    if (!challengeId && !tripId && !isSpecialBonus) {
+        throw new HttpsError('invalid-argument', 'ID de trajet manquant (tripId obligatoire).');
     }
 
-    const travelMode = data.travelMode || 'walking';
+    const rawMode = (data.travelMode || 'walking').toString().toLowerCase();
+    const travelMode = rawMode.includes('transit') ? 'transit' : (rawMode.includes('bicycling') || rawMode.includes('bike') ? 'bicycling' : 'walking');
     const cheatDetected = data.cheatDetected || false;
     const cheatReason = data.cheatReason || null;
     const startLocation = data.startLocation || null;
@@ -397,31 +429,42 @@ exports.validateTrip = functions.https.onCall(async (data, context) => {
             const cData = challengeDoc.data();
             challengeReward = Math.round(cData.reward_lame ?? cData.reward ?? 0);
             if (challengeReward <= 0) {
-                throw new functions.https.HttpsError('invalid-argument', 'Récompense du défi non valide.');
+                throw new HttpsError('invalid-argument', 'Récompense du défi non valide.');
             }
         } else {
-            throw new functions.https.HttpsError('not-found', 'Défi ou bonus introuvable ou expiré.');
+            throw new HttpsError('not-found', 'Défi ou bonus introuvable ou expiré.');
         }
     }
 
-    // Pour un défi, la récompense est strictement imposée par le serveur depuis Firestore (ignore le client)
-    const amountToAdd = isVerifiedChallenge ? challengeReward : Math.round(data.amountToAdd || 0);
+    // On autorise le montant du client s'il est supérieur (grâce aux multiplicateurs légitimes), 
+    // mais on le plafonne à 3x la récompense de base pour bloquer la triche.
+    let amountToAdd = Math.round(data.amountToAdd || 0);
+    if (isVerifiedChallenge) {
+        if (amountToAdd > challengeReward) {
+            if (amountToAdd > challengeReward * 3.0) {
+                console.warn(`⚠️ [ANTI-TRICHE SERVEUR] Récompense de défi anormalement élevée (${amountToAdd} > ${challengeReward * 3.0}) par ${userId}`);
+                throw new HttpsError('permission-denied', 'Récompense de défi anormalement élevée (triche détectée).');
+            }
+        } else {
+            amountToAdd = challengeReward; // Sécurité : on ne peut pas recevoir moins que la base
+        }
+    }
 
     if (amountToAdd <= 0) {
-        throw new functions.https.HttpsError('invalid-argument', 'Montant de Lames invalide.');
+        throw new HttpsError('invalid-argument', 'Montant de Lames invalide.');
     }
 
     // 🛡️ ANTI-TRICHE 1 : Si le client a déjà détecté une triche, on rejette immédiatement
-    if (cheatDetected && !isVerifiedChallenge) {
+    if (cheatDetected && !isVerifiedChallenge && !isSpecialBonus) {
         console.warn(`⚠️ [ANTI-TRICHE CLIENT] Trajet rejeté (${cheatReason}) par ${userId}`);
-        throw new functions.https.HttpsError('permission-denied', `Trajet invalide : ${cheatReason}`);
+        throw new HttpsError('permission-denied', `Trajet invalide : ${cheatReason}`);
     }
 
-    // Anti-triche 2 : Plafond max absolu de Lames par trajet / action (1500 pour trajets, 5000 pour défis vérifiés DB)
-    const maxCeiling = isVerifiedChallenge ? 5000 : 1500;
+    // Anti-triche 2 : Plafond max absolu de Lames par trajet / action (1500 pour trajets, 5000 pour défis vérifiés DB ou bonus spéciaux)
+    const maxCeiling = (isVerifiedChallenge || isSpecialBonus) ? 5000 : 1500;
     if (amountToAdd > maxCeiling) {
         console.warn(`⚠️ [ANTI-TRICHE] Tentative d'attribution suspecte (${amountToAdd} Lames, max: ${maxCeiling}) par ${userId} (source: ${source})`);
-        throw new functions.https.HttpsError('permission-denied', `Montant de Lames dépassant le plafond maximal autorisé (${maxCeiling}).`);
+        throw new HttpsError('permission-denied', `Montant de Lames dépassant le plafond maximal autorisé (${maxCeiling}).`);
     }
 
     const userRef = admin.firestore().collection('users').doc(userId);
@@ -432,7 +475,7 @@ exports.validateTrip = functions.https.onCall(async (data, context) => {
             const userDoc = await transaction.get(userRef);
             const statsDoc = await transaction.get(statsRef);
             if (!userDoc.exists) {
-                throw new functions.https.HttpsError('not-found', 'Profil utilisateur introuvable.');
+                throw new HttpsError('not-found', 'Profil utilisateur introuvable.');
             }
             const statsData = statsDoc.exists ? statsDoc.data() : {};
 
@@ -444,15 +487,15 @@ exports.validateTrip = functions.https.onCall(async (data, context) => {
                 const tripRef = userRef.collection('trip_logs').doc(tripId);
                 const tripDoc = await transaction.get(tripRef);
                 if (!tripDoc.exists) {
-                    throw new functions.https.HttpsError('not-found', 'Journal de trajet introuvable en base de données.');
+                    throw new HttpsError('not-found', 'Journal de trajet introuvable en base de données.');
                 }
 
                 const tripLogData = tripDoc.data();
                 if (tripLogData.cheat_detected === true) {
-                    throw new functions.https.HttpsError('permission-denied', 'Trajet marqué comme triché par le système.');
+                    throw new HttpsError('permission-denied', 'Trajet marqué comme triché par le système.');
                 }
                 if (tripLogData.validation_status === 'validated') {
-                    throw new functions.https.HttpsError('already-exists', 'Ce trajet a déjà été validé.');
+                    throw new HttpsError('already-exists', 'Ce trajet a déjà été validé.');
                 }
 
                 // Récupération stricte depuis la BD pour les calculs anti-triche
@@ -460,7 +503,7 @@ exports.validateTrip = functions.https.onCall(async (data, context) => {
                 dbDurationSeconds = Number(tripLogData.actual_duration_seconds ?? dbDurationSeconds);
 
                 if (dbDistanceMeters <= 0) {
-                    throw new functions.https.HttpsError('invalid-argument', 'Distance de trajet enregistrée en BD invalide.');
+                    throw new HttpsError('invalid-argument', 'Distance de trajet enregistrée en BD invalide.');
                 }
 
                 // Validation Physique Serveur
@@ -470,14 +513,17 @@ exports.validateTrip = functions.https.onCall(async (data, context) => {
 
                     if (speedKmh > maxPhysicalSpeed) {
                         console.warn(`⚠️ [ANTI-TRICHE SERVEUR] Vitesse physiquement impossible: ${speedKmh.toFixed(1)} km/h en ${travelMode} par ${userId}`);
-                        throw new functions.https.HttpsError('permission-denied', `Vitesse physiquement impossible détectée (${speedKmh.toFixed(1)} km/h). Trajet rejeté.`);
+                        throw new HttpsError('permission-denied', `Vitesse physiquement impossible détectée (${speedKmh.toFixed(1)} km/h). Trajet rejeté.`);
                     }
                 }
 
-                const maxAllowedForDistance = Math.ceil((dbDistanceMeters / 1000) * 150) + 50;
+                const baseMaxAllowed = Math.ceil((dbDistanceMeters / 1000) * 150) + 50;
+                // On multiplie par 3.0 pour laisser une marge confortable aux multiplicateurs légitimes cumulés
+                const maxAllowedForDistance = Math.ceil(baseMaxAllowed * 3.0);
+
                 if (amountToAdd > maxAllowedForDistance) {
                     console.warn(`⚠️ [ANTI-TRICHE SERVEUR] Incohérence Lames/Distance: ${amountToAdd} Lames demandées pour ${(dbDistanceMeters / 1000).toFixed(2)}km par ${userId}`);
-                    throw new functions.https.HttpsError('permission-denied', `Montant de Lames incohérent avec la distance parcourue.`);
+                    throw new HttpsError('permission-denied', `Montant de Lames incohérent avec la distance parcourue.`);
                 }
             }
 
@@ -486,10 +532,10 @@ exports.validateTrip = functions.https.onCall(async (data, context) => {
                 const userChallengeRef = admin.firestore().collection('user_challenges').doc(`${userId}_${challengeId}`);
                 const userChallengeDoc = await transaction.get(userChallengeRef);
                 if (!userChallengeDoc.exists || (userChallengeDoc.data().status !== 'inProgress' && userChallengeDoc.data().completed !== true)) {
-                    throw new functions.https.HttpsError('permission-denied', 'Défi non commencé ou invalide dans vos défis.');
+                    throw new HttpsError('permission-denied', 'Défi non commencé ou invalide dans vos défis.');
                 }
                 if (userChallengeDoc.data().completed === true) {
-                    throw new functions.https.HttpsError('already-exists', 'Ce défi a déjà été validé et récompensé.');
+                    throw new HttpsError('already-exists', 'Ce défi a déjà été validé et récompensé.');
                 }
                 transaction.set(userChallengeRef, {
                     user_id: userId,
@@ -512,13 +558,13 @@ exports.validateTrip = functions.https.onCall(async (data, context) => {
                     const elapsedMs = now.toMillis() - lastTripTime.toMillis();
                     if (elapsedMs < 10 * 60 * 1000) {
                         const remainingSec = Math.ceil((10 * 60 * 1000 - elapsedMs) / 1000);
-                        throw new functions.https.HttpsError('resource-exhausted', `Vous allez trop vite ! Veuillez attendre ${remainingSec}s avant de valider un autre trajet.`);
+                        throw new HttpsError('resource-exhausted', `Vous allez trop vite ! Veuillez attendre ${remainingSec}s avant de valider un autre trajet.`);
                     }
 
                     const elapsedSec = elapsedMs / 1000;
                     if (dbDurationSeconds > elapsedSec + 120) {
                         console.warn(`⚠️ [ANTI-TRICHE SERVEUR] Durée déclarée (${dbDurationSeconds}s) supérieure au temps réel écoulé (${elapsedSec.toFixed(0)}s) pour ${userId}`);
-                        throw new functions.https.HttpsError('permission-denied', `Durée de trajet incohérente avec le temps écoulé réel.`);
+                        throw new HttpsError('permission-denied', `Durée de trajet incohérente avec le temps écoulé réel.`);
                     }
                 }
             }
@@ -589,18 +635,20 @@ exports.validateTrip = functions.https.onCall(async (data, context) => {
 
     } catch (error) {
         console.error("❌ Erreur validateTrip :", error);
-        if (error instanceof functions.https.HttpsError) throw error;
-        throw new functions.https.HttpsError('internal', error.message);
+        if (error instanceof HttpsError) throw error;
+        throw new HttpsError('internal', error.message);
     }
 });
 
 // --- FONCTION 5 : ACHAT DE RÉCOMPENSE / BOUTIQUE SERVEUR ---
-exports.purchaseShopItem = functions.https.onCall(async (data, context) => {
+exports.purchaseShopItem = onCall(async (request) => {
+    const data = request.data;
+    const context = request;
     verifyAppCheck(context);
     console.log("🚀 [START] purchaseShopItem appelée");
 
     if (!context.auth) {
-        throw new functions.https.HttpsError('unauthenticated', 'Non authentifié');
+        throw new HttpsError('unauthenticated', 'Non authentifié');
     }
 
     const userId = context.auth.uid;
@@ -614,7 +662,7 @@ exports.purchaseShopItem = functions.https.onCall(async (data, context) => {
             // 1. Le SERVEUR détermine et vérifie le prix réel de l'objet
             let actualCost = 0;
             if (!itemId) {
-                throw new functions.https.HttpsError('invalid-argument', 'Identifiant de l\'objet (itemId) requis.');
+                throw new HttpsError('invalid-argument', 'Identifiant de l\'objet (itemId) requis.');
             }
 
             const itemRef = admin.firestore().collection('shop_items').doc(itemId);
@@ -627,7 +675,7 @@ exports.purchaseShopItem = functions.https.onCall(async (data, context) => {
                 if (rewardDoc.exists) {
                     actualCost = Math.round(rewardDoc.data().cost_lame || rewardDoc.data().cost || 0);
                 } else {
-                    throw new functions.https.HttpsError('not-found', 'Objet de boutique introuvable dans le catalogue.');
+                    throw new HttpsError('not-found', 'Objet de boutique introuvable dans le catalogue.');
                 }
             }
 
@@ -636,18 +684,18 @@ exports.purchaseShopItem = functions.https.onCall(async (data, context) => {
             }
 
             if (actualCost <= 0) {
-                throw new functions.https.HttpsError('invalid-argument', 'Prix de l\'objet invalide.');
+                throw new HttpsError('invalid-argument', 'Prix de l\'objet invalide.');
             }
 
             // 2. Le SERVEUR vérifie l'utilisateur
             const userDoc = await transaction.get(userRef);
             if (!userDoc.exists) {
-                throw new functions.https.HttpsError('not-found', 'Profil utilisateur introuvable.');
+                throw new HttpsError('not-found', 'Profil utilisateur introuvable.');
             }
 
             const currentBalance = userDoc.data().lame_points || 0;
             if (currentBalance < actualCost) {
-                throw new functions.https.HttpsError('failed-precondition', 'Solde de Lames insuffisant.');
+                throw new HttpsError('failed-precondition', 'Solde de Lames insuffisant.');
             }
 
             const newBalance = currentBalance - actualCost;
@@ -684,18 +732,20 @@ exports.purchaseShopItem = functions.https.onCall(async (data, context) => {
 
     } catch (error) {
         console.error("❌ Erreur purchaseShopItem :", error);
-        if (error instanceof functions.https.HttpsError) throw error;
-        throw new functions.https.HttpsError('internal', error.message);
+        if (error instanceof HttpsError) throw error;
+        throw new HttpsError('internal', error.message);
     }
 });
 
 // --- FONCTION 6 : RÉCOMPENSE QUOTIDIENNE DE CONNEXION SERVEUR ---
-exports.claimDailyReward = functions.https.onCall(async (data, context) => {
+exports.claimDailyReward = onCall(async (request) => {
+    const data = request.data;
+    const context = request;
     verifyAppCheck(context);
     console.log("🚀 [START] claimDailyReward appelée");
 
     if (!context.auth) {
-        throw new functions.https.HttpsError('unauthenticated', 'Utilisateur non authentifié');
+        throw new HttpsError('unauthenticated', 'Utilisateur non authentifié');
     }
 
     const userId = context.auth.uid;
@@ -707,34 +757,49 @@ exports.claimDailyReward = functions.https.onCall(async (data, context) => {
             const userDoc = await transaction.get(userRef);
             const statsDoc = await transaction.get(statsRef);
             if (!userDoc.exists) {
-                throw new functions.https.HttpsError('not-found', 'Profil utilisateur introuvable.');
+                throw new HttpsError('not-found', 'Profil utilisateur introuvable.');
             }
 
             const userData = userDoc.data();
             const statsData = statsDoc.exists ? statsDoc.data() : {};
-            const lastLoginTimestamp = statsData.last_login_date;
-            const now = admin.firestore.Timestamp.now();
+            const lastLoginTimestamp = statsData.last_login_date || userData.last_login_date;
 
-            let consecutiveLogins = statsData.consecutive_logins ?? 0;
+            const now = new Date();
+            // Normalisation à minuit UTC pour comparaison de jours calendaires stricts
+            const todayUtc = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+
+            let consecutiveLogins = statsData.consecutive_logins || userData.consecutive_logins || 0;
+            let updated = false;
 
             if (lastLoginTimestamp) {
-                const elapsedMs = now.toMillis() - lastLoginTimestamp.toMillis();
-                // Cooldown de 24h (86 400 000 ms)
-                if (elapsedMs < 86400000) {
-                    const remainingHours = Math.ceil((86400000 - elapsedMs) / 3600000);
-                    return { updated: false, message: `Récompense déjà récupérée. Revenez dans ${remainingHours}h.` };
-                }
+                const lastDate = lastLoginTimestamp.toDate();
+                const lastUtc = Date.UTC(lastDate.getUTCFullYear(), lastDate.getUTCMonth(), lastDate.getUTCDate());
+                const diffDays = Math.floor((todayUtc - lastUtc) / (1000 * 60 * 60 * 24));
 
-                // Si entre 24h et 48h (172 800 000 ms), la série s'incrémente. Si > 48h, réinitialisation à 1.
-                if (elapsedMs <= 172800000) {
+                if (diffDays === 0) {
+                    // Déjà connecté aujourd'hui
+                    return { 
+                        updated: false, 
+                        consecutiveLogins: consecutiveLogins, 
+                        nextLevelBoost: statsData.next_level_boost || 1.0, 
+                        message: "Récompense déjà validée pour aujourd'hui." 
+                    };
+                } else if (diffDays === 1) {
+                    // Connexion le lendemain : série continue
                     consecutiveLogins += 1;
+                    updated = true;
                 } else {
+                    // Plus d'un jour d'absence : série réinitialisée à 1
                     consecutiveLogins = 1;
+                    updated = true;
                 }
             } else {
+                // Première connexion
                 consecutiveLogins = 1;
+                updated = true;
             }
 
+            // Calcul du multiplicateur de série (palier tous les 5 jours, max +50%)
             const paliersActuels = Math.floor(consecutiveLogins / 5);
             const bonusSerie = Math.min(paliersActuels * 0.1, 0.5);
             const newNextLevelBoost = 1.0 + bonusSerie;
@@ -746,16 +811,15 @@ exports.claimDailyReward = functions.https.onCall(async (data, context) => {
             const userUpdate = {
                 lame_points: currentLame + 1,
                 total_lame_earned: newTotalEarned,
+                consecutive_logins: consecutiveLogins,
+                last_login_date: admin.firestore.FieldValue.serverTimestamp(),
                 updated_at: admin.firestore.FieldValue.serverTimestamp()
             };
 
-            // Promotion automatique statut VIP si Niveau 30+
             checkAndApplyVipStatus(newTotalEarned, userUpdate);
 
-            // Mise à jour du Portefeuille (users)
+            // Mise à jour users & user_stats synchronisée
             transaction.update(userRef, userUpdate);
-
-            // Mise à jour des Stats/Cooldowns (user_stats)
             transaction.set(statsRef, {
                 consecutive_logins: consecutiveLogins,
                 last_login_date: admin.firestore.FieldValue.serverTimestamp(),
@@ -775,24 +839,32 @@ exports.claimDailyReward = functions.https.onCall(async (data, context) => {
                 }
             });
 
-            return { updated: true, consecutiveLogins, nextLevelBoost: newNextLevelBoost, newBalance: currentLame + 1, newTotalEarned: newTotalEarned };
+            return { 
+                updated: true, 
+                consecutiveLogins, 
+                nextLevelBoost: newNextLevelBoost, 
+                newBalance: currentLame + 1, 
+                newTotalEarned: newTotalEarned 
+            };
         });
 
         return { success: true, ...result };
 
     } catch (error) {
         console.error("❌ Erreur claimDailyReward :", error);
-        throw new functions.https.HttpsError('internal', error.message);
+        throw new HttpsError('internal', error.message);
     }
 });
 
 // --- FONCTION 7 : ACHAT DE TICKETS DE LOTERIE (RAFFLE) SERVEUR ---
-exports.purchaseRaffleTicket = functions.https.onCall(async (data, context) => {
+exports.purchaseRaffleTicket = onCall(async (request) => {
+    const data = request.data;
+    const context = request;
     verifyAppCheck(context);
     console.log("🚀 [START] purchaseRaffleTicket appelée");
 
     if (!context.auth) {
-        throw new functions.https.HttpsError('unauthenticated', 'Utilisateur non authentifié');
+        throw new HttpsError('unauthenticated', 'Utilisateur non authentifié');
     }
 
     const userId = context.auth.uid;
@@ -800,7 +872,7 @@ exports.purchaseRaffleTicket = functions.https.onCall(async (data, context) => {
     const ticketCount = Math.round(data.ticketCount || 0);
 
     if (!contestId || ticketCount <= 0) {
-        throw new functions.https.HttpsError('invalid-argument', 'Paramètres d\'achat de ticket invalides.');
+        throw new HttpsError('invalid-argument', 'Paramètres d\'achat de ticket invalides.');
     }
 
     const userRef = admin.firestore().collection('users').doc(userId);
@@ -812,7 +884,7 @@ exports.purchaseRaffleTicket = functions.https.onCall(async (data, context) => {
         const result = await admin.firestore().runTransaction(async (transaction) => {
             const userDoc = await transaction.get(userRef);
             if (!userDoc.exists) {
-                throw new functions.https.HttpsError('not-found', 'Profil utilisateur introuvable.');
+                throw new HttpsError('not-found', 'Profil utilisateur introuvable.');
             }
 
             let contestDoc = await transaction.get(rewardRef);
@@ -825,7 +897,7 @@ exports.purchaseRaffleTicket = functions.https.onCall(async (data, context) => {
                     contestDoc = legacyDoc;
                     contestData = legacyDoc.data();
                 } else {
-                    throw new functions.https.HttpsError('not-found', 'Concours ou loterie introuvable.');
+                    throw new HttpsError('not-found', 'Concours ou loterie introuvable.');
                 }
             }
 
@@ -833,13 +905,13 @@ exports.purchaseRaffleTicket = functions.https.onCall(async (data, context) => {
             const contestStateData = contestStateDoc.exists ? contestStateDoc.data() : {};
 
             if (contestData.status && contestData.status !== 'open') {
-                throw new functions.https.HttpsError('failed-precondition', 'Le concours n\'est pas ouvert.');
+                throw new HttpsError('failed-precondition', 'Le concours n\'est pas ouvert.');
             }
 
             const rawEndDate = contestData.end_date || contestData.details_json?.end_date;
             const endDate = rawEndDate ? (rawEndDate.toDate ? rawEndDate.toDate() : new Date(rawEndDate)) : null;
             if (endDate && new Date() > endDate) {
-                throw new functions.https.HttpsError('failed-precondition', 'Ce concours est terminé.');
+                throw new HttpsError('failed-precondition', 'Ce concours est terminé.');
             }
 
             const ticketCostLame = Math.round(
@@ -853,7 +925,7 @@ exports.purchaseRaffleTicket = functions.https.onCall(async (data, context) => {
 
             const currentLame = userDoc.data().lame_points || 0;
             if (currentLame < totalCost) {
-                throw new functions.https.HttpsError('failed-precondition', `Fonds insuffisants (${currentLame} Lames disponibles, ${totalCost} requises).`);
+                throw new HttpsError('failed-precondition', `Fonds insuffisants (${currentLame} Lames disponibles, ${totalCost} requises).`);
             }
 
             const newBalance = currentLame - totalCost;
@@ -906,18 +978,20 @@ exports.purchaseRaffleTicket = functions.https.onCall(async (data, context) => {
 
     } catch (error) {
         console.error("❌ Erreur purchaseRaffleTicket :", error);
-        if (error instanceof functions.https.HttpsError) throw error;
-        throw new functions.https.HttpsError('internal', error.message);
+        if (error instanceof HttpsError) throw error;
+        throw new HttpsError('internal', error.message);
     }
 });
 
 // --- FONCTION 8 : ENCHÈRES SÉCURISÉES SERVEUR ---
-exports.placeBid = functions.https.onCall(async (data, context) => {
+exports.placeBid = onCall(async (request) => {
+    const data = request.data;
+    const context = request;
     verifyAppCheck(context);
     console.log("🚀 [START] placeBid appelée");
 
     if (!context.auth) {
-        throw new functions.https.HttpsError('unauthenticated', 'Utilisateur non authentifié');
+        throw new HttpsError('unauthenticated', 'Utilisateur non authentifié');
     }
 
     const userId = context.auth.uid;
@@ -925,7 +999,7 @@ exports.placeBid = functions.https.onCall(async (data, context) => {
     const bidAmount = parseFloat(data.bidAmount);
 
     if (!contestId || isNaN(bidAmount) || bidAmount <= 0) {
-        throw new functions.https.HttpsError('invalid-argument', 'Paramètres d\'enchère invalides.');
+        throw new HttpsError('invalid-argument', 'Paramètres d\'enchère invalides.');
     }
 
     const userRef = admin.firestore().collection('users').doc(userId);
@@ -937,7 +1011,7 @@ exports.placeBid = functions.https.onCall(async (data, context) => {
         const result = await admin.firestore().runTransaction(async (transaction) => {
             const userDoc = await transaction.get(userRef);
             if (!userDoc.exists) {
-                throw new functions.https.HttpsError('not-found', 'Profil utilisateur introuvable.');
+                throw new HttpsError('not-found', 'Profil utilisateur introuvable.');
             }
 
             const userStatsDoc = await transaction.get(userStatsRef);
@@ -950,7 +1024,7 @@ exports.placeBid = functions.https.onCall(async (data, context) => {
                 const elapsedMs = now.toMillis() - lastBidTime.toMillis();
                 if (elapsedMs < 3000) {
                     const remainingSec = ((3000 - elapsedMs) / 1000).toFixed(1);
-                    throw new functions.https.HttpsError('resource-exhausted', `Veuillez patienter ${remainingSec}s entre chaque enchère.`);
+                    throw new HttpsError('resource-exhausted', `Veuillez patienter ${remainingSec}s entre chaque enchère.`);
                 }
             }
 
@@ -961,7 +1035,7 @@ exports.placeBid = functions.https.onCall(async (data, context) => {
                 if (legacyDoc.exists) {
                     contestDoc = legacyDoc;
                 } else {
-                    throw new functions.https.HttpsError('not-found', 'Enchère introuvable.');
+                    throw new HttpsError('not-found', 'Enchère introuvable.');
                 }
             }
 
@@ -975,18 +1049,18 @@ exports.placeBid = functions.https.onCall(async (data, context) => {
             const minBid = parseFloat(contestData.min_bid || 10);
 
             if (contestData.status && contestData.status !== 'open') {
-                throw new functions.https.HttpsError('failed-precondition', 'L\'enchère n\'est pas ouverte.');
+                throw new HttpsError('failed-precondition', 'L\'enchère n\'est pas ouverte.');
             }
 
             const rawEndDate = contestData.end_date || contestData.details_json?.end_date;
             const endDate = rawEndDate ? (rawEndDate.toDate ? rawEndDate.toDate() : new Date(rawEndDate)) : null;
             if (endDate && new Date() > endDate) {
-                throw new functions.https.HttpsError('failed-precondition', 'Cette enchère est terminée.');
+                throw new HttpsError('failed-precondition', 'Cette enchère est terminée.');
             }
 
             const minNextBid = currentHighestBid > 0 ? currentHighestBid + 1.0 : minBid;
             if (bidAmount < minNextBid) {
-                throw new functions.https.HttpsError('failed-precondition', `L'enchère doit être d'au moins ${minNextBid} Lames.`);
+                throw new HttpsError('failed-precondition', `L'enchère doit être d'au moins ${minNextBid} Lames.`);
             }
 
             const oldBidderId = contestStateData.highest_bidder_user_id || contestData.highest_bidder_user_id;
@@ -999,7 +1073,7 @@ exports.placeBid = functions.https.onCall(async (data, context) => {
 
             const userLame = userDoc.data().lame_points || 0;
             if (userLame < amountToDeduct) {
-                throw new functions.https.HttpsError('failed-precondition', `Solde de Lames insuffisant (${userLame} disponibles, ${amountToDeduct} requises pour cette surenchère).`);
+                throw new HttpsError('failed-precondition', `Solde de Lames insuffisant (${userLame} disponibles, ${amountToDeduct} requises pour cette surenchère).`);
             }
 
             // Lire l'ancien enchérisseur si nécessaire (toutes les lectures doivent précéder les écritures dans une transaction)
@@ -1076,8 +1150,8 @@ exports.placeBid = functions.https.onCall(async (data, context) => {
 
     } catch (error) {
         console.error("❌ Erreur placeBid :", error);
-        if (error instanceof functions.https.HttpsError) throw error;
-        throw new functions.https.HttpsError('internal', error.message);
+        if (error instanceof HttpsError) throw error;
+        throw new HttpsError('internal', error.message);
     }
 });
 
@@ -1132,10 +1206,12 @@ const chunkArray = (arr, size) => arr.reduce((acc, _, i) => {
     return acc;
 }, []);
 
-exports.deleteUserAccount = functions.https.onCall(async (data, context) => {
+exports.deleteUserAccount = onCall(async (request) => {
+    const data = request.data;
+    const context = request;
     verifyAppCheck(context);
     if (!context.auth) {
-        throw new functions.https.HttpsError('unauthenticated', 'Utilisateur non authentifié');
+        throw new HttpsError('unauthenticated', 'Utilisateur non authentifié');
     }
 
     const userId = context.auth.uid;
@@ -1217,8 +1293,8 @@ exports.deleteUserAccount = functions.https.onCall(async (data, context) => {
         return { success: true };
     } catch (error) {
         console.error("❌ Erreur suppression de compte:", error);
-        if (error instanceof functions.https.HttpsError) throw error;
-        throw new functions.https.HttpsError('internal', error.message);
+        if (error instanceof HttpsError) throw error;
+        throw new HttpsError('internal', error.message);
     }
 });
 
@@ -1227,9 +1303,11 @@ exports.deleteUserAccount = functions.https.onCall(async (data, context) => {
 // ===========================================================================
 
 // --- 1. Regarder une pub générale (Ad Points) ---
-exports.addAdPoint = functions.https.onCall(async (data, context) => {
+exports.addAdPoint = onCall(async (request) => {
+    const data = request.data;
+    const context = request;
     verifyAppCheck(context);
-    if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'Non autorisé');
+    if (!context.auth) throw new HttpsError('unauthenticated', 'Non autorisé');
 
     const userId = context.auth.uid;
     const userRef = admin.firestore().collection('users').doc(userId);
@@ -1238,7 +1316,7 @@ exports.addAdPoint = functions.https.onCall(async (data, context) => {
     return admin.firestore().runTransaction(async (transaction) => {
         const userDoc = await transaction.get(userRef);
         const statsDoc = await transaction.get(statsRef);
-        if (!userDoc.exists) throw new functions.https.HttpsError('not-found', 'Profil introuvable.');
+        if (!userDoc.exists) throw new HttpsError('not-found', 'Profil introuvable.');
 
         const statsData = statsDoc.exists ? statsDoc.data() : {};
         const userData = userDoc.data();
@@ -1248,14 +1326,14 @@ exports.addAdPoint = functions.https.onCall(async (data, context) => {
             const elapsedMs = now.toMillis() - lastAdTime.toMillis();
             if (elapsedMs < 30000) {
                 const remainingSec = Math.ceil((30000 - elapsedMs) / 1000);
-                throw new functions.https.HttpsError('resource-exhausted', `Veuillez patienter ${remainingSec}s avant de regarder une autre publicité.`);
+                throw new HttpsError('resource-exhausted', `Veuillez patienter ${remainingSec}s avant de regarder une autre publicité.`);
             }
         }
 
         const currentPoints = statsData.ad_points ?? 0;
 
         if (currentPoints >= 50) {
-            throw new functions.https.HttpsError('resource-exhausted', 'Max Ad Points atteints.');
+            throw new HttpsError('resource-exhausted', 'Max Ad Points atteints.');
         }
 
         const newPoints = currentPoints + 1;
@@ -1271,12 +1349,14 @@ exports.addAdPoint = functions.https.onCall(async (data, context) => {
 });
 
 // --- 2. Regarder une pub pour un magasin (Boost Cashback) ---
-exports.addStoreBoost = functions.https.onCall(async (data, context) => {
+exports.addStoreBoost = onCall(async (request) => {
+    const data = request.data;
+    const context = request;
     verifyAppCheck(context);
-    if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'Non autorisé');
+    if (!context.auth) throw new HttpsError('unauthenticated', 'Non autorisé');
 
     const storeId = data.storeId;
-    if (!storeId) throw new functions.https.HttpsError('invalid-argument', 'Store ID manquant');
+    if (!storeId) throw new HttpsError('invalid-argument', 'Store ID manquant');
 
     const userId = context.auth.uid;
     const userRef = admin.firestore().collection('users').doc(userId);
@@ -1288,7 +1368,7 @@ exports.addStoreBoost = functions.https.onCall(async (data, context) => {
         const statsDoc = await transaction.get(statsRef);
         const storeDoc = await transaction.get(storeRef);
 
-        if (!userDoc.exists) throw new functions.https.HttpsError('not-found', 'Profil introuvable.');
+        if (!userDoc.exists) throw new HttpsError('not-found', 'Profil introuvable.');
 
         const userData = userDoc.data();
         const statsData = statsDoc.exists ? statsDoc.data() : {};
@@ -1299,7 +1379,7 @@ exports.addStoreBoost = functions.https.onCall(async (data, context) => {
             const elapsedMs = now.toMillis() - lastBoostTime.toMillis();
             if (elapsedMs < 30000) {
                 const remainingSec = Math.ceil((30000 - elapsedMs) / 1000);
-                throw new functions.https.HttpsError('resource-exhausted', `Veuillez patienter ${remainingSec}s entre deux boosts de magasin.`);
+                throw new HttpsError('resource-exhausted', `Veuillez patienter ${remainingSec}s entre deux boosts de magasin.`);
             }
         }
 
@@ -1309,7 +1389,7 @@ exports.addStoreBoost = functions.https.onCall(async (data, context) => {
         const dailyBoosts = statsData[boostDailyKey] || 0;
 
         if (dailyBoosts >= 10) {
-            throw new functions.https.HttpsError('resource-exhausted', 'Limite quotidienne de boosts atteinte pour ce magasin (10 max par jour).');
+            throw new HttpsError('resource-exhausted', 'Limite quotidienne de boosts atteinte pour ce magasin (10 max par jour).');
         }
 
         const isVip = userData.is_vip === true;
@@ -1360,12 +1440,14 @@ exports.addStoreBoost = functions.https.onCall(async (data, context) => {
 });
 
 // --- 3. Dépenser des lames (Dons, Arbres, Virements) ---
-exports.processDonation = functions.https.onCall(async (data, context) => {
+exports.processDonation = onCall(async (request) => {
+    const data = request.data;
+    const context = request;
     verifyAppCheck(context);
-    if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'Non autorisé');
+    if (!context.auth) throw new HttpsError('unauthenticated', 'Non autorisé');
 
-    const { amount, offerId, offerTitle, email, isInstantApproval } = data;
-
+    // NOUVEAU : Récupération du flag d'anonymat
+    const { amount, offerId, offerTitle, email, isInstantApproval, isAnonymous } = data;
     const userId = context.auth.uid;
     const userRef = admin.firestore().collection('users').doc(userId);
     const claimedRef = admin.firestore().collection('user_claimed_offers').doc();
@@ -1373,30 +1455,33 @@ exports.processDonation = functions.https.onCall(async (data, context) => {
     return admin.firestore().runTransaction(async (transaction) => {
         const userDoc = await transaction.get(userRef);
         if (!userDoc.exists) {
-            throw new functions.https.HttpsError('not-found', 'Profil utilisateur introuvable.');
+            throw new HttpsError('not-found', 'Profil utilisateur introuvable.');
         }
 
         let cost = 0;
+        let isCampaign = false;
 
         if (offerId) {
             const rewardRef = admin.firestore().collection('rewards').doc(offerId);
             const rewardDoc = await transaction.get(rewardRef);
             if (!rewardDoc.exists) {
-                throw new functions.https.HttpsError('not-found', 'Offre introuvable dans le catalogue.');
+                throw new HttpsError('not-found', 'Offre introuvable dans le catalogue.');
             }
             const rData = rewardDoc.data();
             const fetchedCost = rData.eco_cost ?? rData.cost_lame ?? rData.cost;
             if (fetchedCost !== undefined && fetchedCost !== null && !isNaN(parseFloat(fetchedCost))) {
                 cost = parseFloat(fetchedCost);
             } else {
-                throw new functions.https.HttpsError('invalid-argument', 'Coût de l\'offre invalide.');
+                throw new HttpsError('invalid-argument', 'Coût de l\'offre invalide.');
             }
 
-            // Si c'est une campagne solidaires (avec details_json), enregistrer le don sur la campagne
+            // Si c'est une campagne solidaire, on met à jour les détails de la campagne
             if (rData.details_json) {
+                isCampaign = true;
                 const currentDetails = rData.details_json || {};
                 const currentAmt = Number(currentDetails.current_amount_eco || 0);
                 const currentDonors = Number(currentDetails.current_donors || 0);
+                
                 currentDetails.current_amount_eco = currentAmt + cost;
                 currentDetails.current_donors = currentDonors + 1;
 
@@ -1404,43 +1489,50 @@ exports.processDonation = functions.https.onCall(async (data, context) => {
                     details_json: currentDetails,
                     updated_at: admin.firestore.FieldValue.serverTimestamp()
                 });
+
+                // NOUVEAU : Enregistrer le don dans la collection campaign_donations pour le classement
+                const donationRef = admin.firestore().collection('campaign_donations').doc();
+                const userData = userDoc.data();
+                transaction.set(donationRef, {
+                    campaign_id: offerId,
+                    user_id: isAnonymous ? 'anonymous' : userId,
+                    username: isAnonymous ? 'Anonyme' : (userData.username || 'Utilisateur'),
+                    amount_eco: cost,
+                    created_at: admin.firestore.FieldValue.serverTimestamp(),
+                });
             }
         } else {
-            // 🚨 FIX 5 : Don libre sans offerId -> contrôle strict des limites (100 min, 5000 max)
             const rawCost = parseFloat(amount);
             if (isNaN(rawCost) || rawCost < 100 || rawCost > 5000) {
-                throw new functions.https.HttpsError('invalid-argument', 'Montant de don libre invalide (minimum 100, maximum 5000 Lames).');
+                throw new HttpsError('invalid-argument', 'Montant de don libre invalide (minimum 100, maximum 5000 Lames).');
             }
             cost = rawCost;
         }
 
         if (isNaN(cost) || cost <= 0) {
-            throw new functions.https.HttpsError('invalid-argument', 'Montant invalide. Triche détectée.');
+            throw new HttpsError('invalid-argument', 'Montant invalide. Triche détectée.');
         }
 
         const currentLame = userDoc.data().lame_points || 0;
-
         if (currentLame < cost) {
-            throw new functions.https.HttpsError('failed-precondition', 'Fonds insuffisants.');
+            throw new HttpsError('failed-precondition', 'Fonds insuffisants.');
         }
 
-        // Déduction des points
         transaction.update(userRef, {
             lame_points: admin.firestore.FieldValue.increment(-cost),
             updated_at: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        // Enregistrement de la demande
         transaction.set(claimedRef, {
             user_id: userId,
             user_email_contact: email || 'inconnu',
             reward_id: offerId || 'donation',
+            is_anonymous: isAnonymous || false, // NOUVEAU
             details: { claimed_for_lame: cost, offer_title: offerTitle || 'Offre / Don' },
             claimed_at: admin.firestore.FieldValue.serverTimestamp(),
             status: isInstantApproval ? 'approved' : 'pending',
         });
 
-        // Historique
         const historyRef = userRef.collection('lame_history').doc();
         transaction.set(historyRef, {
             amount: -cost,
@@ -1514,20 +1606,22 @@ function calculateDecayedBoost(initialAmount, lastUpdateTimestamp, isVip) {
 }
 
 // --- 4. Valider un Ticket de Caisse et Calculer le Cashback ---
-exports.claimCashback = functions.https.onCall(async (data, context) => {
+exports.claimCashback = onCall(async (request) => {
+    const data = request.data;
+    const context = request;
     verifyAppCheck(context);
-    if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'Non autorisé');
+    if (!context.auth) throw new HttpsError('unauthenticated', 'Non autorisé');
 
     const { storeId, receiptToken, rawText } = data;
     const userId = context.auth.uid;
 
     if (!storeId) {
-        throw new functions.https.HttpsError('invalid-argument', 'Store ID manquant.');
+        throw new HttpsError('invalid-argument', 'Store ID manquant.');
     }
 
     // 🚨 FIX 2 : Exiger le jeton de validation OCR éphémère émis par Document AI / Gemini
     if (!receiptToken) {
-        throw new functions.https.HttpsError('invalid-argument', 'Jeton de validation OCR manquant. Veuillez d\'abord scanner votre reçu.');
+        throw new HttpsError('invalid-argument', 'Jeton de validation OCR manquant. Veuillez d\'abord scanner votre reçu.');
     }
 
     const userRef = admin.firestore().collection('users').doc(userId);
@@ -1542,20 +1636,20 @@ exports.claimCashback = functions.https.onCall(async (data, context) => {
         // 🚨 FIX 2 : Vérification atomique du jeton OCR
         const ocrDoc = await transaction.get(ocrRef);
         if (!ocrDoc.exists) {
-            throw new functions.https.HttpsError('not-found', 'Jeton de validation du reçu introuvable ou expiré.');
+            throw new HttpsError('not-found', 'Jeton de validation du reçu introuvable ou expiré.');
         }
         const ocrData = ocrDoc.data();
 
         if (ocrData.user_id !== userId) {
-            throw new functions.https.HttpsError('permission-denied', 'Ce jeton de validation ne correspond pas à votre compte.');
+            throw new HttpsError('permission-denied', 'Ce jeton de validation ne correspond pas à votre compte.');
         }
 
         if (ocrData.used === true) {
-            throw new functions.https.HttpsError('already-exists', 'Ce reçu a déjà été réclamé.');
+            throw new HttpsError('already-exists', 'Ce reçu a déjà été réclamé.');
         }
 
         if (ocrData.expires_at && ocrData.expires_at.toMillis() < Date.now()) {
-            throw new functions.https.HttpsError('deadline-exceeded', 'Le jeton de validation du reçu a expiré (limite de 5 minutes).');
+            throw new HttpsError('deadline-exceeded', 'Le jeton de validation du reçu a expiré (limite de 5 minutes).');
         }
 
         const validText = (ocrData.extracted_text || rawText || '').trim();
@@ -1579,7 +1673,7 @@ exports.claimCashback = functions.https.onCall(async (data, context) => {
         }
 
         if (!extractedAmount || extractedAmount <= 0) {
-            throw new functions.https.HttpsError('invalid-argument', 'Impossible de vérifier le montant total sur le ticket certifié.');
+            throw new HttpsError('invalid-argument', 'Impossible de vérifier le montant total sur le ticket certifié.');
         }
         let amount = Math.min(extractedAmount, 100.0); // Plafond anti-triche 100€
 
@@ -1588,7 +1682,7 @@ exports.claimCashback = functions.https.onCall(async (data, context) => {
         const claimRef = admin.firestore().collection('cashback_claims').doc(receiptHash);
         const claimDoc = await transaction.get(claimRef);
         if (claimDoc.exists) {
-            throw new functions.https.HttpsError('already-exists', 'Ce ticket de caisse a déjà été scanné et validé.');
+            throw new HttpsError('already-exists', 'Ce ticket de caisse a déjà été scanné et validé.');
         }
 
         const userDoc = await transaction.get(userRef);
@@ -1596,7 +1690,7 @@ exports.claimCashback = functions.https.onCall(async (data, context) => {
         const storeDoc = await transaction.get(storeRef);
 
         if (!userDoc.exists || !storeDoc.exists) {
-            throw new functions.https.HttpsError('not-found', 'Utilisateur ou magasin introuvable.');
+            throw new HttpsError('not-found', 'Utilisateur ou magasin introuvable.');
         }
 
         const userData = userDoc.data();
@@ -1815,4 +1909,291 @@ exports.cleanupOldLogs = onSchedule('every 24 hours', async (event) => {
     }
     console.log(`✅ [CLEANUP] Nettoyage terminé. ${totalDeleted} documents anciens supprimés.`);
     return null;
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// 🛒 FONCTION 1 : CRÉER UN ARTICLE DE BOUTIQUE (Shop Item) - ADMIN ONLY
+// ════════════════════════════════════════════════════════════════════════════
+exports.createShopItem = onCall(async (request) => {
+    const data = request.data;
+    const context = request;
+    
+    verifyAdmin(context);
+
+    const { name, cost_lame, type, icon } = data;
+
+    // Validation des données
+    if (!name || typeof cost_lame !== 'number' || cost_lame <= 0 || !type || !icon) {
+        throw new HttpsError('invalid-argument', 'Données invalides. Champs requis : name, cost_lame (nombre > 0), type, icon.');
+    }
+
+    try {
+        const newItemRef = admin.firestore().collection('shop_items').doc();
+        const newItemData = {
+            name: name,
+            cost_lame: cost_lame,
+            type: type, // ex: 'Boost', 'Badge', 'Cashback'
+            icon: icon, // ex: 'card_giftcard', 'account_balance_wallet'
+            created_at: admin.firestore.FieldValue.serverTimestamp(),
+            updated_at: admin.firestore.FieldValue.serverTimestamp()
+        };
+
+        await newItemRef.set(newItemData);
+
+        console.log(`✅ Article de boutique créé avec succès : ${newItemRef.id}`);
+        return { 
+            success: true, 
+            itemId: newItemRef.id, 
+            message: 'Article ajouté à la boutique avec succès.' 
+        };
+    } catch (error) {
+        console.error("❌ Erreur lors de la création de l'article :", error);
+        throw new HttpsError('internal', 'Erreur interne lors de la création de l\'article.');
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// 🎁 FONCTION 2 : CRÉER UNE OFFRE DE RÉCOMPENSE (Reward Offer) - ADMIN ONLY
+// ════════════════════════════════════════════════════════════════════════════
+exports.createRewardOffer = onCall(async (request) => {
+    const data = request.data;
+    const context = request;
+    
+    verifyAdmin(context);
+
+    const { 
+        title, 
+        description, 
+        offer_type, 
+        eco_cost, 
+        brand_name, 
+        is_active = true,
+        details_json = {},
+        sort_order = 0
+    } = data;
+
+    // Validation des données
+    if (!title || !offer_type || typeof eco_cost !== 'number' || eco_cost < 0) {
+        throw new HttpsError('invalid-argument', 'Données invalides. Champs requis : title, offer_type, eco_cost (nombre >= 0).');
+    }
+
+    try {
+        const newOfferRef = admin.firestore().collection('rewards').doc();
+        const newOfferData = {
+            title: title,
+            description: description || '',
+            offer_type: offer_type, // ex: 'freeOffer', 'promoCode', 'transfer', 'contest', 'campaignDonation'
+            eco_cost: eco_cost,
+            brand_name: brand_name || 'EcoNav',
+            is_active: is_active,
+            details_json: details_json, // Pour stocker des infos supplémentaires (ex: code promo, lien, etc.)
+            sort_order: sort_order,
+            created_at: admin.firestore.FieldValue.serverTimestamp(),
+            updated_at: admin.firestore.FieldValue.serverTimestamp()
+        };
+
+        await newOfferRef.set(newOfferData);
+
+        console.log(`✅ Offre de récompense créée avec succès : ${newOfferRef.id}`);
+        return { 
+            success: true, 
+            offerId: newOfferRef.id, 
+            message: 'Offre ajoutée au catalogue de récompenses avec succès.' 
+        };
+    } catch (error) {
+        console.error("❌ Erreur lors de la création de l'offre :", error);
+        throw new HttpsError('internal', 'Erreur interne lors de la création de l\'offre.');
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// 🌱 FONCTION AUTOMATIQUE D'INITIALISATION DE CATALOGUE (SEED)
+// ════════════════════════════════════════════════════════════════════════════
+exports.seedInitialOffers = onCall(async (request) => {
+    const context = request;
+    verifyAdmin(context);
+
+    const shopItems = [
+        {
+            name: "Multiplicateur de Lames x1.5 (24h)",
+            cost_lame: 300,
+            type: "Boost",
+            icon: "bolt",
+            description: "Multiplie vos gains de Lames par 1.5 sur tous vos trajets pendant 24h."
+        },
+        {
+            name: "Multiplicateur de Lames x2.0 (24h)",
+            cost_lame: 600,
+            type: "Boost",
+            icon: "flash_on",
+            description: "Double tous vos gains de Lames pendant 24h."
+        },
+        {
+            name: "Badge Exclusif Éco-Guerrier",
+            cost_lame: 1000,
+            type: "Badge",
+            icon: "military_tech",
+            description: "Débloque le badge spécial Éco-Guerrier sur votre profil."
+        },
+        {
+            name: "Pass Premium VIP (7 Jours)",
+            cost_lame: 2500,
+            type: "VIP",
+            icon: "workspace_premium",
+            description: "Profitez de tous les avantages VIP pendant 7 jours."
+        },
+        {
+            name: "Pack Rechargement 500 Lames",
+            cost_lame: 400,
+            type: "Reward",
+            icon: "stars",
+            description: "Bonus instantané de 500 Lames."
+        }
+    ];
+
+    const rewardOffers = [
+        {
+            title: "Bon de réduction 5€ Biocoop",
+            description: "Valable dès 25€ d'achat dans tous les magasins Biocoop.",
+            brand_name: "Biocoop",
+            offer_type: "promoCode",
+            eco_cost: 1500,
+            is_active: true,
+            sort_order: 1,
+            details_json: { code: "BIOCOOP-ECO5" }
+        },
+        {
+            title: "Carte Cadeau 10€ Decathlon",
+            description: "E-carte cadeau valable sur tout le site decathlon.fr ou en magasin.",
+            brand_name: "Decathlon",
+            offer_type: "freeOffer",
+            eco_cost: 3000,
+            is_active: true,
+            sort_order: 2,
+            details_json: { code: "DECATH-10EUR-7892" }
+        },
+        {
+            title: "Don 5€ - Plantation de 2 arbres",
+            description: "Financez la plantation de 2 arbres en forêt française avec Reforest'Action.",
+            brand_name: "Reforest'Action",
+            offer_type: "campaignDonation",
+            eco_cost: 1000,
+            is_active: true,
+            sort_order: 3,
+            details_json: { partner: "Reforest'Action" }
+        },
+        {
+            title: "15% de réduction Nature & Découvertes",
+            description: "Remise immédiate en caisse sur vos achats hors promotions.",
+            brand_name: "Nature & Découvertes",
+            offer_type: "promoCode",
+            eco_cost: 2000,
+            is_active: true,
+            sort_order: 4,
+            details_json: { code: "NATURE-ECO15" }
+        },
+        {
+            title: "Tirage au sort : VTT Électrique",
+            description: "Achetez des tickets de tombola et tentez de remporter ce VTT Électrique !",
+            brand_name: "Grand Tirage EcoNav",
+            offer_type: "contest",
+            eco_cost: 500,
+            is_active: true,
+            sort_order: 5,
+            details_json: {
+                type: "raffle",
+                product_name: "VTT Électrique Performance",
+                product_image_url: "https://i.imgur.com/gO0A3vT.png",
+                ticket_cost_eco: 500,
+                total_tickets_sold: 120,
+                end_date: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()
+            }
+        },
+        {
+            title: "Tirage au sort : Console PS5 Slim",
+            description: "Tirage au sort exclusif pour gagner une console PS5 Slim 1To !",
+            brand_name: "Grand Tirage EcoNav",
+            offer_type: "contest",
+            eco_cost: 200,
+            is_active: true,
+            sort_order: 6,
+            details_json: {
+                type: "raffle",
+                product_name: "Console PS5 Slim 1To",
+                product_image_url: "https://i.imgur.com/gO0A3vT.png",
+                ticket_cost_eco: 200,
+                total_tickets_sold: 450,
+                end_date: new Date(Date.now() + 15 * 24 * 60 * 60 * 1000).toISOString()
+            }
+        },
+        {
+            title: "Enchère : Apple Watch Series 9",
+            description: "Misez vos Lames et remportez la montre connectée Apple Watch Series 9 !",
+            brand_name: "Enchères Exclusives",
+            offer_type: "contest",
+            eco_cost: 100,
+            is_active: true,
+            sort_order: 7,
+            details_json: {
+                type: "auction",
+                product_name: "Apple Watch Series 9",
+                product_image_url: "https://i.imgur.com/gO0A3vT.png",
+                min_bid: 100,
+                current_highest_bid: 1250,
+                end_date: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+                contest_id_ref: "CONTEST_AUCTION_AW9"
+            }
+        }
+    ];
+
+    try {
+        const batch = admin.firestore().batch();
+
+        for (const item of shopItems) {
+            const ref = admin.firestore().collection('shop_items').doc();
+            batch.set(ref, {
+                ...item,
+                created_at: admin.firestore.FieldValue.serverTimestamp(),
+                updated_at: admin.firestore.FieldValue.serverTimestamp()
+            });
+        }
+
+        for (const offer of rewardOffers) {
+            const ref = admin.firestore().collection('rewards').doc();
+            batch.set(ref, {
+                ...offer,
+                created_at: admin.firestore.FieldValue.serverTimestamp(),
+                updated_at: admin.firestore.FieldValue.serverTimestamp()
+            });
+        }
+
+        // Créer les documents pour l'enchère dans `contests` et `contest_state`
+        const auctionRef = admin.firestore().collection('contests').doc("CONTEST_AUCTION_AW9");
+        batch.set(auctionRef, {
+            product_name: "Apple Watch Series 9",
+            product_image_url: "https://i.imgur.com/gO0A3vT.png",
+            description: "Misez vos Lames et remportez la montre connectée Apple Watch Series 9 !",
+            min_bid: 100,
+            current_highest_bid: 1250,
+            is_active: true,
+            end_date: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+            created_at: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+
+        const auctionStateRef = admin.firestore().collection('contest_state').doc("CONTEST_AUCTION_AW9");
+        batch.set(auctionStateRef, {
+            current_highest_bid: 1250,
+            highest_bid: 1250,
+            highest_bidder_user_id: null,
+            total_bids: 5,
+            updated_at: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+
+        await batch.commit();
+        console.log("✅ Catalogue initial généré avec succès !");
+        return { success: true, message: "Catalogue initial d'offres, d'articles et d'enchères généré avec succès !" };
+    } catch (error) {
+        console.error("❌ Erreur lors de la génération du catalogue :", error);
+        throw new HttpsError('internal', 'Erreur lors de la création du catalogue initial.');
+    }
 });

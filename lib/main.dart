@@ -1521,6 +1521,26 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
           }
         }
 
+        // ══════════════════════════════════════════════════════════════
+        // 🔧 CORRECTION ANTI-TREMBLEMENT DANS LES VIRAGES
+        // ══════════════════════════════════════════════════════════════
+        // Le _arrowTrail met du temps à se mettre à jour dans les virages serrés,
+        // ce qui crée un cap "moyen" entre l'ancienne et la nouvelle rue -> la flèche tremble.
+        // On compare le cap du trail avec le cap réel de l'itinéraire (route).
+        // Si l'écart est > 30°, on force l'utilisation du cap de l'itinéraire.
+        double? stableRouteBearing = _stableRouteBearing(predictedPos);
+        if (stableRouteBearing != null && bearingFromPath) {
+          double diffTrailVsRoute =
+              (targetBearing - stableRouteBearing + 540) % 360 - 180;
+          if (diffTrailVsRoute.abs() > 30.0) {
+            // Le trail est corrompu par le virage, on suit la route immédiatement
+            targetBearing = stableRouteBearing;
+          }
+        } else if (!bearingFromPath && stableRouteBearing != null) {
+          targetBearing = stableRouteBearing;
+          bearingFromPath = true;
+        }
+
         // Repli GPS brut -> cible, UNIQUEMENT en mouvement.
         // À l'arrêt, le cap GPS brut est beaucoup trop bruité.
         if (!bearingFromPath && !freezeHeading) {
@@ -1795,8 +1815,12 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
       double d = Geolocator.distanceBetween(
           gpsPos.latitude, gpsPos.longitude, proj.latitude, proj.longitude);
 
-      // Pénalité Continue d'Angle (Empêche l'aimant de coller sur des routes perpendiculaires)
-      if (headingGps != null) {
+      // 🔧 CORRECTION ANTI-BLOCAGE VIRAGE :
+      // On n'applique la pénalité d'angle QUE si on n'est pas déjà très proche de la route.
+      // Dans un virage serré, le cap GPS/Trail n'a pas encore eu le temps de se mettre à jour
+      // et pointe encore vers l'ancienne rue. Si on pénalise, l'algo rejette le nouveau segment
+      // et la flèche reste bloquée dans le virage.
+      if (headingGps != null && d > 12.0) {
         double segmentBearing = Geolocator.bearingBetween(
             p1.latitude, p1.longitude, p2.latitude, p2.longitude);
         if (segmentBearing < 0) segmentBearing += 360;
@@ -1804,9 +1828,9 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
         double diff = (segmentBearing - headingGps).abs();
         if (diff > 180) diff = 360 - diff;
 
-        // Courbe Cosinus fluide pour la pénalité (0m si aligné, 100m si contre-sens)
+        // Réduction de la pénalité max (35m au lieu de 100m) pour éviter les sauts
         double diffRad = diff * (math.pi / 180.0);
-        double penalty = 100.0 * ((1.0 - math.cos(diffRad)) / 2.0);
+        double penalty = 35.0 * ((1.0 - math.cos(diffRad)) / 2.0);
         d += penalty;
       }
 
@@ -4362,25 +4386,23 @@ class NavigationController extends GetxController {
   }
 
   void _checkRouteLogic(LatLng raw, LatLng snapped) {
-    // CORRIGÉ : on utilise la position "snapped" (filtrée/projetée sur la
-    // route) plutôt que la position GPS brute pour détecter l'arrivée. Un
-    // fix brut aberrant (précision dégradée en ville, tunnel, etc.) pouvait
-    // tomber par hasard à moins de 40m de la destination et déclencher une
-    // arrivée prématurée. On ajoute aussi un filtre de précision GPS,
-    // cohérent avec le filtre qualité déjà utilisé dans le moteur de
-    // prédiction (predictNextPosition).
     final kf = homeController.kinematicFilter;
+
+    // 🔧 CORRECTION : Utiliser la position lissée (bleue) et non la position snappée brute
+    final LatLng checkPos = kf.simulatedPos ?? snapped;
+
     final double maxAccuracy =
         kf.isWalking ? kf.maxAccuracyWalking : kf.maxAccuracyVehicle;
     if (kf.lastRawAccuracy > maxAccuracy) return;
 
     double distDest = Geolocator.distanceBetween(
-        snapped.latitude,
-        snapped.longitude,
+        checkPos.latitude,
+        checkPos.longitude,
         homeController.destinationCoordinates.latitude,
         homeController.destinationCoordinates.longitude);
 
-    if (distDest < 40 && !homeController.arrived.value) {
+    // Seuil d'arrivée à 35m pour être sûr que la flèche bleue est bien sur la destination
+    if (distDest < 35.0 && !homeController.arrived.value) {
       homeController.arrived.value = true;
       _finishTripWithRecap();
     }
@@ -8208,7 +8230,7 @@ class EcoNavApp extends StatelessWidget {
           foregroundColor: textDark,
           titleTextStyle: TextStyle(
               fontSize: 20, fontWeight: FontWeight.bold, color: textDark),
-          centerTitle: true,
+          centerTitle: false,
         ),
         bottomNavigationBarTheme: const BottomNavigationBarThemeData(
             selectedItemColor: primaryGreen,
@@ -9759,8 +9781,14 @@ class _MainScreenControllerState extends State<MainScreenController>
       await userChallengeDocRef.set(userChallengeData, SetOptions(merge: true));
 
       if (challenge.status == ChallengeStatus.rewardClaimed) {
-        _addLame(rewardAmount,
-            source: "Défi: ${challenge.title}", challengeId: challenge.id);
+        final bool isSuperDefiBonus = challenge.title.contains("BONUS FINAL");
+
+        _addLame(
+          rewardAmount,
+          source: "Défi: ${challenge.title}",
+          challengeId: isSuperDefiBonus ? null : challenge.id,
+          isSpecialBonus: isSuperDefiBonus,
+        );
       }
       if (mounted) setState(() {});
     } catch (e) {
@@ -9825,6 +9853,8 @@ class _MainScreenControllerState extends State<MainScreenController>
       appBar: _currentIndex == 0
           ? PreferredSize(preferredSize: Size.zero, child: Container())
           : AppBar(
+              centerTitle: false,
+              titleSpacing: 16.0,
               title: Text(screenTitles[_currentIndex]),
               actions: [
                 Padding(
@@ -11166,8 +11196,11 @@ class _DefisScreenState extends State<DefisScreen> {
             'last_all_challenges_bonus_date': FieldValue.serverTimestamp()
           }, SetOptions(merge: true));
 
+          final totalCount = _localPoiChallenges.length;
           await widget.onUpdateUserChallenge(
-              challenge.copyWith(title: "BONUS FINAL : 10/10 Défis"), 5000);
+              challenge.copyWith(
+                  title: "BONUS FINAL : $totalCount/$totalCount Défis"),
+              5000);
 
           Future.delayed(const Duration(milliseconds: 500), () {
             _showSnackBar(
@@ -11501,7 +11534,7 @@ class _DefisScreenState extends State<DefisScreen> {
                                                           FontWeight.bold,
                                                       color: Colors.purple)),
                                               Text(
-                                                  "Finissez les 10 défis pour le bonus !",
+                                                  "Finissez les $totalPoi défis pour le bonus !",
                                                   style: TextStyle(
                                                       fontSize: 12,
                                                       color: Colors
@@ -13958,23 +13991,17 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
 
   bool _canCollectTodayReward() {
     final profile = widget.userProfile;
-    if (profile.lastLoginDate == null) return false;
+    if (profile.lastLoginDate == null) return true;
 
-    DateTime now = DateTime.now();
-    DateTime today = DateTime(now.year, now.month, now.day);
-    DateTime lastLoginDay = DateTime(
-        profile.lastLoginDate!.toDate().year,
-        profile.lastLoginDate!.toDate().month,
-        profile.lastLoginDate!.toDate().day);
+    // Utilisation de UTC pour correspondre exactement à la logique du serveur Firebase
+    final now = DateTime.now().toUtc();
+    final lastLogin = profile.lastLoginDate!.toDate().toUtc();
 
-    if (!DateUtils.isSameDay(lastLoginDay, today)) return false;
-    if (profile.lastDailyRewardCollectedDate == null) return true;
+    final isSameDay = now.year == lastLogin.year &&
+        now.month == lastLogin.month &&
+        now.day == lastLogin.day;
 
-    DateTime lastCollectionDay = DateTime(
-        profile.lastDailyRewardCollectedDate!.toDate().year,
-        profile.lastDailyRewardCollectedDate!.toDate().month,
-        profile.lastDailyRewardCollectedDate!.toDate().day);
-    return lastCollectionDay.isBefore(today);
+    return !isSameDay;
   }
 
   // --- POPUPS DETAILS ---
@@ -14706,22 +14733,48 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
                                       final callable = FirebaseFunctions
                                           .instance
                                           .httpsCallable('claimDailyReward');
-                                      await callable.call();
+                                      final result = await callable.call();
+                                      final data = result.data != null
+                                          ? Map<String, dynamic>.from(
+                                              result.data as Map)
+                                          : null;
 
-                                      widget.onProfileModified();
-                                      setDialogState(() {
-                                        _isClaimingReward = false;
-                                      });
-                                      _showSnackBar(
-                                          "Récompense récupérée (+1 Lame)!",
-                                          backgroundColor: primaryGreen);
+                                      if (data != null &&
+                                          data['updated'] == true) {
+                                        // ✅ Succès : on met à jour le profil et on affiche le message
+                                        await widget.onProfileModified();
+                                        if (mounted) {
+                                          setDialogState(() {
+                                            _isClaimingReward = false;
+                                          });
+                                          _showSnackBar(
+                                              "Récompense récupérée (+1 Lame)!",
+                                              backgroundColor: primaryGreen);
+                                        }
+                                      } else {
+                                        // ⚠️ Le serveur indique que c'est déjà fait.
+                                        // On met à jour le profil pour synchroniser la date et désactiver le bouton correctement.
+                                        await widget.onProfileModified();
+                                        if (mounted) {
+                                          setDialogState(() {
+                                            _isClaimingReward = false;
+                                            _hasClaimedLocally =
+                                                false; // On laisse _canCollectTodayReward() gérer l'état
+                                          });
+                                          _showSnackBar(
+                                              "Récompense déjà récupérée aujourd'hui.",
+                                              backgroundColor: Colors.orange);
+                                        }
+                                      }
                                     } catch (e) {
-                                      setDialogState(() {
-                                        _isClaimingReward = false;
-                                        _hasClaimedLocally = false;
-                                      });
-                                      _showSnackBar("Erreur: ${e.toString()}",
-                                          backgroundColor: Colors.red);
+                                      if (mounted) {
+                                        setDialogState(() {
+                                          _isClaimingReward = false;
+                                          _hasClaimedLocally = false;
+                                        });
+                                        _showSnackBar("Erreur: ${e.toString()}",
+                                            backgroundColor: Colors.red);
+                                      }
                                     }
                                   }
                                 : null,
@@ -18936,28 +18989,25 @@ class _StoreCardState extends State<StoreCard> {
     }
   }
 
-  /// Vérification finale du reçu (simplifiée - le LLM a déjà fait le gros du travail)
+  /// Vérification finale du reçu (simplifiée - le gros du travail est fait par le serveur)
   Future<Map<String, dynamic>> _verifyReceiptWithGemini(
       String rawText, bool serverValid, String serverReason,
       {double? extractedAmount, String? storeNameFound}) async {
-    // Si le LLM a déjà rejeté, on rejette
+    // Si le LLM serveur a déjà rejeté, on rejette en affichant SA raison explicite
     if (!serverValid) {
       return {
         'valid': false,
         'reason': serverReason.isNotEmpty
-            ? '❌ Ticket invalide: $serverReason'
-            : '❌ Ticket jugé non valide par l\'analyse IA.'
+            ? serverReason
+            : 'Le ticket ne correspond pas aux critères de validation (magasin, authenticité ou montant manquant).'
       };
     }
 
-    // Vérification locale supplémentaire : cohérence du nom de magasin
+    // Vérification locale supplémentaire : cohérence du nom de magasin (tolérance)
     final storeName = widget.store.name.toLowerCase();
     final foundName = (storeNameFound ?? '').toLowerCase();
 
-    if (foundName.isNotEmpty &&
-        !storeName.contains(foundName.split(' ').first) &&
-        !foundName.contains(storeName.split(' ').first)) {
-      // Tolérance : si les premiers mots correspondent, c'est OK
+    if (foundName.isNotEmpty && foundName != 'inconnu') {
       final storeWords = storeName
           .split(RegExp(r'[\s\-]+'))
           .where((w) => w.length > 3)
@@ -18975,25 +19025,25 @@ class _StoreCardState extends State<StoreCard> {
         }
       }
 
+      // Si aucun mot en commun ET que le nom du magasin n'est pas du tout dans le texte brut
       if (!hasCommonWord &&
-          rawText.toLowerCase().contains(storeName.split(' ').first) == false) {
+          !rawText.toLowerCase().contains(storeName.split(' ').first)) {
         return {
           'valid': false,
           'reason':
-              '❌ Le nom du magasin sur le ticket ne correspond pas à "${widget.store.name}".'
+              '❌ Le nom du magasin sur le ticket ("$foundName") ne correspond pas à "${widget.store.name}".',
         };
       }
     }
 
     // Vérification du montant extrait
     if (extractedAmount == null || extractedAmount <= 0) {
-      // Essayer d'extraire le montant du texte brut en fallback
       final parsedAmount = _parseReceiptAmount(rawText);
       if (parsedAmount == null) {
         return {
           'valid': false,
           'reason':
-              '❌ Impossible de lire le montant total sur le ticket. Veuillez reprendre une photo plus nette.'
+              '❌ Impossible de lire le montant total sur le ticket. Veuillez reprendre une photo où le "Total" est bien visible.',
         };
       }
     }
@@ -19001,23 +19051,76 @@ class _StoreCardState extends State<StoreCard> {
     return {'valid': true, 'reason': ''};
   }
 
+  /// Popup de refus robuste et explicite
   void _showReceiptRejectedDialog(String reason) {
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
         title: const Row(children: [
-          Icon(Icons.error_outline, color: Colors.red),
+          Icon(Icons.error_outline, color: Colors.red, size: 28),
           SizedBox(width: 8),
-          Text("Ticket invalide"),
+          Expanded(
+              child:
+                  Text("Ticket refusé", style: TextStyle(color: Colors.red))),
         ]),
-        content: Text(reason),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                "L'analyse IA a détecté un problème avec ce document :",
+                style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 8),
+              // Mise en évidence de la raison explicite de l'IA
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.red.shade50,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.red.shade200),
+                ),
+                child: Text(
+                  reason,
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: Colors.red.shade900,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              const Text(
+                "💡 Conseils pour réussir votre scan :",
+                style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 6),
+              const Text(
+                "• Assurez-vous que le nom du magasin est bien visible en haut du ticket.\n"
+                "• Le ticket doit être un original (pas de capture d'écran d'un autre téléphone).\n"
+                "• Le montant total (TTC) et la date doivent être parfaitement lisibles.\n"
+                "• Prenez la photo à plat, dans un endroit bien éclairé, sans reflets.",
+                style:
+                    TextStyle(fontSize: 12, color: Colors.black87, height: 1.4),
+              ),
+            ],
+          ),
+        ),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(ctx), child: const Text("Fermer")),
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text("Annuler"),
+          ),
           ElevatedButton.icon(
             icon: const Icon(Icons.camera_alt),
             label: const Text("Réessayer"),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: primaryGreen,
+              foregroundColor: Colors.white,
+            ),
             onPressed: () {
               Navigator.pop(ctx);
               _startReceiptScan();
@@ -23678,10 +23781,14 @@ class CampaignDetailPage extends StatefulWidget {
 }
 
 class _CampaignDetailPageState extends State<CampaignDetailPage> {
-  late int currentAmount;
-  late int targetAmount;
-  late int donors;
-  late double progress;
+  // CORRECTION : Initialisation immédiate pour éviter le LateInitializationError
+  int currentAmount = 0;
+  int targetAmount = 1;
+  int donors = 0;
+  double progress = 0.0;
+
+  // NOUVEAU : État pour le don anonyme
+  bool _isAnonymous = false;
 
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   final FirebaseAuth _firebaseAuth = FirebaseAuth.instance;
@@ -23784,29 +23891,121 @@ class _CampaignDetailPageState extends State<CampaignDetailPage> {
                     Icon(Icons.eco, color: Theme.of(context).primaryColor),
               ),
             ),
+            const SizedBox(height: 16),
+            // --- TOGGLE DON ANONYME ---
+            Row(
+              children: [
+                Checkbox(
+                  value: _isAnonymous,
+                  onChanged: (bool? value) {
+                    setState(() {
+                      _isAnonymous = value ?? false;
+                    });
+                  },
+                  activeColor: Theme.of(context).primaryColor,
+                ),
+                const Expanded(
+                  child: Text(
+                    "Faire un don anonyme (votre nom n'apparaîtra pas dans le classement)",
+                    style: TextStyle(fontSize: 14, color: Colors.grey),
+                  ),
+                ),
+              ],
+            ),
             const SizedBox(height: 24),
+            // --- CLASSEMENT DES TOP DONATEURS ---
+            const Text("Top Donateurs",
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+            SizedBox(
+              height: 200,
+              child: StreamBuilder<QuerySnapshot>(
+                stream: _firestore
+                    .collection('campaign_donations')
+                    .where('campaign_id', isEqualTo: widget.offer.id)
+                    .orderBy('amount_eco', descending: true)
+                    .limit(10)
+                    .snapshots(),
+                builder: (context, snapshot) {
+                  if (snapshot.connectionState == ConnectionState.waiting) {
+                    return const Center(child: CircularProgressIndicator());
+                  }
+                  if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
+                    return const Center(
+                      child: Text(
+                          "Aucun don pour le moment. Soyez le premier !",
+                          style: TextStyle(color: Colors.grey)),
+                    );
+                  }
+                  final docs = snapshot.data!.docs;
+                  return ListView.separated(
+                    itemCount: docs.length,
+                    separatorBuilder: (_, __) => const Divider(height: 1),
+                    itemBuilder: (context, index) {
+                      final data = docs[index].data() as Map<String, dynamic>;
+                      final amount =
+                          (data['amount_eco'] as num?)?.toDouble() ?? 0.0;
+                      final username = data['username'] ?? 'Anonyme';
+                      final isAnon = data['user_id'] == 'anonymous';
+
+                      return ListTile(
+                        dense: true,
+                        leading: CircleAvatar(
+                          backgroundColor: isAnon
+                              ? Colors.grey.shade300
+                              : Colors.green.shade100,
+                          child: Icon(isAnon ? Icons.visibility_off : Icons.eco,
+                              color: isAnon ? Colors.grey : Colors.green),
+                        ),
+                        title: Text(
+                          username,
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            color: isAnon ? Colors.grey : Colors.black87,
+                          ),
+                        ),
+                        trailing: Text(
+                          "${amount.toInt()} L",
+                          style: const TextStyle(
+                            fontWeight: FontWeight.bold,
+                            color: Colors.green,
+                            fontSize: 16,
+                          ),
+                        ),
+                      );
+                    },
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 16),
             ElevatedButton(
               onPressed: () async {
-                final amount = int.tryParse(donationController.text);
+                final amountStr = donationController.text;
+                final amount = int.tryParse(amountStr);
                 final currentUser = _firebaseAuth.currentUser;
 
                 if (currentUser == null) {
-                  if (mounted)
+                  if (mounted) {
                     ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                        content: Text("Vous devez être connecté."),
-                        backgroundColor: Colors.red));
+                      content: Text("Vous devez être connecté."),
+                      backgroundColor: Colors.red,
+                    ));
+                  }
                   return;
                 }
-                final currentUserId = currentUser.uid;
 
                 if (amount == null || amount <= 0) {
-                  if (mounted)
+                  if (mounted) {
                     ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                        content: Text("Veuillez entrer un montant valide."),
-                        backgroundColor: Colors.orange));
+                      content: Text("Veuillez entrer un montant valide."),
+                      backgroundColor: Colors.orange,
+                    ));
+                  }
                   return;
                 }
 
+                // Afficher le loader
                 showDialog(
                   context: context,
                   barrierDismissible: false,
@@ -23816,121 +24015,48 @@ class _CampaignDetailPageState extends State<CampaignDetailPage> {
                 );
 
                 try {
-                  await _firestore.runTransaction((transaction) async {
-                    final campaignRef =
-                        _firestore.collection('rewards').doc(widget.offer.id);
-                    final userRef =
-                        _firestore.collection('users').doc(currentUserId);
-
-                    // Lectures (doivent être faites avant les écritures)
-                    final campaignDoc = await transaction.get(campaignRef);
-                    final userDoc = await transaction.get(userRef);
-
-                    if (!campaignDoc.exists || campaignDoc.data() == null) {
-                      throw Exception("Campagne non trouvée.");
-                    }
-                    if (!userDoc.exists || userDoc.data() == null) {
-                      throw Exception("Profil utilisateur introuvable.");
-                    }
-
-                    final currentCampaignDetails = campaignDoc
-                            .data()!['details_json'] as Map<String, dynamic>? ??
-                        {};
-
-                    // Vérification du solde lame_points
-                    final double currentLamePoints =
-                        (userDoc.data()!['lame_points'] as num?)?.toDouble() ??
-                            0.0;
-                    if (currentLamePoints < amount) {
-                      throw Exception(
-                          "Fonds insuffisants ($currentLamePoints Lames disponibles).");
-                    }
-
-                    // --- ECRITURES ---
-
-                    // 1. Mise à jour du solde utilisateur (lame_points)
-                    transaction.update(userRef, {
-                      'lame_points': FieldValue.increment(-amount.toDouble()),
-                      'updated_at': FieldValue.serverTimestamp(),
-                    });
-
-                    // Mise à jour locale (Provider) - Attention, c'est hors transaction mais nécessaire pour l'UI
-                    final userStatsProvider = Get.find<UserStatsController>();
-                    userStatsProvider.addLame(-amount.toDouble());
-
-                    // 2. Mise à jour de la campagne
-                    int newCurrentAmount =
-                        (currentCampaignDetails['current_amount_eco'] as num?)
-                                ?.toInt() ??
-                            0;
-                    newCurrentAmount += amount;
-                    int newDonors =
-                        (currentCampaignDetails['current_donors'] as num?)
-                                ?.toInt() ??
-                            0;
-                    newDonors++;
-
-                    currentCampaignDetails['current_amount_eco'] =
-                        newCurrentAmount;
-                    currentCampaignDetails['current_donors'] = newDonors;
-
-                    transaction.update(campaignRef, {
-                      'details_json': currentCampaignDetails,
-                      'updated_at': FieldValue.serverTimestamp(),
-                    });
-
-                    // 3. Enregistrement technique du don
-                    _firestore.collection('campaign_donations').add({
-                      'campaign_id': widget.offer.id,
-                      'user_id': currentUserId,
-                      'amount_eco': amount.toDouble(),
-                      'created_at': FieldValue.serverTimestamp(),
-                    });
-
-                    // 4. --- AJOUT POUR LA CLOCHE DE NOTIFICATION ---
-                    final notificationRef =
-                        _firestore.collection('user_claimed_offers').doc();
-                    transaction.set(notificationRef, {
-                      'user_id': currentUserId,
-                      'reward_id': widget.offer.id,
-                      'details': {
-                        'offer_title': "Don : ${widget.offer.title}",
-                        'claimed_for_lame': amount.toDouble(),
-                      },
-                      'claimed_at': FieldValue.serverTimestamp(),
-                      'status':
-                          'approved', // Un don est validé immédiatement (Reçu)
-                    });
-                    // ------------------------------------------------
+                  final callable = FirebaseFunctions.instance
+                      .httpsCallable('processDonation');
+                  final response = await callable.call({
+                    'amount': amount.toDouble(),
+                    'offerId': widget.offer.id,
+                    'offerTitle': widget.offer.title,
+                    'email': currentUser.email ?? 'inconnu',
+                    'isInstantApproval': true,
+                    'isAnonymous': _isAnonymous,
                   });
 
                   if (mounted) {
                     Navigator.of(context).pop(); // Fermer le loader
                     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                        content: Text(
-                            "Merci pour votre don de $amount Lame Points à ${widget.offer.title}!"),
-                        backgroundColor: Colors.green));
-
-                    _fetchCampaignDetails(); // Rafraichir l'UI
+                      content: Text(
+                          "Merci pour votre don de $amount Lames à ${widget.offer.title} !"),
+                      backgroundColor: Colors.green,
+                    ));
+                    _fetchCampaignDetails(); // Rafraîchir l'UI avec les nouveaux montants
                     donationController.clear();
                   }
                 } catch (e) {
                   if (mounted) {
                     Navigator.of(context).pop();
-                    print("Erreur de transaction Firestore (donation): $e");
+                    print("Erreur de don: $e");
+                    String errorMsg = "Erreur lors du don.";
+                    if (e is FirebaseFunctionsException) {
+                      errorMsg = e.details?.toString() ?? e.message ?? errorMsg;
+                    }
                     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                        content:
-                            Text("Erreur : ${e.toString().split("\n").first}"),
-                        backgroundColor: Colors.red));
+                      content: Text(errorMsg),
+                      backgroundColor: Colors.red,
+                    ));
                   }
                 }
               },
               style: ElevatedButton.styleFrom(
-                  minimumSize: const Size(double.infinity, 50),
-                  shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12))),
-              child: Text("Faire un don",
-                  style: GoogleFonts.poppins(fontSize: 16)),
+                minimumSize: const Size(double.infinity, 50),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12)),
+              ),
+              child: const Text("Faire un don", style: TextStyle(fontSize: 16)),
             ),
           ],
         ),
@@ -24361,31 +24487,21 @@ class AccelerometerBrakeDetector {
   StreamSubscription<UserAccelerometerEvent>? _sub;
   bool _listening = false;
 
-  // État freinage
-  double _deceleration = 0.0; // m/s² positif = freinage
+  // État mouvement
+  double _deceleration = 0.0; // m/s² magnitude lissée
   bool _isBraking = false;
   DateTime? _brakeCandidateStart; // début du pic candidat (avant confirmation)
-  DateTime? _brakeCooldownUntil; // anti-rebond après un freinage
 
-  // État accélération (symétrique)
-  double _acceleration = 0.0; // m/s² positif = accélération
+  // État accélération
+  double _acceleration = 0.0;
   bool _isAccelerating = false;
-  DateTime? _accelCandidateStart;
-  DateTime? _accelCooldownUntil;
 
   // Lissage
   final List<double> _buffer = [];
   static const int _bufSize = 8;
 
-  // Seuils
-  static const double _walkBrakeThresh = 1.0;
-  static const double _vehicBrakeThresh = 2.0;
-  static const double _walkAccelThresh = 0.8;
-  static const double _vehicAccelThresh = 1.5;
-
-  // Debounce / anti-rebond (en ms)
+  // Debounce (en ms)
   static const int _minSustainMs = 60; // durée mini avant confirmation
-  static const int _cooldownMs = 150; // délai avant de pouvoir re-déclencher
 
   bool _isWalking = false;
 
@@ -24401,16 +24517,11 @@ class AccelerometerBrakeDetector {
     _listening = true;
     _buffer.clear();
 
-    // 🔧 userAccelerometerEvents retire la gravité (contrairement à
-    // accelerometerEvents), donc un téléphone incliné (support voiture,
-    // main) ne fausse plus la magnitude x/y.
     _sub = userAccelerometerEventStream(
       samplingPeriod: SensorInterval.uiInterval, // ~60Hz
     ).listen(
       _onAccel,
       onError: (Object e) {
-        // 🔧 Certains devices/émulateurs n'ont pas d'accéléromètre :
-        // on désactive proprement plutôt que de laisser planter le stream.
         debugPrint('⚠️ AccelerometerBrakeDetector stream error: $e');
         stop();
       },
@@ -24427,98 +24538,43 @@ class AccelerometerBrakeDetector {
     _deceleration = 0.0;
     _acceleration = 0.0;
     _brakeCandidateStart = null;
-    _brakeCooldownUntil = null;
-    _accelCandidateStart = null;
-    _accelCooldownUntil = null;
     _buffer.clear();
   }
 
   void setWalkingMode(bool w) => _isWalking = w;
 
   void _onAccel(UserAccelerometerEvent e) {
-    // Magnitude horizontale (x,y) — on ignore z (déjà sans gravité ici,
-    // mais on garde le filtrage horizontal pour ignorer les à-coups
-    // verticaux type nid-de-poule / pas de marche).
+    // Magnitude horizontale (pic de mouvement, toujours positif)
     final double mag = math.sqrt(e.x * e.x + e.y * e.y);
 
     _buffer.add(mag);
     if (_buffer.length > _bufSize) _buffer.removeAt(0);
 
     final double smoothed = _buffer.reduce((a, b) => a + b) / _buffer.length;
-
-    double instDeceleration = 0.0;
-    double instAcceleration = 0.0;
-
-    // Dérivée : différence entre les 2 dernières valeurs lissées
-    if (_buffer.length >= 2) {
-      final double prev = _buffer[_buffer.length - 2];
-      final double delta = smoothed - prev;
-
-      // delta < 0 → on ralentit (freinage)
-      // delta > 0 → on accélère
-      instDeceleration = delta < 0 ? -delta : 0.0;
-      instAcceleration = delta > 0 ? delta : 0.0;
-    }
-
     final DateTime now = DateTime.now();
 
-    // ═══ FREINAGE (avec debounce + cooldown) ═══
-    final double brakeThresh =
-        _isWalking ? _walkBrakeThresh : _vehicBrakeThresh;
+    // On ne déclenche un état que si le pic de mouvement dépasse un seuil physique réel
+    final double motionThresh = _isWalking ? 1.2 : 2.5;
 
-    if (instDeceleration > brakeThresh) {
-      final bool inCooldown =
-          _brakeCooldownUntil != null && now.isBefore(_brakeCooldownUntil!);
+    if (smoothed > motionThresh) {
+      _brakeCandidateStart ??= now;
+      final int sustainedMs =
+          now.difference(_brakeCandidateStart!).inMilliseconds;
 
-      if (!inCooldown) {
-        _brakeCandidateStart ??= now;
-        final int sustainedMs =
-            now.difference(_brakeCandidateStart!).inMilliseconds;
-
-        if (sustainedMs >= _minSustainMs) {
-          // 🔧 Confirmé : on ne déclenche isBraking qu'après la durée mini,
-          // ça filtre les à-coups isolés (nid de poule, vibration support).
-          _isBraking = true;
-          _deceleration = instDeceleration;
-        }
+      if (sustainedMs >= _minSustainMs) {
+        // Flag générique : Mouvement Brusque Détecté.
+        // C'est le KinematicFilter qui décidera si c'est un freinage ou une accélération
+        // en regardant la variation de vitesse GPS.
+        _isBraking = true;
+        _deceleration = smoothed;
+        _isAccelerating = true;
+        _acceleration = smoothed;
       }
     } else {
-      if (_isBraking) {
-        // 🔧 Cooldown : évite qu'un bruit juste après le relâchement du
-        // frein ne redéclenche immédiatement un nouveau freinage.
-        _brakeCooldownUntil =
-            now.add(const Duration(milliseconds: _cooldownMs));
-      }
       _isBraking = false;
+      _isAccelerating = false;
       _brakeCandidateStart = null;
       _deceleration = 0.0;
-    }
-
-    // ═══ ACCÉLÉRATION (symétrique, même logique) ═══
-    final double accelThresh =
-        _isWalking ? _walkAccelThresh : _vehicAccelThresh;
-
-    if (instAcceleration > accelThresh) {
-      final bool inCooldown =
-          _accelCooldownUntil != null && now.isBefore(_accelCooldownUntil!);
-
-      if (!inCooldown) {
-        _accelCandidateStart ??= now;
-        final int sustainedMs =
-            now.difference(_accelCandidateStart!).inMilliseconds;
-
-        if (sustainedMs >= _minSustainMs) {
-          _isAccelerating = true;
-          _acceleration = instAcceleration;
-        }
-      }
-    } else {
-      if (_isAccelerating) {
-        _accelCooldownUntil =
-            now.add(const Duration(milliseconds: _cooldownMs));
-      }
-      _isAccelerating = false;
-      _accelCandidateStart = null;
       _acceleration = 0.0;
     }
   }
@@ -24650,8 +24706,9 @@ class KinematicFilter {
 
   // Plancher de bruit GPS à l'arrêt : un déplacement snappé plus petit que
   // ça n'est pas considéré comme un vrai mouvement (jitter du capteur).
-  static const double _gpsNoiseFloorWalking = 3.0; // mètres
-  static const double _gpsNoiseFloorVehicle = 6.0; // mètres
+  static const double _gpsNoiseFloorWalking = 4.0; // mètres (anti-rampement)
+  static const double _gpsNoiseFloorVehicle =
+      8.0; // mètres (anti-rampement ronds-points)
 
   // Vitesse plausible max (avec marge) pour juger si un saut le long de
   // l'itinéraire entre 2 fixes GPS est réaliste ou aberrant.
@@ -24772,29 +24829,35 @@ class KinematicFilter {
     // fait donc confiance en premier ; le delta GPS (rawInstantDecel) ne
     // sert que de solution de secours quand l'accéléromètre ne détecte
     // rien (ex: freinage très progressif, capteur indisponible).
+    // Calcul de la décélération réelle basée sur le GPS (le seul qui connaît le sens)
     final double rawInstantDecel =
-        dt > 0.1 ? (_vehicleSpeedMps - vInst) / dt : 0.0;
-    final bool likelyBraking =
-        _accelBrakeActive || rawInstantDecel > (_hardBrakeDecel * 0.5);
-    final bool likelyAccelerating = accelDetector.isAccelerating ||
-        rawInstantDecel < -(_hardBrakeDecel * 0.5);
+        dt > 0.1 ? (_previousVehicleSpeedMps - vInst) / dt : 0.0;
 
-    double speedSmoothing = 0.55; // poids "normal" donné à vInst
-    if (_accelBrakeActive) {
-      // 🔧 L'accéléromètre détecte un vrai freinage → confiance maximale,
-      // on ne dépend plus du prochain fix GPS (qui peut arriver dans
-      // presque 1s) pour faire chuter la vitesse.
-      speedSmoothing = 0.88;
-    } else if (likelyBraking) {
-      speedSmoothing = 0.80; // on fait confiance vite à la chute de vitesse
-    } else if (accelDetector.isAccelerating) {
-      speedSmoothing = 0.75; // idem, priorité accéléromètre pour la reprise
+    // VRAIE logique : On freine SI la vitesse GPS chute ET que l'accéléromètre sent un choc
+    final bool likelyBraking = rawInstantDecel > 1.0 && accelDetector.isBraking;
+    // On accélère SI la vitesse GPS monte (ou si arrêt) ET que l'accéléromètre sent un choc
+    final bool likelyAccelerating =
+        (rawInstantDecel < -1.0 || _vehicleSpeedMps <= 0.05) &&
+            accelDetector.isBraking;
+
+    double speedSmoothing = 0.55;
+
+    if (likelyBraking) {
+      speedSmoothing = 0.90; // Confiance maximale à la chute de vitesse GPS
     } else if (likelyAccelerating) {
-      speedSmoothing = 0.65; // on suit un peu plus vite une reprise franche
+      speedSmoothing = 0.85; // Confiance maximale à la reprise
+    } else if (vInst < 0.5 && _vehicleSpeedMps > 1.0) {
+      // Sécurité : si le GPS dit 0 mais qu'on avançait, on freine fort
+      speedSmoothing = 0.95;
     }
 
-    if (_vehicleSpeedMps <= 0.01) {
-      _vehicleSpeedMps = vInst;
+    // 🔧 CORRECTION DU KICKSTART (Feu vert)
+    if (_vehicleSpeedMps <= 0.05) {
+      if (likelyAccelerating) {
+        _vehicleSpeedMps = 1.2; // Force un démarrage immédiat à ~4.3 km/h
+      } else {
+        _vehicleSpeedMps = vInst; // Reste à 0 si pas de mouvement
+      }
     } else {
       _vehicleSpeedMps = (_vehicleSpeedMps * (1.0 - speedSmoothing)) +
           (vInst * speedSmoothing);
@@ -25082,10 +25145,11 @@ class KinematicFilter {
       final double stopThreshold =
           _isWalking ? _walkingStopSpeed : _vehicleStopSpeed;
 
-      final bool isStopped = _vehicleSpeedMps < stopThreshold;
+      final bool isStopped =
+          _vehicleSpeedMps < stopThreshold && _lastRawSpeedMps < stopThreshold;
 
       // ═══════════════════════════════════════════════════════════
-      // 🔍 AJOUT : PLANCHER DE BRUIT GPS À L'ARRÊT
+      // 🔍 AJOUT : PLANCHER DE BRUIT GPS À L'ARRÊT (ANTI-RAMPEMENT RONDS-POINTS)
       // ═══════════════════════════════════════════════════════════
       // À l'arrêt, un léger jitter GPS peut sembler être une petite
       // avancée réelle et faire "ramper" la flèche en avant peu à peu.

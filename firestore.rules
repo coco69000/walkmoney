@@ -1,12 +1,23 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+    
+    // Helper : Vérifier si l'utilisateur est admin (Custom Claim admin: true)
+    function isAdmin() {
+      return request.auth != null && request.auth.token.admin == true;
+    }
+
+    // Helper : Vérifier si c'est le propriétaire des données
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
     // Règle globale pour la collection des utilisateurs (RGPD : lecture stricte réservée au seul propriétaire)
     match /users/{userId} {
-      allow read: if request.auth != null && request.auth.uid == userId;
+      allow read: if isOwner(userId) || isAdmin();
       
       // L'utilisateur peut mettre à jour son profil (ex: domicile, nom), mais NE PEUT PAS modifier ses champs sensibles
-      allow update: if request.auth != null && request.auth.uid == userId
+      allow update: if isOwner(userId)
                     && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
                          'lame_points', 
                          'total_lame_earned', 
@@ -25,29 +36,29 @@ service cloud.firestore {
                          'last_ocr_timestamp'
                        ]);
                        
-      allow create: if request.auth != null && request.auth.uid == userId;
-      allow delete: if request.auth != null && request.auth.uid == userId;
+      allow create: if isOwner(userId) || isAdmin();
+      allow delete: if isAdmin();
     }
 
     // Sous-collections sous /users/{userId}
     match /users/{userId}/lame_history/{document=**} {
-      allow read: if request.auth != null && request.auth.uid == userId;
+      allow read: if isOwner(userId) || isAdmin();
       allow write: if false;
     }
 
     match /users/{userId}/trip_logs/{docId} {
-      allow read, create: if request.auth != null && request.auth.uid == userId;
-      allow update: if request.auth != null && request.auth.uid == userId
+      allow read, create: if isOwner(userId);
+      allow update: if isOwner(userId)
                     && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
                          'validation_status',
                          'validated_at',
                          'lames_earned'
                        ]);
-      allow delete: if request.auth != null && request.auth.uid == userId;
+      allow delete: if isOwner(userId) || isAdmin();
     }
 
     match /users/{userId}/cashback_history/{docId} {
-      allow read: if request.auth != null && request.auth.uid == userId;
+      allow read: if isOwner(userId) || isAdmin();
       allow write: if false;
     }
 
@@ -59,7 +70,7 @@ service cloud.firestore {
 
     // Statistiques des utilisateurs (Gérées uniquement par Cloud Functions)
     match /user_stats/{userId} {
-      allow read: if request.auth != null && request.auth.uid == userId;
+      allow read: if isOwner(userId) || isAdmin();
       allow write: if false;
     }
 
@@ -77,7 +88,7 @@ service cloud.firestore {
     // Défis généraux et défis utilisateur (Validation par Cloud Function)
     match /challenges/{docId} {
       allow read: if request.auth != null;
-      allow write: if false;
+      allow create, update, delete: if isAdmin();
     }
 
     match /user_challenges/{docId} {
@@ -93,17 +104,17 @@ service cloud.firestore {
 
     match /stores/{storeId} {
       allow read: if true;
-      allow write: if false;
+      allow create, update, delete: if isAdmin();
     }
 
     match /shop_items/{itemId} {
-      allow read: if request.auth != null;
-      allow write: if false;
+      allow read: if true;
+      allow create, update, delete: if isAdmin();
     }
 
     match /rewards/{rewardId} {
-      allow read: if request.auth != null;
-      allow write: if false;
+      allow read: if true;
+      allow create, update, delete: if isAdmin();
     }
 
     // Concours et participations (Gérés uniquement par Cloud Functions)
