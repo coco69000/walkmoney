@@ -1,0 +1,12 @@
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/logo2.png"
+
+  # Options recommandées
+  adaptive_icon_background: "#EADBC8"
+  adaptive_icon_foreground: "assets/logo2.png"
+
+  # Minimum sizes
+  min_sdk_android: 21
+  remove_alpha_ios: true

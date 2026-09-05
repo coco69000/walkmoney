@@ -1,4 +1,4 @@
-const { onCall, HttpsError } = require('firebase-functions/v2/https');
+const { onCall, onRequest, HttpsError } = require('firebase-functions/v2/https');
 const { onSchedule } = require('firebase-functions/v2/scheduler');
 const admin = require('firebase-admin');
 const crypto = require('crypto');
@@ -163,6 +163,112 @@ exports.createStripeShop = onCall(async (request) => {
     }
 });
 
+// --- FONCTION 2 : WEBHOOK STRIPE (Gestion des impayés et résiliations) ---
+exports.stripeWebhook = onRequest(async (req, res) => {
+    if (!stripe) {
+        console.error("❌ Stripe non configuré sur le serveur.");
+        return res.status(500).send("Stripe non configuré.");
+    }
+
+    const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+    const sig = req.headers['stripe-signature'];
+    let event;
+
+    if (endpointSecret && sig) {
+        try {
+            const rawBody = req.rawBody || req.body;
+            event = stripe.webhooks.constructEvent(rawBody, sig, endpointSecret);
+        } catch (err) {
+            console.error(`⚠️ Erreur vérification webhook Stripe : ${err.message}`);
+            return res.status(400).send(`Webhook Error: ${err.message}`);
+        }
+    } else {
+        event = req.body;
+    }
+
+    console.log(`🔔 Webhook Stripe reçu : ${event?.type}`);
+
+    try {
+        switch (event.type) {
+            case 'invoice.payment_failed': {
+                const invoice = event.data.object;
+                const subscriptionId = invoice.subscription;
+                console.warn(`⚠️ Paiement échoué pour l'abonnement : ${subscriptionId}`);
+
+                if (subscriptionId) {
+                    const usersRef = admin.firestore().collection('users');
+                    const querySnapshot = await usersRef.where('stripe_subscription_id', '==', subscriptionId).get();
+                    if (!querySnapshot.empty) {
+                        const batch = admin.firestore().batch();
+                        querySnapshot.forEach(doc => {
+                            batch.update(doc.ref, {
+                                is_vip: false,
+                                stripe_subscription_status: 'past_due',
+                                updated_at: admin.firestore.FieldValue.serverTimestamp()
+                            });
+                        });
+                        await batch.commit();
+                        console.log(`✅ Statut VIP révoqué pour ${querySnapshot.size} utilisateur(s).`);
+                    }
+                }
+                break;
+            }
+
+            case 'customer.subscription.deleted': {
+                const subscription = event.data.object;
+                const subscriptionId = subscription.id;
+                console.warn(`🛑 Abonnement résilié : ${subscriptionId}`);
+
+                if (subscriptionId) {
+                    const usersRef = admin.firestore().collection('users');
+                    const querySnapshot = await usersRef.where('stripe_subscription_id', '==', subscriptionId).get();
+                    if (!querySnapshot.empty) {
+                        const batch = admin.firestore().batch();
+                        querySnapshot.forEach(doc => {
+                            batch.update(doc.ref, {
+                                is_vip: false,
+                                stripe_subscription_id: null,
+                                stripe_subscription_item_id: null,
+                                stripe_subscription_status: 'canceled',
+                                updated_at: admin.firestore.FieldValue.serverTimestamp()
+                            });
+                        });
+                        await batch.commit();
+                        console.log(`✅ Abonnement supprimé pour ${querySnapshot.size} utilisateur(s).`);
+                    }
+
+                    // Mettre également à jour les boutiques associées
+                    const storesRef = admin.firestore().collection('stores');
+                    const storesSnapshot = await storesRef.where('stripe_subscription_id', '==', subscriptionId).get();
+                    if (!storesSnapshot.empty) {
+                        const batch = admin.firestore().batch();
+                        storesSnapshot.forEach(doc => {
+                            batch.update(doc.ref, {
+                                stripe_subscription_id: null,
+                                stripe_subscription_item_id: null,
+                                lamePointMultiplier: 1.0,
+                                is_visibility_boost_enabled: false,
+                                updated_at: admin.firestore.FieldValue.serverTimestamp()
+                            });
+                        });
+                        await batch.commit();
+                        console.log(`✅ Boosts de visibilité désactivés pour ${storesSnapshot.size} boutique(s).`);
+                    }
+                }
+                break;
+            }
+
+            default:
+                break;
+        }
+
+        res.json({ received: true });
+    } catch (err) {
+        console.error("❌ Erreur traitement webhook Stripe :", err);
+        res.status(500).send(`Internal Error: ${err.message}`);
+    }
+});
+
 // (Note: La déclaration de commission Stripe est gérée automatiquement de façon sécurisée à la fin de claimCashback)
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -250,11 +356,11 @@ Règles absolues :
         // --- PARSING JSON ROBUSTE ---
         // 1. Enlever les balises markdown ```json ... ``` si l'IA en ajoute quand même
         let cleanedText = responseText.trim().replace(/^```json\s*/i, '').replace(/```\s*$/i, '');
-        
+
         // 2. Extraire uniquement le bloc JSON si du texte parasite existe avant/après
         const firstBrace = cleanedText.indexOf('{');
         const lastBrace = cleanedText.lastIndexOf('}');
-        
+
         if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
             cleanedText = cleanedText.substring(firstBrace, lastBrace + 1);
         }
@@ -264,10 +370,10 @@ Règles absolues :
             parsed = JSON.parse(cleanedText);
         } catch (jsonErr) {
             console.error("❌ Échec parsing JSON NVIDIA. Réponse brute:", cleanedText);
-            return { 
-                valid: false, 
-                reason: 'Erreur de format de la réponse de l\'IA. Veuillez réessayer avec une image plus nette.', 
-                extractedText: '', 
+            return {
+                valid: false,
+                reason: 'Erreur de format de la réponse de l\'IA. Veuillez réessayer avec une image plus nette.',
+                extractedText: '',
                 amount: null,
                 storeNameFound: ''
             };
@@ -275,8 +381,8 @@ Règles absolues :
 
         // Validation stricte des champs
         const isValid = (parsed.valid === true && parsed.isReceipt === true);
-        const reason = (parsed.reason && parsed.reason.trim().length > 0) 
-            ? parsed.reason 
+        const reason = (parsed.reason && parsed.reason.trim().length > 0)
+            ? parsed.reason
             : (isValid ? 'OK' : 'Le ticket ne respecte pas les critères de validation (magasin, authenticité ou montant).');
 
         return {
@@ -778,11 +884,11 @@ exports.claimDailyReward = onCall(async (request) => {
 
                 if (diffDays === 0) {
                     // Déjà connecté aujourd'hui
-                    return { 
-                        updated: false, 
-                        consecutiveLogins: consecutiveLogins, 
-                        nextLevelBoost: statsData.next_level_boost || 1.0, 
-                        message: "Récompense déjà validée pour aujourd'hui." 
+                    return {
+                        updated: false,
+                        consecutiveLogins: consecutiveLogins,
+                        nextLevelBoost: statsData.next_level_boost || 1.0,
+                        message: "Récompense déjà validée pour aujourd'hui."
                     };
                 } else if (diffDays === 1) {
                     // Connexion le lendemain : série continue
@@ -839,12 +945,12 @@ exports.claimDailyReward = onCall(async (request) => {
                 }
             });
 
-            return { 
-                updated: true, 
-                consecutiveLogins, 
-                nextLevelBoost: newNextLevelBoost, 
-                newBalance: currentLame + 1, 
-                newTotalEarned: newTotalEarned 
+            return {
+                updated: true,
+                consecutiveLogins,
+                nextLevelBoost: newNextLevelBoost,
+                newBalance: currentLame + 1,
+                newTotalEarned: newTotalEarned
             };
         });
 
@@ -1481,7 +1587,7 @@ exports.processDonation = onCall(async (request) => {
                 const currentDetails = rData.details_json || {};
                 const currentAmt = Number(currentDetails.current_amount_eco || 0);
                 const currentDonors = Number(currentDetails.current_donors || 0);
-                
+
                 currentDetails.current_amount_eco = currentAmt + cost;
                 currentDetails.current_donors = currentDonors + 1;
 
@@ -1917,7 +2023,7 @@ exports.cleanupOldLogs = onSchedule('every 24 hours', async (event) => {
 exports.createShopItem = onCall(async (request) => {
     const data = request.data;
     const context = request;
-    
+
     verifyAdmin(context);
 
     const { name, cost_lame, type, icon } = data;
@@ -1941,10 +2047,10 @@ exports.createShopItem = onCall(async (request) => {
         await newItemRef.set(newItemData);
 
         console.log(`✅ Article de boutique créé avec succès : ${newItemRef.id}`);
-        return { 
-            success: true, 
-            itemId: newItemRef.id, 
-            message: 'Article ajouté à la boutique avec succès.' 
+        return {
+            success: true,
+            itemId: newItemRef.id,
+            message: 'Article ajouté à la boutique avec succès.'
         };
     } catch (error) {
         console.error("❌ Erreur lors de la création de l'article :", error);
@@ -1958,15 +2064,15 @@ exports.createShopItem = onCall(async (request) => {
 exports.createRewardOffer = onCall(async (request) => {
     const data = request.data;
     const context = request;
-    
+
     verifyAdmin(context);
 
-    const { 
-        title, 
-        description, 
-        offer_type, 
-        eco_cost, 
-        brand_name, 
+    const {
+        title,
+        description,
+        offer_type,
+        eco_cost,
+        brand_name,
         is_active = true,
         details_json = {},
         sort_order = 0
@@ -1995,10 +2101,10 @@ exports.createRewardOffer = onCall(async (request) => {
         await newOfferRef.set(newOfferData);
 
         console.log(`✅ Offre de récompense créée avec succès : ${newOfferRef.id}`);
-        return { 
-            success: true, 
-            offerId: newOfferRef.id, 
-            message: 'Offre ajoutée au catalogue de récompenses avec succès.' 
+        return {
+            success: true,
+            offerId: newOfferRef.id,
+            message: 'Offre ajoutée au catalogue de récompenses avec succès.'
         };
     } catch (error) {
         console.error("❌ Erreur lors de la création de l'offre :", error);

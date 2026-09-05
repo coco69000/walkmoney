@@ -69,6 +69,8 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^3.0.0
+  flutter_launcher_icons: ^0.14.3
+  flutter_native_splash: ^2.4.4
 
 # Cette section force tous les packages à utiliser la version 1.1.0 de http
 dependency_overrides:
@@ -79,6 +81,7 @@ flutter:
 
   assets:
     - .env
+    - assets/
     - assets/images/map_icon.png
     - assets/images/locate_me.png
     - assets/images/car.png

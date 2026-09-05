@@ -2048,12 +2048,23 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
 
   // --- GESTION ANTI-SPAM DES PERMISSIONS GPS ---
   Future<Position>? _pendingLocationFuture;
+  DateTime? _lastPermissionErrorTime; // Cooldown anti-spam
 
   Future<Position> getMyCurrentLocation() {
-    // Si une requête GPS est déjà en cours, on retourne la même (évite le spam des 13 fenêtres)
+    // Si une requête GPS est déjà en cours, on retourne la même (évite le spam des fenêtres multiples)
     if (_pendingLocationFuture != null) return _pendingLocationFuture!;
 
-    _pendingLocationFuture = _fetchLocationSafely().whenComplete(() {
+    // Cooldown de 5 secondes si la dernière tentative a échoué
+    if (_lastPermissionErrorTime != null &&
+        DateTime.now().difference(_lastPermissionErrorTime!).inSeconds < 5) {
+      return Future.error(
+          'Permission GPS refusée récemment. Veuillez patienter.');
+    }
+
+    _pendingLocationFuture = _fetchLocationSafely().catchError((e) {
+      _lastPermissionErrorTime = DateTime.now(); // Active le cooldown en cas d'erreur
+      throw e; // Re-throw pour que l'appelant gère l'erreur
+    }).whenComplete(() {
       _pendingLocationFuture = null; // Libère le verrou une fois terminé
     });
 
@@ -2492,6 +2503,8 @@ class NavigationController extends GetxController {
   Challenge? stayChallenge;
   StreamSubscription<Position>? independentStayStream;
   Timer? independentStayTimer;
+  int? _challengeStartTimeStamp;
+  int? _lastInZoneTimestamp;
   StreamSubscription<Position>? positionStream;
 
   // ── VARIABLES DIAGNOSTIC (AJOUT) ──
@@ -2910,6 +2923,7 @@ class NavigationController extends GetxController {
   }
 
   int _currentGpsIntervalMs = 1000; // Intervalle par défaut (1 seconde)
+  bool _isUpdatingGpsStream = false;
 
   void _startPositionStream() {
     positionStream?.cancel();
@@ -2940,11 +2954,22 @@ class NavigationController extends GetxController {
       targetIntervalMs = 550;
     }
 
-    if (targetIntervalMs != _currentGpsIntervalMs) {
+    // Évite les appels concurrents, les boucles infinies et les fuites de stream
+    if (targetIntervalMs != _currentGpsIntervalMs && !_isUpdatingGpsStream) {
       _currentGpsIntervalMs = targetIntervalMs;
       debugPrint(
           "🔄 GPS Interval changed to ${_currentGpsIntervalMs}ms (Speed: ${speedKmh.toStringAsFixed(1)} km/h)");
-      _startPositionStream(); // Recrée le stream avec le nouvel intervalle
+      _isUpdatingGpsStream = true;
+      (positionStream?.cancel() ?? Future.value()).then((_) {
+        // Ne recréer le stream que si la navigation est toujours active
+        if (homeController.mapStatus.value == Constants.onDestination) {
+          _startPositionStream();
+        }
+        _isUpdatingGpsStream = false;
+      }).catchError((e) {
+        debugPrint("Erreur lors de l'annulation du stream GPS: $e");
+        _isUpdatingGpsStream = false;
+      });
     }
   }
 
@@ -2957,6 +2982,18 @@ class NavigationController extends GetxController {
           receiveTime.difference(_lastGpsReceiveTime!).inMilliseconds;
     }
     _lastGpsReceiveTime = receiveTime;
+
+    // ⏱️ Âge du fix GPS : temps entre le timestamp GPS et la réception Dart.
+    final int fixAgeMs =
+        receiveTime.difference(position.timestamp).inMilliseconds;
+
+    // On utilise la dernière mesure de traitement connue pour ne pas attendre
+    // la fin du traitement courant.
+    homeController.kinematicFilter.updateGpsLatency(
+      intervalMs: timeBetweenGpsMs.value,
+      processingMs: gpsProcessingMs.value,
+      fixAgeMs: fixAgeMs,
+    );
 
     // 🚀 2. DONNER LA VRAIE POSITION AU FILTRE !
     final currentMode = homeController.currentTravelMode.value;
@@ -3202,6 +3239,13 @@ class NavigationController extends GetxController {
     // ⏱️ 4. FIN DU CHRONO : Temps de traitement du code
     final finishTime = DateTime.now();
     gpsProcessingMs.value = finishTime.difference(receiveTime).inMilliseconds;
+
+    // Met à jour le filtre avec la vraie mesure de traitement qui vient d'être calculée.
+    homeController.kinematicFilter.updateGpsLatency(
+      intervalMs: timeBetweenGpsMs.value,
+      processingMs: gpsProcessingMs.value,
+      fixAgeMs: fixAgeMs,
+    );
   } // Fin de _onGpsPositionUpdate
 
   void navigateToDestination({bool validateWalkingLegs = false}) async {
@@ -4591,7 +4635,9 @@ class NavigationController extends GetxController {
   }
 
   void stopNavigation({bool keepChallengeCallbacks = false}) {
+    _isUpdatingGpsStream = false;
     positionStream?.cancel();
+    positionStream = null;
     _lastGpsReceiveTime = null;
     homeController.kinematicFilter.accelDetector.stop(); // ← AJOUT
     homeController.stopFluidNavigation();
@@ -4690,11 +4736,15 @@ class NavigationController extends GetxController {
 
   void startIndependentStayTimer(Challenge challenge) {
     stayChallenge = challenge;
-    staySecondsRemaining.value = challenge.stayDurationSeconds ?? 180;
-    isStayTimerActive.value = true;
-    isUserInStayZone.value = true; // On suppose qu'il y est en arrivant
+    _challengeStartTimeStamp = DateTime.now().millisecondsSinceEpoch;
+    _lastInZoneTimestamp = _challengeStartTimeStamp;
 
-    _showStayChallengeNotification('Défi de zone démarré',
+    int totalDuration = challenge.stayDurationSeconds ?? 180;
+    staySecondsRemaining.value = totalDuration;
+    isStayTimerActive.value = true;
+    isUserInStayZone.value = true;
+
+    _showStayChallengeNotification('DÉFI DE ZONE DÉMARRÉ',
         'Restez dans la zone pendant ${staySecondsRemaining.value} secondes pour valider.');
 
     // Dessine le cercle
@@ -4704,53 +4754,98 @@ class NavigationController extends GetxController {
     independentStayStream?.cancel();
     independentStayTimer?.cancel();
 
-    // Flux GPS indépendant (tourne même si on coupe la navigation)
+    // 1. Minuteur périodique (1 seconde) garantissant le décompte même si l'utilisateur est parfaitement immobile
+    independentStayTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!isStayTimerActive.value) return;
+      if (isUserInStayZone.value) {
+        int now = DateTime.now().millisecondsSinceEpoch;
+        int elapsedSinceLast = _lastInZoneTimestamp != null
+            ? ((now - _lastInZoneTimestamp!) / 1000).floor()
+            : 1;
+        if (elapsedSinceLast < 1) elapsedSinceLast = 1;
+        _lastInZoneTimestamp = now;
+
+        int remaining = staySecondsRemaining.value - elapsedSinceLast;
+        if (remaining < 0) remaining = 0;
+
+        if (staySecondsRemaining.value != remaining) {
+          staySecondsRemaining.value = remaining;
+
+          if (remaining > 0 && remaining % 10 == 0) {
+            _showStayChallengeNotification(
+                'DÉFI EN COURS', 'Temps restant: ${remaining}s');
+          }
+        }
+
+        if (remaining <= 0) {
+          _completeStayChallenge(challenge);
+        }
+      }
+    });
+
+    // 2. Flux GPS indépendant
     independentStayStream = Geolocator.getPositionStream(
-            locationSettings: LocationSettings(
-                accuracy: LocationAccuracy.bestForNavigation,
-                distanceFilter: LOCATION_DISTANCE_FILTER_METERS.toInt()))
-        .listen((pos) {
+      locationSettings: LocationSettings(
+          accuracy: LocationAccuracy.bestForNavigation,
+          distanceFilter: LOCATION_DISTANCE_FILTER_METERS.toInt()),
+    ).listen((pos) {
       double dist = Geolocator.distanceBetween(pos.latitude, pos.longitude,
           challenge.latitude!, challenge.longitude!);
+
       bool wasInZone = isUserInStayZone.value;
       bool isNowInZone = dist <= STAY_ZONE_TOLERANCE_METERS;
       isUserInStayZone.value = isNowInZone;
 
       if (isNowInZone && !wasInZone) {
-        _showStayChallengeNotification('Restez sur place',
-            'Vous êtes revenu dans la zone. Continuez le défi.');
+        _lastInZoneTimestamp = DateTime.now().millisecondsSinceEpoch;
+        _showStayChallengeNotification(
+            'RETOUR DANS LA ZONE', 'Le timer reprend.');
       } else if (!isNowInZone && wasInZone) {
-        _showStayChallengeNotification('⚠️ Hors zone',
-            'Vous avez quitté la zone. Revenez pour continuer le défi.');
+        _showStayChallengeNotification(
+            '⚠️ HORS ZONE', 'Revenez pour continuer le défi.');
       }
 
-      if (isUserInStayZone.value) {
-        staySecondsRemaining.value--;
-        if (staySecondsRemaining.value % 10 == 0) {
-          _showStayChallengeNotification(
-              'Défi en cours', 'Temps restant ${staySecondsRemaining.value}s.');
-        }
+      // Synchronisation au point GPS si dans la zone
+      if (isUserInStayZone.value && _lastInZoneTimestamp != null) {
+        int now = DateTime.now().millisecondsSinceEpoch;
+        int delta = ((now - _lastInZoneTimestamp!) / 1000).floor();
+        if (delta > 0) {
+          _lastInZoneTimestamp = now;
+          int remaining = staySecondsRemaining.value - delta;
+          if (remaining < 0) remaining = 0;
 
-        if (staySecondsRemaining.value <= 0) {
-          independentStayTimer?.cancel();
-          independentStayStream?.cancel();
-          isStayTimerActive.value = false;
+          if (staySecondsRemaining.value != remaining) {
+            staySecondsRemaining.value = remaining;
+          }
 
-          // CORRECTION : Défi complété !
-          _onChallengeReached?.call(challenge);
-          activeChallenge = null;
-
-          _showStayChallengeCompletionDialog();
-          Get.snackbar(
-            "✅ Étape validée !",
-            "Temps sur place validé.",
-            backgroundColor: Colors.green,
-            colorText: Colors.white,
-            duration: const Duration(seconds: 5),
-          );
+          if (remaining <= 0) {
+            _completeStayChallenge(challenge);
+          }
         }
       }
     });
+  }
+
+  void _completeStayChallenge(Challenge challenge) {
+    independentStayTimer?.cancel();
+    independentStayStream?.cancel();
+    isStayTimerActive.value = false;
+
+    // Callback vers le controller principal pour valider le défi
+    _onChallengeReached?.call(challenge);
+
+    activeChallenge = null;
+    _challengeStartTimeStamp = null;
+    _lastInZoneTimestamp = null;
+
+    _showStayChallengeCompletionDialog();
+    Get.snackbar(
+      "✅ ÉTAPE VALIDÉE !",
+      "Temps sur place validé.",
+      backgroundColor: Colors.green,
+      colorText: Colors.white,
+      duration: const Duration(seconds: 5),
+    );
   }
 
   void _distributeRewardsAndCallbacks({bool forceChallenge = false}) {
@@ -5077,6 +5172,7 @@ class DebugOverlayWidget extends StatelessWidget {
 
       final pingMs = nav.timeBetweenGpsMs.value;
       final procMs = nav.gpsProcessingMs.value;
+      final int projectionLatencyMs = home.kinematicFilter.totalLatencyMs;
       final isVisible = home.showDiagnosticPoints.value;
 
       // Calcul de la précision
@@ -5138,6 +5234,17 @@ class DebugOverlayWidget extends StatelessWidget {
               "⚙️ Traitement : ${procMs} ms",
               style: TextStyle(
                 color: procMs > 50 ? Colors.orangeAccent : Colors.greenAccent,
+                fontSize: 11,
+                fontFamily: 'monospace',
+              ),
+            ),
+            const SizedBox(height: 2),
+            Text(
+              "⏱️ Latence projection : ${projectionLatencyMs} ms",
+              style: TextStyle(
+                color: projectionLatencyMs > 450
+                    ? Colors.orangeAccent
+                    : Colors.greenAccent,
                 fontSize: 11,
                 fontFamily: 'monospace',
               ),
@@ -7629,7 +7736,7 @@ void onBackgroundServiceStart(ServiceInstance service) async {
 
       double speedKmh = position.speed * 3.6;
 
-      // ✅ AJOUT : Fallback si le GPS en veille renvoie une vitesse nulle ou aberrante
+      // ✅ CORRECTION : Ignorer le calcul fallback si c'est le tout premier fix après restart
       if ((speedKmh <= 0.0 || speedKmh == 1.0) &&
           _lastNavPosition != null &&
           _lastNavTime != null) {
@@ -7642,9 +7749,15 @@ void onBackgroundServiceStart(ServiceInstance service) async {
         double dtSeconds =
             position.timestamp.difference(_lastNavTime!).inMilliseconds /
                 1000.0;
+        // Ne calculer que si le delta temps est cohérent (> 0.5s)
         if (dtSeconds > 0.5) {
           speedKmh = (distMeters / dtSeconds) * 3.6;
+        } else {
+          speedKmh = 0.0;
         }
+      } else if (_lastNavPosition == null) {
+        // Premier fix absolu après redémarrage du service : on ne peut pas calculer de vitesse fiable
+        speedKmh = 0.0;
       }
 
       final String modeStr =
@@ -10258,17 +10371,33 @@ class _DefisScreenState extends State<DefisScreen> {
 
 // Initialise la date de fin du cycle actuel
   Future<void> _initChallengeCycle() async {
-    final userDoc = await _firestore
-        .collection('user_stats')
-        .doc(widget.currentUserId)
-        .get();
-// Par défaut, une date passée pour forcer le refresh si pas de donnée
     DateTime lastRefresh = DateTime.now().subtract(const Duration(days: 30));
+    try {
+      final userDoc = await _firestore
+          .collection('user_stats')
+          .doc(widget.currentUserId)
+          .get();
 
-    if (userDoc.exists &&
-        userDoc.data()!.containsKey('last_challenges_refresh')) {
-      lastRefresh =
-          (userDoc.data()!['last_challenges_refresh'] as Timestamp).toDate();
+      if (userDoc.exists &&
+          userDoc.data()!.containsKey('last_challenges_refresh')) {
+        lastRefresh =
+            (userDoc.data()!['last_challenges_refresh'] as Timestamp).toDate();
+      } else {
+        // Fallback sur le document users
+        final userProfile = await _firestore
+            .collection('users')
+            .doc(widget.currentUserId)
+            .get();
+        if (userProfile.exists &&
+            userProfile.data() != null &&
+            userProfile.data()!.containsKey('last_challenges_refresh')) {
+          lastRefresh = (userProfile.data()!['last_challenges_refresh']
+                  as Timestamp)
+              .toDate();
+        }
+      }
+    } catch (e) {
+      debugPrint("⚠️ Erreur lors de l'initialisation du cycle de défis: $e");
     }
 
     if (mounted) {
@@ -10278,7 +10407,6 @@ class _DefisScreenState extends State<DefisScreen> {
     }
   }
 
-// Cette fonction est appelée par le Widget Enfant quand le temps est écoulé
   // Cette fonction est appelée par le Widget Enfant quand le temps est écoulé
   Future<void> _triggerAutoRefresh() async {
     print("CYCLE TERMINÉ : ACTUALISATION AUTOMATIQUE");
@@ -10314,8 +10442,10 @@ class _DefisScreenState extends State<DefisScreen> {
     }
 
     String newLocationName = "Ma position";
-    _showStayChallengeNotification(
-        "Défi de zone", "Début du défi. Restez dans la zone pour valider.");
+    if (mounted) {
+      _showStayChallengeNotification(
+          "Défi de zone", "Début du défi. Restez dans la zone pour valider.");
+    }
 
     if (pos != null) {
       try {
@@ -10336,9 +10466,21 @@ class _DefisScreenState extends State<DefisScreen> {
 
     // 2. Mettre à jour la date en base
     final now = DateTime.now();
-    await _firestore.collection('user_stats').doc(widget.currentUserId).set(
-        {'last_challenges_refresh': FieldValue.serverTimestamp()},
-        SetOptions(merge: true));
+    try {
+      await _firestore.collection('user_stats').doc(widget.currentUserId).set(
+          {'last_challenges_refresh': FieldValue.serverTimestamp()},
+          SetOptions(merge: true));
+    } catch (e) {
+      debugPrint("⚠️ Erreur mise à jour user_stats dans _triggerAutoRefresh: $e");
+      // Fallback sur le document users en cas de restriction Firestore
+      try {
+        await _firestore.collection('users').doc(widget.currentUserId).set(
+            {'last_challenges_refresh': FieldValue.serverTimestamp()},
+            SetOptions(merge: true));
+      } catch (err) {
+        debugPrint("⚠️ Erreur fallback users: $err");
+      }
+    }
 
     // 3. Mettre à jour la date locale et la nouvelle Zone
     if (mounted) {
@@ -10606,68 +10748,90 @@ class _DefisScreenState extends State<DefisScreen> {
   void _showSnackBar(String message,
       {Color backgroundColor = Colors.black87,
       Duration duration = const Duration(seconds: 3)}) {
-    if (!context.mounted) return;
-    ScaffoldMessenger.of(context).removeCurrentSnackBar();
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        backgroundColor: backgroundColor,
-        duration: duration,
-      ),
-    );
+    if (!mounted || !context.mounted) return;
+    try {
+      ScaffoldMessenger.of(context).removeCurrentSnackBar();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(message),
+          backgroundColor: backgroundColor,
+          duration: duration,
+        ),
+      );
+    } catch (e) {
+      debugPrint("Impossible d'afficher le snackbar: $e");
+    }
   }
 
   void _showStayChallengeNotification(String title, String message) {
-    if (!context.mounted) return;
-    Get.snackbar(title, message,
-        snackPosition: SnackPosition.BOTTOM,
-        backgroundColor: Colors.blueGrey.shade900.withOpacity(0.9),
-        colorText: Colors.white,
-        duration: const Duration(seconds: 2));
+    // Vérification de sécurité pour éviter le crash "No Overlay"
+    if (!mounted || !context.mounted) return;
+    try {
+      if (Get.overlayContext != null) {
+        Get.snackbar(
+          title,
+          message,
+          snackPosition: SnackPosition.BOTTOM,
+          backgroundColor: Colors.blueGrey.shade900.withOpacity(0.9),
+          colorText: Colors.white,
+          duration: const Duration(seconds: 2),
+        );
+      }
+    } catch (e) {
+      debugPrint("Impossible d'afficher la notification: $e");
+    }
   }
 
   void _showStayChallengeCompletionDialog() {
-    if (!context.mounted) return;
-    if (_isStayChallengeDialogOpen) {
-      Get.back();
-      _isStayChallengeDialogOpen = false;
-    }
+    if (!mounted || !context.mounted) return;
+    try {
+      if (_isStayChallengeDialogOpen) {
+        Get.back();
+        _isStayChallengeDialogOpen = false;
+      }
 
-    _isStayChallengeDialogOpen = true;
-    Get.dialog(
-      AlertDialog(
-        title: const Text('Défi terminé'),
-        content: const Text(
-            '🎉 Félicitations ! Vous avez validé votre défi de zone. Bravo !'),
-        actions: [
-          TextButton(
-            onPressed: () {
-              _isStayChallengeDialogOpen = false;
-              Get.back();
-            },
-            child: const Text('OK'),
-          ),
-        ],
-      ),
-      barrierDismissible: false,
-    );
+      _isStayChallengeDialogOpen = true;
+      Get.dialog(
+        AlertDialog(
+          title: const Text('Défi terminé'),
+          content: const Text(
+              '🎉 Félicitations ! Vous avez validé votre défi de zone. Bravo !'),
+          actions: [
+            TextButton(
+              onPressed: () {
+                _isStayChallengeDialogOpen = false;
+                Get.back();
+              },
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+        barrierDismissible: false,
+      );
+    } catch (e) {
+      debugPrint("Impossible d'afficher la boîte de dialogue défi terminé: $e");
+    }
   }
 
   void _showCriticalModal(String title, String message) {
-    if (!context.mounted) return;
-    Get.dialog(
-      AlertDialog(
-        title: Text(title),
-        content: Text(message),
-        actions: [
-          TextButton(
-            onPressed: () => Get.back(),
-            child: const Text('OK'),
-          ),
-        ],
-      ),
-      barrierDismissible: false,
-    );
+    if (!mounted || !context.mounted) return;
+    try {
+      Get.dialog(
+        AlertDialog(
+          title: Text(title),
+          content: Text(message),
+          actions: [
+            TextButton(
+              onPressed: () => Get.back(),
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+        barrierDismissible: false,
+      );
+    } catch (e) {
+      debugPrint("Impossible d'afficher le dialogue critique: $e");
+    }
   }
 
 // --- CALCUL DYNAMIQUE DE RÉCOMPENSE ---
@@ -11173,41 +11337,45 @@ class _DefisScreenState extends State<DefisScreen> {
               newStatus == ChallengeStatus.rewardClaimed) ||
           c.status == ChallengeStatus.rewardClaimed)) {
         // Vérifier si le bonus a déjà été donné pour ce cycle
-        final statsDoc = await _firestore
-            .collection('user_stats')
-            .doc(widget.currentUserId)
-            .get();
-        final lastBonusDate =
-            statsDoc.data()?['last_all_challenges_bonus_date'] as Timestamp?;
-        final lastRefreshDate =
-            statsDoc.data()?['last_challenges_refresh'] as Timestamp?;
-
-        bool alreadyGiven = false;
-        if (lastBonusDate != null && lastRefreshDate != null) {
-          alreadyGiven = lastBonusDate.millisecondsSinceEpoch >
-              lastRefreshDate.millisecondsSinceEpoch;
-        }
-
-        if (!alreadyGiven) {
-          await _firestore
+        try {
+          final statsDoc = await _firestore
               .collection('user_stats')
               .doc(widget.currentUserId)
-              .set({
-            'last_all_challenges_bonus_date': FieldValue.serverTimestamp()
-          }, SetOptions(merge: true));
+              .get();
+          final lastBonusDate =
+              statsDoc.data()?['last_all_challenges_bonus_date'] as Timestamp?;
+          final lastRefreshDate =
+              statsDoc.data()?['last_challenges_refresh'] as Timestamp?;
 
-          final totalCount = _localPoiChallenges.length;
-          await widget.onUpdateUserChallenge(
-              challenge.copyWith(
-                  title: "BONUS FINAL : $totalCount/$totalCount Défis"),
-              5000);
+          bool alreadyGiven = false;
+          if (lastBonusDate != null && lastRefreshDate != null) {
+            alreadyGiven = lastBonusDate.millisecondsSinceEpoch >
+                lastRefreshDate.millisecondsSinceEpoch;
+          }
 
-          Future.delayed(const Duration(milliseconds: 500), () {
-            _showSnackBar(
-                "FÉLICITATIONS ! Vous avez complété tous les défis du cycle. Bonus de 5000 lames ajouté ! 🏆",
-                backgroundColor: Colors.purple,
-                duration: const Duration(seconds: 7));
-          });
+          if (!alreadyGiven) {
+            await _firestore
+                .collection('user_stats')
+                .doc(widget.currentUserId)
+                .set({
+              'last_all_challenges_bonus_date': FieldValue.serverTimestamp()
+            }, SetOptions(merge: true));
+
+            final totalCount = _localPoiChallenges.length;
+            await widget.onUpdateUserChallenge(
+                challenge.copyWith(
+                    title: "BONUS FINAL : $totalCount/$totalCount Défis"),
+                5000);
+
+            Future.delayed(const Duration(milliseconds: 500), () {
+              _showSnackBar(
+                  "FÉLICITATIONS ! Vous avez complété tous les défis du cycle. Bonus de 5000 lames ajouté ! 🏆",
+                  backgroundColor: Colors.purple,
+                  duration: const Duration(seconds: 7));
+            });
+          }
+        } catch (e) {
+          debugPrint("⚠️ Erreur Firestore bonus défis dans user_stats: $e");
         }
       }
     }
@@ -13557,9 +13725,10 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
       const double FE_RAIL_KM = 6.0;
       const double CONVERSION_CO2_POINTS = 1.0 / 40.0;
 
-      final List<dynamic> steps = leg['steps'] as List<dynamic>? ?? [];
+      final List<dynamic> steps = (leg['steps'] as List<dynamic>?) ?? [];
       for (var stepData in steps) {
-        final step = stepData as Map<String, dynamic>;
+        if (stepData == null || stepData is! Map) continue;
+        final step = Map<String, dynamic>.from(stepData);
 
         double distanceKm = 0.0;
         if (step['distance'] != null && step['distance']['value'] != null) {
@@ -18993,7 +19162,7 @@ class _StoreCardState extends State<StoreCard> {
   Future<Map<String, dynamic>> _verifyReceiptWithGemini(
       String rawText, bool serverValid, String serverReason,
       {double? extractedAmount, String? storeNameFound}) async {
-    // Si le LLM serveur a déjà rejeté, on rejette en affichant SA raison explicite
+    // ✅ RÈGLE D'OR : Le serveur est la seule source de vérité pour la validité du ticket
     if (!serverValid) {
       return {
         'valid': false,
@@ -19003,47 +19172,15 @@ class _StoreCardState extends State<StoreCard> {
       };
     }
 
-    // Vérification locale supplémentaire : cohérence du nom de magasin (tolérance)
-    final storeName = widget.store.name.toLowerCase();
-    final foundName = (storeNameFound ?? '').toLowerCase();
-
-    if (foundName.isNotEmpty && foundName != 'inconnu') {
-      final storeWords = storeName
-          .split(RegExp(r'[\s\-]+'))
-          .where((w) => w.length > 3)
-          .toList();
-      final foundWords = foundName
-          .split(RegExp(r'[\s\-]+'))
-          .where((w) => w.length > 3)
-          .toList();
-
-      bool hasCommonWord = false;
-      for (var sw in storeWords) {
-        if (foundWords.any((fw) => fw.contains(sw) || sw.contains(fw))) {
-          hasCommonWord = true;
-          break;
-        }
-      }
-
-      // Si aucun mot en commun ET que le nom du magasin n'est pas du tout dans le texte brut
-      if (!hasCommonWord &&
-          !rawText.toLowerCase().contains(storeName.split(' ').first)) {
-        return {
-          'valid': false,
-          'reason':
-              '❌ Le nom du magasin sur le ticket ("$foundName") ne correspond pas à "${widget.store.name}".',
-        };
-      }
-    }
-
-    // Vérification du montant extrait
+    // Vérification locale UNIQUEMENT pour le montant (UX rapide)
+    // Plus de vérification stricte du nom de magasin ici pour éviter les faux rejets
     if (extractedAmount == null || extractedAmount <= 0) {
       final parsedAmount = _parseReceiptAmount(rawText);
       if (parsedAmount == null) {
         return {
           'valid': false,
           'reason':
-              '❌ Impossible de lire le montant total sur le ticket. Veuillez reprendre une photo où le "Total" est bien visible.',
+              '❌ Impossible de lire le montant total sur le ticket. Veuillez reprendre une photo nette où le "Total" est bien visible.',
         };
       }
     }
@@ -24643,6 +24780,59 @@ class KinematicFilter {
   // faire "sauter" le point bleu au fix GPS suivant.
   int displaySnapIndex = -1;
 
+  // ═══════════════════════════════════════════════════════════════
+  // ⏱️ LATENCE GPS : âge du fix + temps de traitement + rendu
+  // ═══════════════════════════════════════════════════════════════
+  double _smoothedProcessingLatencySeconds = 0.0;
+  double _smoothedFixAgeSeconds = 0.0;
+  double _renderLatencySeconds = 0.016;
+  double _measuredIntervalSeconds = 1.0;
+
+  int _targetRouteIndex = -1;
+  DateTime? _targetUpdatedAt;
+
+  /// Latence totale lissée utilisée pour projeter le point bleu plus loin.
+  /// Marche : max ~0.90s. Vélo/véhicule : max ~1.40s.
+  double get totalLatencySeconds {
+    final double raw = _smoothedFixAgeSeconds +
+        _smoothedProcessingLatencySeconds +
+        _renderLatencySeconds;
+
+    return raw.clamp(0.0, _isWalking ? 0.90 : 1.40).toDouble();
+  }
+
+  int get totalLatencyMs => (totalLatencySeconds * 1000).round();
+
+  /// Met à jour les latences mesurées depuis NavigationController.
+  void updateGpsLatency({
+    required int intervalMs,
+    required int processingMs,
+    required int fixAgeMs,
+    int renderMs = 16,
+  }) {
+    final double interval =
+        (intervalMs / 1000.0).clamp(0.25, 3.0).toDouble();
+
+    final double proc =
+        (processingMs / 1000.0).clamp(0.0, 1.0).toDouble();
+
+    final double age =
+        (fixAgeMs / 1000.0).clamp(0.0, 1.5).toDouble();
+
+    final double render =
+        (renderMs / 1000.0).clamp(0.004, 0.050).toDouble();
+
+    _measuredIntervalSeconds = interval;
+    _renderLatencySeconds = render;
+
+    // Lissage exponentiel pour éviter les pics brutaux.
+    _smoothedProcessingLatencySeconds =
+        (_smoothedProcessingLatencySeconds * 0.70) + (proc * 0.30);
+
+    _smoothedFixAgeSeconds =
+        (_smoothedFixAgeSeconds * 0.70) + (age * 0.30);
+  }
+
   // ═══ AJOUT : Filtrage qualité GPS (anti-téléportation / anti-fix aberrant) ═══
   double _lastRawAccuracy = 999.0;
   LatLng? _lastConfirmedSnappedPos;
@@ -24785,6 +24975,16 @@ class KinematicFilter {
 
     _lastGpsUpdateTime = now;
     _lastGpsIntervalSeconds = dt;
+
+    // Utilise aussi l'intervalle réel mesuré si le timestamp GPS est bizarre.
+    if (_measuredIntervalSeconds > 0.25) {
+      if (_lastGpsIntervalSeconds < 0.05 || _lastGpsIntervalSeconds > 3.0) {
+        _lastGpsIntervalSeconds = _measuredIntervalSeconds;
+      } else {
+        _lastGpsIntervalSeconds =
+            (_lastGpsIntervalSeconds * 0.6) + (_measuredIntervalSeconds * 0.4);
+      }
+    }
 
     double vInst = rawPos.speed;
 
@@ -25042,7 +25242,18 @@ class KinematicFilter {
 
       // 🔧 Budget de déplacement réaliste depuis le dernier fix GPS : empêche
       // le snap de se verrouiller loin en avant "par-dessus" un virage.
-      final double moveBudget = _vehicleSpeedMps * _lastGpsIntervalSeconds;
+      final double stopThresholdForBudget =
+          _isWalking ? _walkingStopSpeed : _vehicleStopSpeed;
+
+      final bool likelyStoppedBudget =
+          _vehicleSpeedMps < stopThresholdForBudget &&
+              _lastRawSpeedMps < stopThresholdForBudget;
+
+      final double latencyBudget =
+          likelyStoppedBudget ? 0.0 : totalLatencySeconds;
+
+      final double moveBudget =
+          _vehicleSpeedMps * (_lastGpsIntervalSeconds + latencyBudget);
       final double maxAhead = moveBudget + (_isWalking ? 6.0 : 20.0);
       final double maxBehind = _isWalking ? 12.0 : 35.0;
 
@@ -25180,6 +25391,8 @@ class KinematicFilter {
       _lastConfirmedSnappedPos = _snappedGpsPos;
       _lastConfirmedRouteIndex = lastRouteIndex;
 
+      final double latencyCompensation = isStopped ? 0.0 : totalLatencySeconds;
+
       double lookahead = _normalLookaheadSeconds;
 
       if (isStopped) {
@@ -25188,6 +25401,9 @@ class KinematicFilter {
         lookahead = _brakingLookaheadSeconds +
             (1.0 - _brakingIntensity) *
                 (_normalLookaheadSeconds - _brakingLookaheadSeconds);
+
+        // ⏱️ Compensation de la latence GPS + traitement + rendu.
+        lookahead += latencyCompensation;
       }
 
       // ═══ AJOUT : projection KINÉMATIQUE (et non plus vitesse constante) ═══
@@ -25211,7 +25427,7 @@ class KinematicFilter {
       // virage ou un rond-point, le vol d'oiseau sous-estime l'écart réel
       // et laissait passer des cas incohérents.
       final double maxCoherentGap =
-          (_vehicleSpeedMps * _normalLookaheadSeconds) +
+          (_vehicleSpeedMps * (_normalLookaheadSeconds + latencyCompensation)) +
               (_isWalking ? 4.0 : 8.0); // marge de sécurité (bruit GPS)
 
       final double coherentLookaheadDistance =
@@ -25225,6 +25441,17 @@ class KinematicFilter {
         routePolyline,
         rawIndex,
       );
+
+      _targetRouteIndex = _findRouteIndex(
+        _targetPos!,
+        heading,
+        routePolyline,
+        rawIndex,
+        maxAheadMeters: 150.0,
+        maxBehindMeters: 40.0,
+      );
+
+      _targetUpdatedAt = DateTime.now();
 
       // Si on est arrêté, la cible redevient le point GPS projeté
       final LatLng referencePos = isStopped ? _snappedGpsPos! : _targetPos!;
@@ -25240,6 +25467,53 @@ class KinematicFilter {
       _lastReferencePos = referencePos;
       _lastReferenceIndex = referenceIndex;
       _lastIsStopped = isStopped;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // ⏱️ AVANCE CONTINUE DU POINT DE PROJECTION (POINT B)
+    // Le point bleu ne doit pas rester figé entre deux fixes GPS.
+    // ═══════════════════════════════════════════════════════════
+    if (_targetPos != null &&
+        _targetRouteIndex >= 0 &&
+        routePolyline.length >= 2 &&
+        !isStationary) {
+      final double sinceTargetUpdate = _targetUpdatedAt != null
+          ? now.difference(_targetUpdatedAt!).inMilliseconds / 1000.0
+          : 999.0;
+
+      // Si le GPS est resté muet trop longtemps, on évite un saut énorme.
+      if (sinceTargetUpdate > 1.5) {
+        _targetUpdatedAt = now;
+      } else if (sinceTargetUpdate > 0.016) {
+        final double targetMove = _kinematicLookaheadDistance(
+          _vehicleSpeedMps,
+          sinceTargetUpdate,
+        );
+
+        if (targetMove > 0.008) {
+          _targetPos = _advanceForwardAlongRoute(
+            _targetPos!,
+            targetMove,
+            routePolyline,
+            _targetRouteIndex,
+          );
+
+          _targetRouteIndex = _findRouteIndex(
+            _targetPos!,
+            lastRealPos?.heading ?? 0.0,
+            routePolyline,
+            _targetRouteIndex,
+            maxAheadMeters: 80.0,
+            maxBehindMeters: 30.0,
+          );
+
+          _targetUpdatedAt = now;
+          if (!_lastIsStopped) {
+            _lastReferencePos = _targetPos;
+            _lastReferenceIndex = _targetRouteIndex;
+          }
+        }
+      }
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -25890,5 +26164,12 @@ class KinematicFilter {
     _snappedGpsIndex = 0;
     lastRouteIndex = -1;
     displaySnapIndex = -1;
+
+    _smoothedProcessingLatencySeconds = 0.0;
+    _smoothedFixAgeSeconds = 0.0;
+    _renderLatencySeconds = 0.016;
+    _measuredIntervalSeconds = 1.0;
+    _targetRouteIndex = -1;
+    _targetUpdatedAt = null;
   }
 }

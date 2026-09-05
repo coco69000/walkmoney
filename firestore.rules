@@ -1,142 +1,197 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+
+    // ── HELPERS DE SÉCURITÉ ──────────────────────────────────────────────────
+    function isAuthenticated() {
+      return request.auth != null;
+    }
     
-    // Helper : Vérifier si l'utilisateur est admin (Custom Claim admin: true)
-    function isAdmin() {
-      return request.auth != null && request.auth.token.admin == true;
-    }
-
-    // Helper : Vérifier si c'est le propriétaire des données
     function isOwner(userId) {
-      return request.auth != null && request.auth.uid == userId;
+      return isAuthenticated() && request.auth.uid == userId;
     }
 
-    // Règle globale pour la collection des utilisateurs (RGPD : lecture stricte réservée au seul propriétaire)
+    function isAdmin() {
+      return isAuthenticated() && request.auth.token.admin == true;
+    }
+
+    // ── RÈGLE PAR DÉFAUT : REFUS TOTAL ──────────────────────────────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ── PROFIL UTILISATEUR ──────────────────────────────────────────────────
     match /users/{userId} {
-      allow read: if isOwner(userId) || isAdmin();
+      // Lecture : Publique (permet l'affichage du classement et des profils publics sans blocage d'authentification)
+      allow read: if true;
       
-      // L'utilisateur peut mettre à jour son profil (ex: domicile, nom), mais NE PEUT PAS modifier ses champs sensibles
-      allow update: if isOwner(userId)
-                    && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
-                         'lame_points', 
-                         'total_lame_earned', 
-                         'is_vip', 
-                         'consecutive_logins',
-                         'ad_points',
-                         'store_boosts',
-                         'next_level_boost',
-                         'last_trip_timestamp',
-                         'loyalty_progress',
-                         'stripe_customer_id',
-                         'stripe_subscription_id',
-                         'stripe_subscription_item_id',
-                         'last_ad_point_timestamp',
-                         'last_store_boost_timestamp',
-                         'last_ocr_timestamp'
-                       ]);
-                       
-      allow create: if isOwner(userId) || isAdmin();
+      // Création : Seulement par le propriétaire à l'inscription (avec validation anti-usurpation)
+      allow create: if isOwner(userId)
+        && (!('lame_points' in request.resource.data) || request.resource.data.lame_points == 0)
+        && (!('total_lame_earned' in request.resource.data) || request.resource.data.total_lame_earned == 0)
+        && (!('is_vip' in request.resource.data) || request.resource.data.is_vip == false)
+        && (!('role' in request.resource.data) || request.resource.data.role == 'user');
+
+      // Mise à jour :
+      // 1. Le propriétaire peut modifier son profil SAUF les champs d'autorité serveur
+      // 2. OU un autre utilisateur authentifié peut UNIQUEMENT envoyer/accepter des demandes d'amis
+      allow update: if (
+        isOwner(userId) && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'lame_points',
+          'total_lame_earned',
+          'is_vip',
+          'role',
+          'current_level',
+          'next_level_boost',
+          'unlocked_badges',
+          'consecutive_logins',
+          'ad_points',
+          'store_boosts',
+          'stripe_customer_id',
+          'stripe_subscription_id',
+          'stripe_subscription_item_id'
+        ])
+      ) || (
+        isAuthenticated() && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'friend_requests_received',
+          'friend_requests_sent',
+          'friend_ids'
+        ])
+      );
+
       allow delete: if isAdmin();
+
+      // ── SOUS-COLLECTIONS UTILISATEUR ──────────────────────────────────────
+
+      // Historique des gains de Lames (Géré exclusivement par Cloud Functions sécurisées)
+      match /lame_history/{historyId} {
+        allow read: if isOwner(userId) || isAdmin();
+        allow write: if false;
+      }
+
+      // Logs de trajet (Création/mise à jour par le client, suppression strictement interdite pour anti-triche)
+      match /trip_logs/{tripId} {
+        allow read, create: if isOwner(userId);
+        allow update: if isOwner(userId) && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'validation_status',
+          'validated_at'
+        ]);
+        allow delete: if false; // Empêche la suppression des trajets flagués comme triche
+      }
+
+      // Historique de cashback magasin (Écriture serveur uniquement via claimCashback)
+      match /cashback_history/{cbId} {
+        allow read: if isOwner(userId) || isAdmin();
+        allow write: if false;
+      }
     }
 
-    // Sous-collections sous /users/{userId}
-    match /users/{userId}/lame_history/{document=**} {
-      allow read: if isOwner(userId) || isAdmin();
-      allow write: if false;
-    }
-
-    match /users/{userId}/trip_logs/{docId} {
-      allow read, create: if isOwner(userId);
-      allow update: if isOwner(userId)
-                    && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
-                         'validation_status',
-                         'validated_at',
-                         'lames_earned'
-                       ]);
-      allow delete: if isOwner(userId) || isAdmin();
-    }
-
-    match /users/{userId}/cashback_history/{docId} {
-      allow read: if isOwner(userId) || isAdmin();
-      allow write: if false;
-    }
-
-    // Protection des réclamations de tickets anti-rejeu (Hash SHA-256)
-    match /cashback_claims/{docId} {
-      allow read: if request.auth != null;
-      allow write: if false;
-    }
-
-    // Statistiques des utilisateurs (Gérées uniquement par Cloud Functions)
+    // ── STATISTIQUES UTILISATEUR (Collection Racine) ─────────────────────────
     match /user_stats/{userId} {
       allow read: if isOwner(userId) || isAdmin();
-      allow write: if false;
+      // Permet au client de rafraîchir les timestamps de défis locaux, mais interdit de modifier les totaux/points
+      allow create, update: if isOwner(userId) && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+        'total_lame_earned',
+        'total_trips',
+        'total_distance_meters',
+        'total_duration_seconds',
+        'total_calories',
+        'daily_ad_views',
+        'daily_store_boosts'
+      ]);
+      allow delete: if false;
     }
 
-    // Journaux d'activité utilisateur (top-level)
-    match /user_activity_logs/{docId} {
-      allow read, create: if request.auth != null;
-    }
-
-    // Agrégat du classement public (Généré par Cloud Function)
-    match /leaderboards/{docId} {
-      allow read: if request.auth != null;
-      allow write: if false;
-    }
-
-    // Défis généraux et défis utilisateur (Validation par Cloud Function)
-    match /challenges/{docId} {
-      allow read: if request.auth != null;
-      allow create, update, delete: if isAdmin();
+    // ── DÉFIS GLOBAUX & PROGRESSION UTILISATEUR ──────────────────────────────
+    match /challenges/{challengeId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
     }
 
     match /user_challenges/{docId} {
-      allow read: if request.auth != null;
-      allow write: if false;
+      allow read: if isAuthenticated() && (
+        resource.data.user_id == request.auth.uid ||
+        docId.matches('^' + request.auth.uid + '_.*') ||
+        isAdmin()
+      );
+      allow create, update: if isAuthenticated() && request.resource.data.user_id == request.auth.uid;
+      allow delete: if isAdmin();
     }
 
-    // Offres réclamées (Créées uniquement par Cloud Functions)
-    match /user_claimed_offers/{docId} {
-      allow read: if request.auth != null;
-      allow write: if false;
-    }
-
+    // ── COMMERCES & TRANSACTIONS ─────────────────────────────────────────────
     match /stores/{storeId} {
       allow read: if true;
-      allow create, update, delete: if isAdmin();
+      allow write: if isAdmin();
+
+      match /store_transactions/{transId} {
+        allow read: if isAuthenticated();
+        allow write: if false; // Écriture exclusivement gérée par claimCashback
+      }
     }
 
+    // ── BOUTIQUE & RÉCOMPENSES ───────────────────────────────────────────────
     match /shop_items/{itemId} {
       allow read: if true;
-      allow create, update, delete: if isAdmin();
+      allow write: if isAdmin();
     }
 
     match /rewards/{rewardId} {
       allow read: if true;
-      allow create, update, delete: if isAdmin();
+      allow write: if isAdmin();
     }
 
-    // Concours et participations (Gérés uniquement par Cloud Functions)
-    match /contests/{contestId} {
-      allow read: if request.auth != null;
+    match /user_claimed_offers/{docId} {
+      allow read: if isAuthenticated() && (resource.data.user_id == request.auth.uid || isAdmin());
       allow write: if false;
+    }
+
+    // ── CONCOURS & ENCHÈRES (Gestion autoritaire Cloud Functions) ────────────
+    match /contests/{contestId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
     }
 
     match /contest_state/{contestId} {
-      allow read: if request.auth != null;
-      allow write: if false;
+      allow read: if isAuthenticated();
+      allow write: if false; // Géré par placeBid / purchaseRaffleTicket
     }
 
     match /contest_entries/{entryId} {
-      allow read: if request.auth != null;
-      allow write: if false;
+      allow read: if isAuthenticated();
+      allow write: if false; // Seul le serveur valide les entrées et déduit les Lames
     }
 
-    // Dons aux campagnes (Gérés uniquement par Cloud Functions)
+    // ── DONATIONS & CAMPAGNES ────────────────────────────────────────────────
     match /campaign_donations/{donationId} {
-      allow read: if request.auth != null;
-      allow write: if false;
+      allow read: if isAuthenticated();
+      allow write: if false; // Géré par processDonation
+    }
+
+    // ── VALIDATION OCR & JETONS ANTI-REJEU ───────────────────────────────────
+    match /ocr_validations/{tokenId} {
+      allow read: if isAuthenticated() && resource.data.user_id == request.auth.uid;
+      allow write: if false; // Géré par processReceiptOCR
+    }
+
+    match /cashback_claims/{claimHash} {
+      allow read, write: if false; // Hash SHA-256 privé exclusivement géré par le backend
+    }
+
+    // ── CLASSEMENT & LOGS ────────────────────────────────────────────────────
+    match /leaderboards/{boardId} {
+      allow read: if true;
+      allow write: if false; // Généré par la fonction planifiée updateDailyLeaderboard
+    }
+
+    match /user_activity_logs/{docId} {
+      allow read: if isAuthenticated() && (resource.data.user_id == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && request.resource.data.user_id == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    match /admin_logs/{logId} {
+      allow read, write: if isAdmin();
     }
   }
 }
+

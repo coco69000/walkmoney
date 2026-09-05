@@ -15,8 +15,8 @@ configurations.all {
 android {
     namespace = "com.parrel.walkmoney"
 
-    // Google Navigation nécessite souvent un compileSdk récent (34 ou 35)
-    compileSdk = flutter.compileSdkVersion
+    // Flutter secure storage et composants récents requièrent compileSdk 37
+    compileSdk = 37
 
     ndkVersion = "28.1.13356709"
 
