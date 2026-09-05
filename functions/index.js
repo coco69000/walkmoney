@@ -289,22 +289,32 @@ async function analyzeReceiptWithNvidia(base64Image, mimeType, storeName) {
     // Nettoyer le nom du magasin pour le prompt
     const safeStoreName = (storeName || 'Commerce').replace(/[^a-zA-Z0-9\s\-\.\'\&]/g, '').trim().substring(0, 50) || 'Commerce';
 
-    const prompt = `Tu es un expert strict en détection de fraude et en OCR de tickets de caisse pour une application de cashback. Ta mission est de valider ou rejeter ce document de manière rigoureuse.
+    const prompt = `Tu es un expert strict en vérification de tickets de caisse et en détection de fraude pour une application de cashback. Ton but est de valider l'authenticité du ticket et d'exclure toute tentative de falsification ou de triche.
 
 Analyse l'image fournie qui est censée être un ticket de caisse du magasin : "${safeStoreName}".
 
-ÉVALUATION STRICTE (Tu dois rejeter le ticket si l'une de ces conditions n'est pas remplie) :
-1. EST-CE UN VRAI TICKET ? : Ce doit être un vrai ticket de caisse imprimé ou un reçu numérique officiel. Rejette immédiatement les captures d'écran d'applications, les notes manuscrites, les documents vierges ou les images manifestement retouchées.
-2. CORRESPONDANCE DU MAGASIN : Le nom du magasin imprimé sur le ticket doit correspondre clairement à "${safeStoreName}". Une légère variation orthographique est acceptable, mais si c'est un magasin complètement différent ou si le nom est "Inconnu", c'est un REJET IMMÉDIAT.
-3. MONTANT CLAIR : Il doit y avoir un montant total (TTC, Total, Net à payer) clairement identifiable et supérieur à 0.
-4. DATE : Une date doit être visible.
+ÉVALUATION STRICTE ET DÉTECTION DE TRICHE :
+1. DÉTECTION DE TRICHE ET FALSIFICATION :
+   - Inspecte minutieusement le document pour détecter toute altération : ratures, texte barré, annotations manuelles au stylo ou au feutre remplaçant du texte imprimé, collage ou photomontage.
+   - Si le nom du magasin imprimé à l'origine semble avoir été rayé, masqué ou modifié manuellement (par ex. pour écrire ou faire croire qu'il s'agit de "${safeStoreName}"), marque IMMÉDIATEMENT le ticket comme INVALIDE (valid: false) avec une explication claire.
+   - Rejette immédiatement les faux tickets, les notes manuscrites, les captures d'écran d'applications ou d'autres écrans de téléphone, et les images tronquées ne montrant pas un vrai ticket.
 
-Tu dois répondre EXCLUSIVEMENT avec un objet JSON valide (aucun texte avant ou après, aucune balise markdown comme \`\`\`json). 
+2. CORRESPONDANCE DU MAGASIN :
+   - Identifie le nom officiel de l'enseigne imprimé sur le ticket ("storeNameFound").
+   - Il doit correspondre clairement à "${safeStoreName}". Si le ticket provient d'une autre enseigne (ex: ticket Carrefour pour une visite Auchan), c'est un REJET IMMÉDIAT (valid: false).
+
+3. MONTANT TOTAL TTC :
+   - Extrais le montant total payé TTC (Total, Net à payer, Total TTC). Ce montant doit être supérieur à 0 et clairement imprimé sur le reçu (pas ajouté à la main).
+
+4. DATE DU TICKET :
+   - Une date de transaction doit être visible sur le ticket.
+
+Tu dois répondre EXCLUSIVEMENT avec un objet JSON valide (aucun texte avant ou après, aucune balise markdown comme \`\`\`json).
 
 Format de réponse JSON strict :
 {
   "valid": true ou false,
-  "reason": "Si valid est false, explique EXPLICITEMENT et en une phrase précise pourquoi (ex: 'Le magasin trouvé est X, pas Y', 'Aucun montant total lisible', 'Document suspecté d'être une capture d'écran'). Si valid est true, mets 'OK'.",
+  "reason": "Si valid est false, explique PRÉCISÉMENT et en une phrase claire pourquoi (ex: 'Le nom du magasin semble avoir été raturé ou modifié manuellement', 'Le ticket provient de X au lieu de Y', 'Montant total introuvable ou illisible'). Si valid est true, mets 'OK'.",
   "extractedText": "Le texte brut extrait du ticket (concentre-toi sur l'en-tête avec le nom du magasin et le pied de page avec le total)",
   "storeNameFound": "Le nom exact du magasin tel qu'il apparaît sur le ticket (ou 'Inconnu')",
   "amount": nombre_decimal (ex: 15.50) ou null si introuvable,
@@ -313,7 +323,7 @@ Format de réponse JSON strict :
 }
 
 Règles absolues :
-- Si le magasin ne correspond pas, valid DOIT être false et reason DOIT le mentionner explicitement.
+- Si le ticket semble falsifié, altéré ou si le magasin ne correspond pas, valid DOIT être false et reason DOIT le mentionner explicitement.
 - Ne sois pas indulgent. En cas de doute sur l'authenticité ou le magasin, rejette (valid: false).
 - Ne génère AUCUN texte en dehors du JSON.`;
 
@@ -513,9 +523,13 @@ exports.validateTrip = onCall(async (request) => {
     const tripId = data.tripId || null; // 🆕 L'ID du document trip_logs
     const isSpecialBonus = data.isSpecialBonus === true || (source && source.toLowerCase().includes('bonus'));
 
-    // 🚨 FIX 1 : tripId est STRICTEMENT OBLIGATOIRE pour les trajets normaux (hors défis et bonus spéciaux)
+    // 🚨 FIX 1 : tripId ou données GPS obligatoires pour les trajets normaux (hors défis et bonus spéciaux)
     if (!challengeId && !tripId && !isSpecialBonus) {
-        throw new HttpsError('invalid-argument', 'ID de trajet manquant (tripId obligatoire).');
+        // Si on n'a pas d'ID de trajet, on exige impérativement la distance et la durée pour valider
+        if (!data.distanceMeters || !data.durationSeconds) {
+            throw new HttpsError('invalid-argument', 'ID de trajet manquant ET données GPS incomplètes.');
+        }
+        console.warn(`⚠️ Validation de trajet sans tripId explicite pour ${userId}, fallback sur données GPS.`);
     }
 
     const rawMode = (data.travelMode || 'walking').toString().toLowerCase();
@@ -607,9 +621,12 @@ exports.validateTrip = onCall(async (request) => {
                 // Récupération stricte depuis la BD pour les calculs anti-triche
                 dbDistanceMeters = Number(tripLogData.actual_distance_meters ?? dbDistanceMeters);
                 dbDurationSeconds = Number(tripLogData.actual_duration_seconds ?? dbDurationSeconds);
+            }
 
+            // Validation physique et cohérence pour tout trajet classique (avec ou sans tripId)
+            if (!isVerifiedChallenge && !isSpecialBonus) {
                 if (dbDistanceMeters <= 0) {
-                    throw new HttpsError('invalid-argument', 'Distance de trajet enregistrée en BD invalide.');
+                    throw new HttpsError('invalid-argument', 'Distance de trajet invalide.');
                 }
 
                 // Validation Physique Serveur

@@ -2727,11 +2727,14 @@ class NavigationController extends GetxController {
       _positionSampleCount = 0;
       final userPos = await homeController.getMyCurrentLocation();
       _tripStartPos = LatLng(userPos.latitude, userPos.longitude);
-      final docRef = await FirebaseFirestore.instance
+      final tripDocRef = FirebaseFirestore.instance
           .collection('users')
           .doc(userId)
           .collection('trip_logs')
-          .add({
+          .doc();
+      _activeTripId = tripDocRef.id;
+      _lastCompletedTripId = _activeTripId;
+      await tripDocRef.set({
         'user_id': userId,
         'travel_mode': modeStr,
         'start_lat': userPos.latitude,
@@ -2755,7 +2758,6 @@ class NavigationController extends GetxController {
         'positions': [],
         'lames_earned': 0,
       });
-      _activeTripId = docRef.id;
     } catch (e) {
       debugPrint('[TripLog] Erreur démarrage: $e');
     }
@@ -2895,6 +2897,7 @@ class NavigationController extends GetxController {
       _onWorkReached = cb;
   void setOnNormalDestinationReachedCallback(Function(int, String?) cb) =>
       onNormalDestinationReached = cb;
+  String? get lastCompletedTripId => _lastCompletedTripId ?? _activeTripId;
 
   /// Transmettre le profil utilisateur pour la tolérance déviation (3km standard / 6km premium)
   void setActiveUserProfile(UserProfile? profile) =>
@@ -4706,7 +4709,7 @@ class NavigationController extends GetxController {
     final bool isChallengeTrip = activeChallenge != null;
     int lamesGagnees = homeController.activeRouteEstimatedGain.value;
 
-    _lastCompletedTripId = _activeTripId;
+    _lastCompletedTripId = _activeTripId ?? _lastCompletedTripId;
     _endTripLog(
         status: 'completed',
         finalDistanceMeters: homeController.activeRouteRawDistanceMeters.value,
@@ -13013,6 +13016,9 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
     // Câbler le callback pour les trajets normaux (sans magasin/défi/travail)
     navigationController
         .setOnNormalDestinationReachedCallback((int gain, String? tripId) {
+      final String? finalTripId =
+          tripId ?? navigationController.lastCompletedTripId;
+
       final tripMeta = {
         'avgSpeedKmh': navigationController._speedHistory.isNotEmpty
             ? navigationController._speedHistory.reduce((a, b) => a + b) /
@@ -13036,7 +13042,7 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
       (widget.addLamePoints as dynamic)(
         gain,
         source: "Trajet",
-        tripId: tripId,
+        tripId: finalTripId,
         tripMetadata: tripMeta,
         distanceMeters: homeController.activeRouteRawDistanceMeters.value,
         durationSeconds: homeController.activeRouteRawDurationSeconds.value,
@@ -19037,100 +19043,115 @@ class _StoreCardState extends State<StoreCard> {
 
     if (photo == null || !mounted) return;
 
+    // 1. Affichage du loader
     showDialog(
       context: context,
-      barrierDismissible: false,
+      barrierDismissible: false, // Empêche de fermer en cliquant dehors
       builder: (c) => const AlertDialog(
-        content: Column(mainAxisSize: MainAxisSize.min, children: [
-          CircularProgressIndicator(),
-          SizedBox(height: 16),
-          Text("Analyse du ticket par IA..."),
-        ]),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            CircularProgressIndicator(),
+            SizedBox(height: 16),
+            Text("Analyse du ticket par IA..."),
+          ],
+        ),
       ),
     );
 
     try {
+      // 2. Appel à l'IA
       final ocrResult = await _performSecureOCR(photo.path);
+
       final rawText = ocrResult['text'] as String? ?? '';
       final bool serverValid = ocrResult['serverValid'] == true;
       final String serverReason = ocrResult['serverReason'] as String? ?? '';
       final String? receiptToken = ocrResult['receiptToken'] as String?;
-      final double? extractedAmount = (ocrResult['amount'] as num?)?.toDouble();
+      final double? extractedAmount =
+          (ocrResult['amount'] as num?)?.toDouble();
       final String? storeNameFound = ocrResult['storeNameFound'] as String?;
 
-      if (rawText.isEmpty && !serverValid) {
-        if (Get.isDialogOpen ?? false) Get.back();
-        _showReceiptRejectedDialog(
-            '❌ Erreur d\'analyse: Impossible de lire le ticket. Veuillez réessayer.');
-        return;
+      // 3. FERMETURE DU LOADER ICI (CRUCIAL)
+      // On vérifie si une dialog est ouverte et on la ferme
+      if (mounted && Navigator.canPop(context)) {
+        Navigator.of(context).pop();
+      } else if (Get.isDialogOpen ?? false) {
+        Get.back();
       }
 
-      if (Get.isDialogOpen ?? false) Get.back();
       if (!mounted) return;
 
-      // Vérification finale
+      // 4. Vérification finale
       final check = await _verifyReceiptWithGemini(
-          rawText, serverValid, serverReason,
-          extractedAmount: extractedAmount, storeNameFound: storeNameFound);
+        rawText,
+        serverValid,
+        serverReason,
+        extractedAmount: extractedAmount,
+        storeNameFound: storeNameFound,
+      );
 
       if (!(check['valid'] as bool)) {
+        // Si refusé : affiche la raison personnalisée de l'IA
         _showReceiptRejectedDialog(check['reason'] as String);
         return;
       }
 
-      // Utiliser le montant extrait par le LLM, ou fallback sur le parsing local
-      double? amount = extractedAmount;
-      if (amount == null || amount <= 0) {
-        amount = _parseReceiptAmount(rawText);
-      }
-
-      if (amount == null) {
-        _showReceiptRejectedDialog(
-            "Impossible de lire le montant automatiquement. Veuillez reprendre une photo avec le total bien visible.");
+      // Si accepté : affiche le popup de cashback
+      if (extractedAmount != null && extractedAmount > 0) {
+        _showCashbackPopup(extractedAmount, rawText, receiptToken: receiptToken);
       } else {
-        _showCashbackPopup(amount, rawText, receiptToken: receiptToken);
+        // Cas rare où l'IA valide mais ne trouve pas de montant
+        _showReceiptRejectedDialog(
+            "Ticket validé mais montant illisible. Veuillez réessayer.");
       }
     } catch (e) {
-      if (Get.isDialogOpen ?? false) Get.back();
+      // Sécurité : fermer le loader en cas d'erreur critique
+      if (mounted && Navigator.canPop(context)) {
+        Navigator.of(context).pop();
+      } else if (Get.isDialogOpen ?? false) {
+        Get.back();
+      }
+
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-              content: Text("Erreur analyse: $e"), backgroundColor: Colors.red),
+              content: Text("Erreur analyse: $e"),
+              backgroundColor: Colors.red),
         );
       }
     }
   }
 
-  /// Secure OCR via NVIDIA NIM (Cloud Function)
+  /// Secure OCR via NVIDIA NIM (Cloud Function) - LOGIQUE 100% IA
   Future<Map<String, dynamic>> _performSecureOCR(String imagePath) async {
     try {
       final File imageFile = File(imagePath);
       final bytes = await imageFile.readAsBytes();
       final base64Image = base64Encode(bytes);
 
-      // Appel à la Cloud Function (qui utilise NVIDIA NIM)
+      // Appel à la Cloud Function
       final HttpsCallable callable =
           FirebaseFunctions.instance.httpsCallable('processReceiptOCR');
 
       final response = await callable.call({
         'imageBase64': base64Image,
         'mimeType': 'image/jpeg',
-        'storeName': widget.store.name,
+        'storeName': widget.store.name, // Nom réel pour comparaison anti-triche
       });
 
       if (response.data != null) {
         final extractedText = response.data['text'] as String? ?? '';
         final bool serverValid = response.data['valid'] == true;
-        final String serverReason = response.data['reason'] as String? ?? '';
+        final String serverReason = response.data['reason'] as String? ??
+            'Ticket invalide selon l\'analyse IA.';
         final String? receiptToken = response.data['receiptToken'] as String?;
         final double? extractedAmount =
             (response.data['amount'] as num?)?.toDouble();
-        final String? extractedDate = response.data['date'] as String?;
         final String? storeNameFound =
             response.data['storeNameFound'] as String?;
 
         debugPrint(
-            '[NVIDIA NIM] Analyse terminée: Valid=$serverValid, Montant=$extractedAmount');
+            '[NVIDIA NIM] Analyse terminée: Valid=$serverValid, Montant=$extractedAmount, Raison=$serverReason');
 
         return {
           'text': extractedText,
@@ -19138,7 +19159,6 @@ class _StoreCardState extends State<StoreCard> {
           'serverReason': serverReason,
           'receiptToken': receiptToken,
           'amount': extractedAmount,
-          'date': extractedDate,
           'storeNameFound': storeNameFound,
         };
       }
@@ -19158,37 +19178,37 @@ class _StoreCardState extends State<StoreCard> {
     }
   }
 
-  /// Vérification finale du reçu (simplifiée - le gros du travail est fait par le serveur)
+  /// Vérification finale simplifiée : L'IA serveur est la seule source de vérité
   Future<Map<String, dynamic>> _verifyReceiptWithGemini(
-      String rawText, bool serverValid, String serverReason,
-      {double? extractedAmount, String? storeNameFound}) async {
-    // ✅ RÈGLE D'OR : Le serveur est la seule source de vérité pour la validité du ticket
+    String rawText,
+    bool serverValid,
+    String serverReason, {
+    double? extractedAmount,
+    String? storeNameFound,
+  }) async {
+    // Si l'IA a refusé (triche, ratures, faux magasin, faux ticket), on applique son motif
     if (!serverValid) {
       return {
         'valid': false,
         'reason': serverReason.isNotEmpty
             ? serverReason
-            : 'Le ticket ne correspond pas aux critères de validation (magasin, authenticité ou montant manquant).'
+            : 'Le ticket ne correspond pas aux critères de validation.',
       };
     }
 
-    // Vérification locale UNIQUEMENT pour le montant (UX rapide)
-    // Plus de vérification stricte du nom de magasin ici pour éviter les faux rejets
+    // Sécurité : l'IA a validé mais vérifions que le montant extrait est positif
     if (extractedAmount == null || extractedAmount <= 0) {
-      final parsedAmount = _parseReceiptAmount(rawText);
-      if (parsedAmount == null) {
-        return {
-          'valid': false,
-          'reason':
-              '❌ Impossible de lire le montant total sur le ticket. Veuillez reprendre une photo nette où le "Total" est bien visible.',
-        };
-      }
+      return {
+        'valid': false,
+        'reason':
+            'L\'IA a validé le ticket mais n\'a pas pu extraire un montant total clair. Veuillez réessayer.',
+      };
     }
 
     return {'valid': true, 'reason': ''};
   }
 
-  /// Popup de refus robuste et explicite
+  /// Popup de refus robuste affichant la raison personnalisée de l'IA
   void _showReceiptRejectedDialog(String reason) {
     showDialog(
       context: context,
@@ -19199,7 +19219,7 @@ class _StoreCardState extends State<StoreCard> {
           SizedBox(width: 8),
           Expanded(
               child:
-                  Text("Ticket refusé", style: TextStyle(color: Colors.red))),
+                  Text("Ticket Refusé", style: TextStyle(color: Colors.red))),
         ]),
         content: SingleChildScrollView(
           child: Column(
@@ -19207,11 +19227,10 @@ class _StoreCardState extends State<StoreCard> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Text(
-                "L'analyse IA a détecté un problème avec ce document :",
+                "L'intelligence artificielle a détecté un problème :",
                 style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
               ),
               const SizedBox(height: 8),
-              // Mise en évidence de la raison explicite de l'IA
               Container(
                 width: double.infinity,
                 padding: const EdgeInsets.all(12),
@@ -19236,10 +19255,9 @@ class _StoreCardState extends State<StoreCard> {
               ),
               const SizedBox(height: 6),
               const Text(
-                "• Assurez-vous que le nom du magasin est bien visible en haut du ticket.\n"
-                "• Le ticket doit être un original (pas de capture d'écran d'un autre téléphone).\n"
-                "• Le montant total (TTC) et la date doivent être parfaitement lisibles.\n"
-                "• Prenez la photo à plat, dans un endroit bien éclairé, sans reflets.",
+                "• Assurez-vous que le ticket est plat et bien éclairé.\n"
+                "• Ne cachez aucune information (date, montant, nom du magasin).\n"
+                "• Évitez les tickets froissés ou abîmés.",
                 style:
                     TextStyle(fontSize: 12, color: Colors.black87, height: 1.4),
               ),
@@ -19266,31 +19284,6 @@ class _StoreCardState extends State<StoreCard> {
         ],
       ),
     );
-  }
-
-  double? _parseReceiptAmount(String text) {
-    final patterns = [
-      RegExp(
-          r'(?:TOTAL|TOTAL TTC|NET À PAYER|À PAYER|MONTANT|SOLDE)[^\d]*(\d+[,\.]\d{2})',
-          caseSensitive: false),
-      RegExp(r'(\d+[,\.]\d{2})\s*(?:EUR|€)', caseSensitive: false),
-      RegExp(r'(?:EUR|€)\s*(\d+[,\.]\d{2})', caseSensitive: false),
-    ];
-    final candidates = <double>[];
-    for (final p in patterns) {
-      for (final m in p.allMatches(text)) {
-        final v = double.tryParse(m.group(1)!.replaceAll(',', '.'));
-        if (v != null && v > 0.5) candidates.add(v);
-      }
-    }
-    if (candidates.isEmpty) return null;
-    candidates.sort((a, b) => b.compareTo(a));
-    return candidates.first;
-  }
-
-  void _showManualAmountEntry(String rawText) {
-    _showReceiptRejectedDialog(
-        "Impossible de lire le montant automatiquement sur le ticket. Veuillez reprendre une photo bien nette avec le total visible.");
   }
 // Add this method inside class _StoreCardState
 
