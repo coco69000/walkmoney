@@ -1,0 +1,46 @@
+name: Build EcoNav iOS (Unsigned for Sideloadly)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    runs-on: macos-14
+    steps:
+      - name: 📥 Cloner le dépôt
+        uses: actions/checkout@v4
+
+      - name: 🛠️ Sélectionner Xcode 16
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
+          xcodebuild -version
+
+      - name: 🐦 Installer Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: ⚙️ Désactiver Swift Package Manager
+        run: flutter config --no-enable-swift-package-manager
+
+      - name: 📦 Récupérer les dépendances Flutter
+        run: flutter pub get
+
+      - name: 🔨 Compiler l'application iOS (Sans signature)
+        run: flutter build ios --release --no-codesign
+
+      - name: 📦 Créer le fichier .IPA pour Sideloadly
+        run: |
+          cd build/ios/iphoneos
+          mkdir -p Payload
+          cp -r Runner.app Payload/
+          zip -r EcoNav_unsigned.ipa Payload/
+          cd ../../..
+
+      - name: 🚀 Télécharger le fichier IPA (Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: EcoNav-iOS-IPA
+          path: build/ios/iphoneos/EcoNav_unsigned.ipa
+          retention-days: 7

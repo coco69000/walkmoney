@@ -5,19 +5,18 @@ flutter_native_splash:
   image: assets/logo1.png
   image_dark: assets/logo1.png
 
-  # Branding optionnel (décommentez si vous ajoutez assets/brand.png)
-  # branding: assets/brand.png
-  # branding_dark: assets/brand.png
-  # branding_mode: bottom
-  # branding_bottom_padding: 65
+  branding: assets/brand.png
+  branding_dark: assets/brand.png
+  branding_mode: bottom
+  branding_bottom_padding: 65
 
   android_12:
     color: "#0B3F48"
     icon_background_color: "#0B3F48"
     image: assets/logo1.png
-    # branding: assets/brand.png
-    # branding_mode: bottom
-    # branding_bottom_padding: 65
+    branding: assets/brand.png
+    branding_mode: bottom
+    branding_bottom_padding: 65
 
   android: true
   ios: true
