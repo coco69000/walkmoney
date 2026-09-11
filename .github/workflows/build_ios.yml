@@ -1,6 +1,8 @@
 name: Build EcoNav iOS (Unsigned for Sideloadly)
 
 on:
+  push:
+    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
