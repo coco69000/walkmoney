@@ -63,7 +63,7 @@ jobs:
         run: |
           # --no-codesign génère un .app non signé compatible Sideloadly
           # Par défaut, flutter build ios cible iphoneos (device), pas iphonesimulator
-          flutter build ios --release --no-codesign --verbose
+          flutter build ios --release --no-codesign
           
           # Vérification que c'est bien une build device
           if [ -d "build/ios/iphoneos/Runner.app" ]; then

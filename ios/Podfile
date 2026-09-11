@@ -59,6 +59,11 @@ post_install do |installer|
       # 🔒 SÉCURITÉ ANTI-SPM : Désactiver explicitement SPM au niveau Xcode
       config.build_settings['SWIFT_PACKAGE_MANAGER_ENABLE'] = 'NO'
       
+      # 🔒 DÉSACTIVER LA SIGNATURE SUR TOUS LES PODS (requis pour CI unsigned)
+      config.build_settings['CODE_SIGNING_ALLOWED'] = 'NO'
+      config.build_settings['CODE_SIGNING_REQUIRED'] = 'NO'
+      config.build_settings['CODE_SIGN_IDENTITY'] = '-'
+      
       # Permissions requises pour les capteurs et la caméra
       config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] ||= [
         '$(inherited)',
@@ -71,8 +76,21 @@ post_install do |installer|
     end
   end
   
+  # 🔒 Désactiver la signature sur TOUS les bundles de ressources (StripePaymentsUIBundle, etc.)
+  installer.target_installation_results.pod_target_installation_results.each do |pod_name, target_installation_result|
+    target_installation_result.resource_bundle_targets.each do |resource_bundle_target|
+      resource_bundle_target.build_configurations.each do |config|
+        config.build_settings['CODE_SIGNING_ALLOWED'] = 'NO'
+        config.build_settings['CODE_SIGNING_REQUIRED'] = 'NO'
+        config.build_settings['CODE_SIGN_IDENTITY'] = '-'
+      end
+    end
+  end
+
   # 🔒 Nettoyage agressif des références SPM résiduelles dans le projet Pods
   installer.pods_project.build_configurations.each do |config|
     config.build_settings['SWIFT_PACKAGE_MANAGER_ENABLE'] = 'NO'
+    config.build_settings['CODE_SIGNING_ALLOWED'] = 'NO'
+    config.build_settings['CODE_SIGNING_REQUIRED'] = 'NO'
   end
 end
