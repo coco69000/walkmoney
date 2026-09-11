@@ -518,30 +518,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "2.4.4"
-  flutter_osm_interface:
-    dependency: transitive
-    description:
-      name: flutter_osm_interface
-      sha256: fe7b02fee205aec861d0f08f643d4d6c49a5b9df06d3b43919fdf6699a275829
-      url: "https://pub.dev"
-    source: hosted
-    version: "1.4.0"
-  flutter_osm_plugin:
-    dependency: "direct main"
-    description:
-      name: flutter_osm_plugin
-      sha256: de2cf892501aafba79b36d29349bc9b7ad81fe851106f84cf104d63a3392876d
-      url: "https://pub.dev"
-    source: hosted
-    version: "1.4.4"
-  flutter_osm_web:
-    dependency: transitive
-    description:
-      name: flutter_osm_web
-      sha256: "4b457aed05915a4af820b74e8bd387a8d1b562b538b4cac14f8fadee9fffa80e"
-      url: "https://pub.dev"
-    source: hosted
-    version: "1.4.4"
   flutter_plugin_android_lifecycle:
     dependency: transitive
     description:
@@ -1168,14 +1144,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "0.2.1"
-  permission_manager:
-    dependency: transitive
-    description:
-      name: permission_manager
-      sha256: c3ad9951dd23fa713559a6dde3974421273b53cf62fe0088d2c860260fa03623
-      url: "https://pub.dev"
-    source: hosted
-    version: "2.0.9"
   petitparser:
     dependency: transitive
     description:
@@ -1216,14 +1184,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "6.1.5+1"
-  routing_client_dart:
-    dependency: transitive
-    description:
-      name: routing_client_dart
-      sha256: "4e2acf1145bb8056e04fd93101a9f2bab2fd769c9d972f7f403f9733a670cb33"
-      url: "https://pub.dev"
-    source: hosted
-    version: "0.5.5"
   rxdart:
     dependency: transitive
     description:

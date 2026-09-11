@@ -45,10 +45,6 @@
         android:name="flutterEmbedding"
         android:value="2" />
 
-    <service
-        android:name="com.custom.flutter_osm_plugin.LocationService"
-        android:foregroundServiceType="location"
-        android:exported="false" />
 
     <service
         android:name="id.flutter.flutter_background_service.BackgroundService"
