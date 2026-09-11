@@ -33,6 +33,17 @@ target 'Runner' do
   use_frameworks!
   use_modular_headers!
 
+  # === RÉSOLUTION CONFLITS PODS ===
+  # Force GoogleMaps compatible avec google_navigation_flutter
+  pod 'GoogleMaps', '10.7.0'
+
+  # Force GoogleUtilities compatible avec Firebase 11.x ET MLKit
+  pod 'GoogleUtilities/UserDefaults', '~> 8.1'
+
+  # Force MLKitVision compatible avec les deux plugins MLKit
+  pod 'MLKitVision', '~> 5.0'
+  # ================================
+
   flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
   
   target 'RunnerTests' do

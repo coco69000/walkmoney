@@ -42,17 +42,22 @@ jobs:
       - name: 📦 Récupérer les dépendances Flutter
         run: flutter pub get
 
-      - name: 🧹 Préparer CocoaPods (Anti-SPM)
+      - name: 🧹 Préparer CocoaPods (Anti-SPM + Fix Conflits)
         run: |
           cd ios
-          # Supprimer les caches SPM résiduels qui trompent Xcode 16
-          rm -rf Pods Podfile.lock .symlinks
+          # Supprimer uniquement les caches et DerivedData, PAS le Podfile.lock
           rm -rf ~/Library/Developer/Xcode/DerivedData/*
           
-          # Réinstaller proprement via CocoaPods
+          # Mettre à jour le repo UNE SEULE FOIS
           pod repo update
+          
+          # Installer en gardant le lock existant comme base
           pod install --repo-update
           cd ..
+        env:
+          COCOAPODS_DISABLE_STATS: true
+          SWIFT_PACKAGE_MANAGER_DISABLE: "1"
+          FLUTTER_DISABLE_SPM: "1"
 
       - name: 🔨 Compiler l'application iOS (Sans signature)
         run: |
