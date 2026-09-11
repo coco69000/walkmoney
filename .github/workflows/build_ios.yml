@@ -8,6 +8,12 @@ on:
 jobs:
   build-ios:
     runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      COCOAPODS_DISABLE_STATS: 'true'
+      SWIFT_PACKAGE_MANAGER_DISABLE: '1'
+      FLUTTER_DISABLE_SPM: '1'
+
     steps:
       - name: 📥 Cloner le dépôt
         uses: actions/checkout@v4
@@ -16,8 +22,12 @@ jobs:
         run: |
           # Sélectionne automatiquement Xcode 16.x installé
           DEVELOPER_DIR=$(find /Applications -maxdepth 1 -name "Xcode_16*.app" | sort -V | tail -n 1)/Contents/Developer
-          echo "Utilisation de : $DEVELOPER_DIR"
-          sudo xcode-select -s "$DEVELOPER_DIR"
+          if [ -z "$DEVELOPER_DIR" ]; then
+            echo "❌ Xcode 16 non trouvé, utilisation de la version par défaut"
+          else
+            echo "✅ Utilisation de : $DEVELOPER_DIR"
+            sudo xcode-select -s "$DEVELOPER_DIR"
+          fi
           xcodebuild -version
 
       - name: 🐦 Installer Flutter
@@ -26,30 +36,46 @@ jobs:
           channel: 'stable'
           cache: true
 
-      - name: 🛠️ Pré-créer les dossiers de build
-        run: |
-          mkdir -p build/ios/SourcePackages
-
-      - name: ⚙️ Désactiver Swift Package Manager
-        run: flutter config --no-enable-swift-package-manager
-
       - name: 📦 Récupérer les dépendances Flutter
         run: flutter pub get
 
+      - name: 🧹 Préparer CocoaPods (Anti-SPM)
+        run: |
+          cd ios
+          # Supprimer les caches SPM résiduels qui trompent Xcode 16
+          rm -rf Pods Podfile.lock .symlinks
+          rm -rf ~/Library/Developer/Xcode/DerivedData/*
+          
+          # Réinstaller proprement via CocoaPods
+          pod repo update
+          pod install --repo-update
+          cd ..
+
       - name: 🔨 Compiler l'application iOS (Sans signature)
-        run: flutter build ios --release --no-codesign
+        run: |
+          flutter build ios --release --no-codesign --verbose
 
       - name: 📦 Créer le fichier .IPA pour Sideloadly
         run: |
-          cd build/ios/iphoneos
-          mkdir -p Payload
-          cp -r Runner.app Payload/
+          # Le chemin peut varier selon Flutter/Xcode, on cherche Runner.app
+          APP_PATH=$(find build/ios -name "Runner.app" -type d | head -n 1)
+          
+          if [ -z "$APP_PATH" ]; then
+            echo "❌ Runner.app introuvable !"
+            ls -la build/ios/
+            exit 1
+          fi
+          
+          echo "✅ App trouvée : $APP_PATH"
+          mkdir -p build/ipa/Payload
+          cp -r "$APP_PATH" build/ipa/Payload/
+          cd build/ipa
           zip -r EcoNav_unsigned.ipa Payload/
-          cd ../../..
+          cd ../..
 
       - name: 🚀 Télécharger le fichier IPA (Artifact)
         uses: actions/upload-artifact@v4
         with:
           name: EcoNav-iOS-IPA
-          path: build/ios/iphoneos/EcoNav_unsigned.ipa
+          path: build/ipa/EcoNav_unsigned.ipa
           retention-days: 7

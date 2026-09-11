@@ -2,6 +2,9 @@
 platform :ios, '16.0'
 
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
+# Force CocoaPods uniquement, désactive SPM de manière agressive
+ENV['SWIFT_PACKAGE_MANAGER_DISABLE'] = '1'
+ENV['FLUTTER_DISABLE_SPM'] = '1'
 
 project 'Runner', {
   'Debug' => :debug,
@@ -31,6 +34,7 @@ target 'Runner' do
   use_modular_headers!
 
   flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
+  
   target 'RunnerTests' do
     inherit! :search_paths
   end
@@ -44,6 +48,9 @@ post_install do |installer|
       config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '16.0'
       config.build_settings['SWIFT_VERSION'] = '5.0'
       
+      # 🔒 SÉCURITÉ ANTI-SPM : Désactiver explicitement SPM au niveau Xcode
+      config.build_settings['SWIFT_PACKAGE_MANAGER_ENABLE'] = 'NO'
+      
       # Permissions requises pour les capteurs et la caméra
       config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] ||= [
         '$(inherited)',
@@ -54,5 +61,10 @@ post_install do |installer|
         'PERMISSION_SENSORS=1'
       ]
     end
+  end
+  
+  # 🔒 Nettoyage agressif des références SPM résiduelles dans le projet Pods
+  installer.pods_project.build_configurations.each do |config|
+    config.build_settings['SWIFT_PACKAGE_MANAGER_ENABLE'] = 'NO'
   end
 end
