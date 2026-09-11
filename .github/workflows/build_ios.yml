@@ -13,6 +13,7 @@ jobs:
       COCOAPODS_DISABLE_STATS: 'true'
       SWIFT_PACKAGE_MANAGER_DISABLE: '1'
       FLUTTER_DISABLE_SPM: '1'
+      COCOAPODS_DISABLE_SPM: '1'
 
     steps:
       - name: 📥 Cloner le dépôt
@@ -42,22 +43,24 @@ jobs:
       - name: 📦 Récupérer les dépendances Flutter
         run: flutter pub get
 
-      - name: 🧹 Préparer CocoaPods (Anti-SPM + Fix Conflits)
+      - name: 🧹 Nettoyage complet Anti-SPM + CocoaPods
         run: |
-          cd ios
-          # Supprimer uniquement les caches et DerivedData, PAS le Podfile.lock
+          # Nettoyer les caches Flutter/Xcode qui peuvent contenir des références SPM résiduelles
+          flutter clean
           rm -rf ~/Library/Developer/Xcode/DerivedData/*
+          flutter pub get
           
-          # Mettre à jour le repo UNE SEULE FOIS
+          cd ios
+          rm -rf Pods Podfile.lock .symlinks
+          
+          export COCOAPODS_DISABLE_STATS=true
+          export SWIFT_PACKAGE_MANAGER_DISABLE=1
+          export FLUTTER_DISABLE_SPM=1
+          export COCOAPODS_DISABLE_SPM=1
+          
           pod repo update
-          
-          # Installer en gardant le lock existant comme base
           pod install --repo-update
           cd ..
-        env:
-          COCOAPODS_DISABLE_STATS: true
-          SWIFT_PACKAGE_MANAGER_DISABLE: "1"
-          FLUTTER_DISABLE_SPM: "1"
 
       - name: 🔨 Compiler l'application iOS (Sans signature)
         run: |

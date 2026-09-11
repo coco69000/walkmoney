@@ -5,6 +5,7 @@ ENV['COCOAPODS_DISABLE_STATS'] = 'true'
 # Force CocoaPods uniquement, désactive SPM de manière agressive
 ENV['SWIFT_PACKAGE_MANAGER_DISABLE'] = '1'
 ENV['FLUTTER_DISABLE_SPM'] = '1'
+ENV['COCOAPODS_DISABLE_SPM'] = '1'
 
 project 'Runner', {
   'Debug' => :debug,
@@ -36,12 +37,8 @@ target 'Runner' do
   # === RÉSOLUTION CONFLITS PODS ===
   # Force GoogleMaps compatible avec google_navigation_flutter
   pod 'GoogleMaps', '10.7.0'
-
-  # Force GoogleUtilities compatible avec Firebase 11.x ET MLKit
-  pod 'GoogleUtilities/UserDefaults', '~> 8.1'
-
-  # Force MLKitVision compatible avec les deux plugins MLKit
-  pod 'MLKitVision', '~> 5.0'
+  # Empêcher CocoaPods de tenter une résolution SPM fallback
+  ENV['COCOAPODS_DISABLE_SPM'] = '1'
   # ================================
 
   flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))

@@ -35,7 +35,6 @@ import 'package:google_directions_api/google_directions_api.dart';
 import 'package:http/http.dart' as http;
 import 'package:maplibre_gl/maplibre_gl.dart';
 import 'package:image_picker/image_picker.dart';
-import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:intl/date_symbol_data_local.dart';
 import 'package:intl/intl.dart';
 import 'package:latlong2/latlong.dart' as latlong;
@@ -2062,7 +2061,8 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
     }
 
     _pendingLocationFuture = _fetchLocationSafely().catchError((e) {
-      _lastPermissionErrorTime = DateTime.now(); // Active le cooldown en cas d'erreur
+      _lastPermissionErrorTime =
+          DateTime.now(); // Active le cooldown en cas d'erreur
       throw e; // Re-throw pour que l'appelant gère l'erreur
     }).whenComplete(() {
       _pendingLocationFuture = null; // Libère le verrou une fois terminé
@@ -10394,9 +10394,9 @@ class _DefisScreenState extends State<DefisScreen> {
         if (userProfile.exists &&
             userProfile.data() != null &&
             userProfile.data()!.containsKey('last_challenges_refresh')) {
-          lastRefresh = (userProfile.data()!['last_challenges_refresh']
-                  as Timestamp)
-              .toDate();
+          lastRefresh =
+              (userProfile.data()!['last_challenges_refresh'] as Timestamp)
+                  .toDate();
         }
       }
     } catch (e) {
@@ -10474,7 +10474,8 @@ class _DefisScreenState extends State<DefisScreen> {
           {'last_challenges_refresh': FieldValue.serverTimestamp()},
           SetOptions(merge: true));
     } catch (e) {
-      debugPrint("⚠️ Erreur mise à jour user_stats dans _triggerAutoRefresh: $e");
+      debugPrint(
+          "⚠️ Erreur mise à jour user_stats dans _triggerAutoRefresh: $e");
       // Fallback sur le document users en cas de restriction Firestore
       try {
         await _firestore.collection('users').doc(widget.currentUserId).set(
@@ -19067,8 +19068,7 @@ class _StoreCardState extends State<StoreCard> {
       final bool serverValid = ocrResult['serverValid'] == true;
       final String serverReason = ocrResult['serverReason'] as String? ?? '';
       final String? receiptToken = ocrResult['receiptToken'] as String?;
-      final double? extractedAmount =
-          (ocrResult['amount'] as num?)?.toDouble();
+      final double? extractedAmount = (ocrResult['amount'] as num?)?.toDouble();
       final String? storeNameFound = ocrResult['storeNameFound'] as String?;
 
       // 3. FERMETURE DU LOADER ICI (CRUCIAL)
@@ -19098,7 +19098,8 @@ class _StoreCardState extends State<StoreCard> {
 
       // Si accepté : affiche le popup de cashback
       if (extractedAmount != null && extractedAmount > 0) {
-        _showCashbackPopup(extractedAmount, rawText, receiptToken: receiptToken);
+        _showCashbackPopup(extractedAmount, rawText,
+            receiptToken: receiptToken);
       } else {
         // Cas rare où l'IA valide mais ne trouve pas de montant
         _showReceiptRejectedDialog(
@@ -19115,8 +19116,7 @@ class _StoreCardState extends State<StoreCard> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-              content: Text("Erreur analyse: $e"),
-              backgroundColor: Colors.red),
+              content: Text("Erreur analyse: $e"), backgroundColor: Colors.red),
         );
       }
     }
@@ -24803,17 +24803,13 @@ class KinematicFilter {
     required int fixAgeMs,
     int renderMs = 16,
   }) {
-    final double interval =
-        (intervalMs / 1000.0).clamp(0.25, 3.0).toDouble();
+    final double interval = (intervalMs / 1000.0).clamp(0.25, 3.0).toDouble();
 
-    final double proc =
-        (processingMs / 1000.0).clamp(0.0, 1.0).toDouble();
+    final double proc = (processingMs / 1000.0).clamp(0.0, 1.0).toDouble();
 
-    final double age =
-        (fixAgeMs / 1000.0).clamp(0.0, 1.5).toDouble();
+    final double age = (fixAgeMs / 1000.0).clamp(0.0, 1.5).toDouble();
 
-    final double render =
-        (renderMs / 1000.0).clamp(0.004, 0.050).toDouble();
+    final double render = (renderMs / 1000.0).clamp(0.004, 0.050).toDouble();
 
     _measuredIntervalSeconds = interval;
     _renderLatencySeconds = render;
@@ -24822,8 +24818,7 @@ class KinematicFilter {
     _smoothedProcessingLatencySeconds =
         (_smoothedProcessingLatencySeconds * 0.70) + (proc * 0.30);
 
-    _smoothedFixAgeSeconds =
-        (_smoothedFixAgeSeconds * 0.70) + (age * 0.30);
+    _smoothedFixAgeSeconds = (_smoothedFixAgeSeconds * 0.70) + (age * 0.30);
   }
 
   // ═══ AJOUT : Filtrage qualité GPS (anti-téléportation / anti-fix aberrant) ═══
