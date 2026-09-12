@@ -1764,22 +1764,19 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
     final int maxSeg = polylineCoordinates.length - 2;
     if (maxSeg < 0) return _RouteSnapResult(polylineCoordinates.first, 0.0);
 
-    // 🔧 CORRIGÉ (anti-téléportation rond-point) : fenêtre bornée en MÈTRES
-    // et BIDIRECTIONNELLE autour du dernier index connu, au lieu d'une
-    // fenêtre de 5 segments UNIQUEMENT EN AVANT. Dans un rond-point, les
-    // points du polyline sont très rapprochés : l'ancienne fenêtre pouvait
-    // accrocher le mauvais côté de la boucle, et comme elle écrivait dans
-    // `kinematicFilter.lastRouteIndex` (la variable du pipeline GPS validé,
-    // voir _findRouteIndex), l'erreur se propageait au fix GPS suivant →
-    // le point bleu semblait "sauter". On utilise maintenant un index
-    // d'affichage dédié (`displaySnapIndex`), jamais partagé.
-    int hint = kinematicFilter.displaySnapIndex;
+    // 🔧 CORRECTIF ROND-POINT : on utilise l'index RÉEL de la position simulée
+    // (celle déjà projetée par le filtre kinématique), pas displaySnapIndex qui
+    // est une recherche indépendante pouvant diverger.
+    int hint = kinematicFilter.lastSimRouteIndex;
+    if (hint < 0) hint = kinematicFilter.displaySnapIndex;
     if (hint < 0) hint = kinematicFilter.lastRouteIndex;
     if (hint < 0) hint = 0;
     hint = hint.clamp(0, maxSeg);
 
-    const double searchWindowMeters =
-        60.0; // couvre large un rond-point standard
+    // Fenêtre réduite (au lieu de 60m) : un petit rond-point de 15-30m de
+    // diamètre tenait entier dans l'ancien rayon, rendant plusieurs boucles
+    // proches candidates au même score.
+    const double searchWindowMeters = 35.0;
 
     double segLen(int i) => Geolocator.distanceBetween(
           polylineCoordinates[i].latitude,
@@ -1802,9 +1799,15 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
       endIndex++;
     }
 
-    LatLng closest = polylineCoordinates[hint];
-    double minDist = double.infinity;
-    int bestIndex = startIndex;
+    // Score de référence : rester sur le segment actuel (hint)
+    final LatLng hintProj = _projectCorrected(
+        gpsPos, polylineCoordinates[hint], polylineCoordinates[hint + 1]);
+    final double hintDist = Geolocator.distanceBetween(
+        gpsPos.latitude, gpsPos.longitude, hintProj.latitude, hintProj.longitude);
+
+    LatLng closest = hintProj;
+    double minDist = hintDist;
+    int bestIndex = hint;
 
     for (int i = startIndex; i <= endIndex; i++) {
       LatLng p1 = polylineCoordinates[i];
@@ -1814,20 +1817,12 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
       double d = Geolocator.distanceBetween(
           gpsPos.latitude, gpsPos.longitude, proj.latitude, proj.longitude);
 
-      // 🔧 CORRECTION ANTI-BLOCAGE VIRAGE :
-      // On n'applique la pénalité d'angle QUE si on n'est pas déjà très proche de la route.
-      // Dans un virage serré, le cap GPS/Trail n'a pas encore eu le temps de se mettre à jour
-      // et pointe encore vers l'ancienne rue. Si on pénalise, l'algo rejette le nouveau segment
-      // et la flèche reste bloquée dans le virage.
       if (headingGps != null && d > 12.0) {
         double segmentBearing = Geolocator.bearingBetween(
             p1.latitude, p1.longitude, p2.latitude, p2.longitude);
         if (segmentBearing < 0) segmentBearing += 360;
-
         double diff = (segmentBearing - headingGps).abs();
         if (diff > 180) diff = 360 - diff;
-
-        // Réduction de la pénalité max (35m au lieu de 100m) pour éviter les sauts
         double diffRad = diff * (math.pi / 180.0);
         double penalty = 35.0 * ((1.0 - math.cos(diffRad)) / 2.0);
         d += penalty;
@@ -1840,11 +1835,19 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
       }
     }
 
-    // ⚠️ On ne touche plus à kinematicFilter.lastRouteIndex ici : cet index
-    // reste la propriété exclusive du pipeline GPS validé (_findRouteIndex).
+    // 🔧 HYSTÉRÉSIS : dans un rond-point serré, deux segments peuvent avoir
+    // un score quasi identique et alterner à chaque fix GPS à cause du bruit.
+    // On n'accepte de changer de segment que si le gain est net (>3m),
+    // sinon on reste sur le segment courant -> plus de téléportation.
+    const double hysteresisMargin = 3.0;
+    if (bestIndex != hint && (hintDist - minDist) < hysteresisMargin) {
+      bestIndex = hint;
+      closest = hintProj;
+      minDist = hintDist;
+    }
+
     kinematicFilter.displaySnapIndex = bestIndex;
 
-    // Distance pure sans pénalité pour les calculs de déviation réels
     double pureDist = Geolocator.distanceBetween(
         gpsPos.latitude, gpsPos.longitude, closest.latitude, closest.longitude);
 
@@ -2990,14 +2993,6 @@ class NavigationController extends GetxController {
     final int fixAgeMs =
         receiveTime.difference(position.timestamp).inMilliseconds;
 
-    // On utilise la dernière mesure de traitement connue pour ne pas attendre
-    // la fin du traitement courant.
-    homeController.kinematicFilter.updateGpsLatency(
-      intervalMs: timeBetweenGpsMs.value,
-      processingMs: gpsProcessingMs.value,
-      fixAgeMs: fixAgeMs,
-    );
-
     // 🚀 2. DONNER LA VRAIE POSITION AU FILTRE !
     final currentMode = homeController.currentTravelMode.value;
     bool isWalking = currentMode == TravelMode.walking ||
@@ -3241,7 +3236,8 @@ class NavigationController extends GetxController {
 
     // ⏱️ 4. FIN DU CHRONO : Temps de traitement du code
     final finishTime = DateTime.now();
-    gpsProcessingMs.value = finishTime.difference(receiveTime).inMilliseconds;
+    gpsProcessingMs.value =
+        (finishTime.difference(receiveTime).inMicroseconds / 1000.0).ceil();
 
     // Met à jour le filtre avec la vraie mesure de traitement qui vient d'être calculée.
     homeController.kinematicFilter.updateGpsLatency(
@@ -5016,8 +5012,7 @@ class SpeedometerDisplay extends StatelessWidget {
       else if (gpsIntervalMs > 1200) gpsColor = Colors.orangeAccent;
 
       return Positioned(
-        top: MediaQuery.of(context).padding.top +
-            200, // Augmenté pour éviter le chevauchement avec les infos Transit
+        bottom: MediaQuery.of(context).padding.bottom + 100,
         left: 20,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -5363,7 +5358,7 @@ class HomePage extends StatelessWidget {
             // Affiche les instructions dès que la navigation est active (route calculée ou navigation en cours)
             if (home.mapStatus.value != Constants.idle) {
               return Positioned(
-                top: 50,
+                top: MediaQuery.of(context).padding.top + 10,
                 left: 15,
                 right: 15,
                 child: Column(
@@ -5377,7 +5372,7 @@ class HomePage extends StatelessWidget {
             } else {
               // Recherche : afficher la barre de recherche
               return Positioned(
-                top: 60,
+                top: MediaQuery.of(context).padding.top + 10,
                 left: 15,
                 right: 15,
                 child: PhotonSearchBar(onSelected: home.setDestination),
@@ -9620,10 +9615,22 @@ class _MainScreenControllerState extends State<MainScreenController>
 
     if (currentPoints == profile.adPoints) return profile; // Pas de changement
 
-    return profile.copyWith(
+    final updated = profile.copyWith(
       adPoints: currentPoints,
       lastAdPointDecayTime: () => Timestamp.fromDate(now),
     );
+
+    // Persister la décroissance dans user_stats
+    try {
+      _firestore.collection('user_stats').doc(_currentUserId).set({
+        'ad_points': currentPoints,
+        'last_ad_point_decay_time': Timestamp.fromDate(now),
+      }, SetOptions(merge: true));
+    } catch (e) {
+      debugPrint("Erreur persistance décroissance ad points: $e");
+    }
+
+    return updated;
   }
 
   /// Wrapper sécurisé pour appeler les Cloud Functions avec un token toujours à jour
@@ -9835,6 +9842,9 @@ class _MainScreenControllerState extends State<MainScreenController>
       MaterialPageRoute(
         builder: (_) => RewardScreen(
           userProfile: _userProfile!,
+          onProfileModified: () async {
+            await _fetchUserProfileData();
+          },
           onPurchase: (int cost) async {
             await _handlePurchase(cost);
           },
@@ -13429,8 +13439,17 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
               TextButton(
                 onPressed: () {
                   Navigator.pop(ctx);
-                  widget.addLamePoints(finalPoints,
-                      source: "Trajet vers ${store.name}");
+                  (widget.addLamePoints as dynamic)(
+                    finalPoints,
+                    source: "Trajet vers ${store.name}",
+                    tripId: navigationController.lastCompletedTripId,
+                    distanceMeters:
+                        homeController.activeRouteRawDistanceMeters.value,
+                    durationSeconds:
+                        homeController.activeRouteRawDurationSeconds.value,
+                    travelMode:
+                        homeController.currentTravelMode.value.toString(),
+                  );
                 },
                 child: const Text("Continuer sans valider"),
               ),
@@ -13442,8 +13461,17 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
                     foregroundColor: Colors.white),
                 onPressed: () {
                   Navigator.pop(ctx);
-                  widget.addLamePoints(finalPoints,
-                      source: "Trajet vers ${store.name}");
+                  (widget.addLamePoints as dynamic)(
+                    finalPoints,
+                    source: "Trajet vers ${store.name}",
+                    tripId: navigationController.lastCompletedTripId,
+                    distanceMeters:
+                        homeController.activeRouteRawDistanceMeters.value,
+                    durationSeconds:
+                        homeController.activeRouteRawDurationSeconds.value,
+                    travelMode:
+                        homeController.currentTravelMode.value.toString(),
+                  );
                   // Lancer le scan ticket directement depuis le contexte principal
                   _triggerStoreValidation(store);
                 },
@@ -15094,13 +15122,13 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
                   SpeedometerDisplay(),
 
                   // --- INSTRUCTIONS NAVIGATION ---
-                  Obx(() => Visibility(
-                        visible: homeController.mapStatus.value ==
-                            Constants.onDestination,
-                        child: Positioned(
-                          top: MediaQuery.of(context).padding.top + 10,
-                          left: 15,
-                          right: 15,
+                  Positioned(
+                    top: MediaQuery.of(context).padding.top + 10,
+                    left: 15,
+                    right: 15,
+                    child: Obx(() => Visibility(
+                          visible: homeController.mapStatus.value ==
+                              Constants.onDestination,
                           child: Column(
                             mainAxisSize: MainAxisSize.min,
                             children: [
@@ -15117,8 +15145,8 @@ class _MainHomeScreenState extends State<MainHomeScreen> {
                               }),
                             ],
                           ),
-                        ),
-                      )),
+                        )),
+                  ),
 
                   // --- MINI-WIDGET MINUTEUR DÉFI ---
                   Obx(() {
@@ -21578,12 +21606,14 @@ class RewardOffer {
 class RewardScreen extends StatefulWidget {
   final UserProfile userProfile;
 
-  final Future<void> Function(int cost) onPurchase;
+  final Future<void> Function(int cost)? onPurchase;
+  final Future<void> Function()? onProfileModified;
 
   const RewardScreen({
     super.key,
     required this.userProfile,
-    required this.onPurchase,
+    this.onPurchase,
+    this.onProfileModified,
   });
 
   @override
@@ -21936,7 +21966,9 @@ class _RewardScreenState extends State<RewardScreen>
         'isInstantApproval': isInstantApproval,
       });
 
-      await widget.onPurchase(amount.toInt());
+      if (widget.onProfileModified != null) {
+        await widget.onProfileModified!();
+      }
       return true;
     } catch (error) {
       debugPrint("Erreur processDonation: $error");
@@ -22023,6 +22055,7 @@ class _RewardScreenState extends State<RewardScreen>
                   const TextInputType.numberWithOptions(decimal: true),
               decoration: InputDecoration(
                   labelText: "Montant du don (en Lame Points)",
+                  helperText: "Minimum 100, maximum 5000 Lames",
                   border: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(8)),
                   prefixIcon:
@@ -22037,7 +22070,7 @@ class _RewardScreenState extends State<RewardScreen>
           ElevatedButton(
             onPressed: () {
               final amount = double.tryParse(amountController.text);
-              if (amount != null && amount > 0) {
+              if (amount != null && amount >= 100 && amount <= 5000) {
                 Navigator.of(ctx).pop();
                 _handleGenericLameSpend(
                     amount, "sdg_donation_${sdg['id']}", "Don à ${sdg['name']}",
@@ -22047,7 +22080,7 @@ class _RewardScreenState extends State<RewardScreen>
               } else {
                 if (mounted)
                   ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                      content: Text("Veuillez entrer un montant valide."),
+                      content: Text("Veuillez entrer un montant entre 100 et 5000 Lame Points."),
                       backgroundColor: Colors.orange));
               }
             },
@@ -22210,13 +22243,23 @@ class _RewardScreenState extends State<RewardScreen>
     if (offer.offerType == OfferType.contest) {
       final contestType = offer.detailsJson?['type'] as String?;
       if (contestType == 'auction') {
-        Navigator.push(context,
-            MaterialPageRoute(builder: (_) => AuctionScreen(offer: offer)));
+        Navigator.push(
+            context,
+            MaterialPageRoute(
+                builder: (_) => AuctionScreen(
+                      offer: offer,
+                      userProfile: widget.userProfile,
+                      onProfileModified: widget.onProfileModified,
+                    )));
       } else if (contestType == 'raffle') {
         Navigator.push(
             context,
             MaterialPageRoute(
-                builder: (_) => RaffleTicketScreen(offer: offer)));
+                builder: (_) => RaffleTicketScreen(
+                      offer: offer,
+                      userProfile: widget.userProfile,
+                      onProfileModified: widget.onProfileModified,
+                    )));
       } else {
         if (mounted)
           ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -23000,7 +23043,14 @@ class _OfferActionPageState extends State<OfferActionPage> {
 
 class AuctionScreen extends StatefulWidget {
   final RewardOffer offer;
-  const AuctionScreen({super.key, required this.offer});
+  final UserProfile? userProfile;
+  final Future<void> Function()? onProfileModified;
+  const AuctionScreen({
+    super.key,
+    required this.offer,
+    this.userProfile,
+    this.onProfileModified,
+  });
 
   @override
   _AuctionScreenState createState() => _AuctionScreenState();
@@ -23009,6 +23059,7 @@ class AuctionScreen extends StatefulWidget {
 class _AuctionScreenState extends State<AuctionScreen> {
   final TextEditingController _bidController = TextEditingController();
   double _currentBidInput = 0.0;
+  double _currentUserLamePoints = 0.0;
   String? _contestIdRef;
   Map<String, dynamic>? _contestDetails;
   bool _isLoadingContest = true;
@@ -23025,6 +23076,8 @@ class _AuctionScreenState extends State<AuctionScreen> {
   @override
   void initState() {
     super.initState();
+    _currentUserLamePoints = (widget.userProfile?.lamePoints ?? 0).toDouble();
+    _fetchUserLamePoints();
     _parseOfferDetails();
     _currentBidInput = _minBid;
     _bidController.text = _currentBidInput.toStringAsFixed(1);
@@ -23049,6 +23102,23 @@ class _AuctionScreenState extends State<AuctionScreen> {
         _isLoadingContest = false;
         _errorMessage = "Référence du concours manquante.";
       });
+    }
+  }
+
+  Future<void> _fetchUserLamePoints() async {
+    final currentUser = _firebaseAuth.currentUser;
+    if (currentUser == null) return;
+    try {
+      final doc =
+          await _firestore.collection('users').doc(currentUser.uid).get();
+      if (mounted && doc.exists) {
+        setState(() {
+          _currentUserLamePoints =
+              (doc.data()?['lame_points'] as num?)?.toDouble() ?? 0.0;
+        });
+      }
+    } catch (e) {
+      debugPrint("Erreur récupération solde Firestore: $e");
     }
   }
 
@@ -23148,14 +23218,6 @@ class _AuctionScreenState extends State<AuctionScreen> {
             backgroundColor: Colors.red));
       return;
     }
-    final currentUserId = currentUser.uid;
-
-    // Récupérer le solde réel (lame_points) depuis users/{uid}
-    final currentUserDocSnapshot =
-        await _firestore.collection('users').doc(currentUserId).get();
-    final double currentUserLamePoints =
-        (currentUserDocSnapshot.data()?['lame_points'] as num?)?.toDouble() ??
-            0.0;
 
     if (_contestDetails == null || _contestDetails!['status'] != 'open') {
       if (mounted)
@@ -23194,8 +23256,6 @@ class _AuctionScreenState extends State<AuctionScreen> {
     final double currentHighestBid =
         (_contestDetails?['current_highest_bid'] as num?)?.toDouble() ??
             _minBid;
-    final String? currentHighestBidderId =
-        _contestDetails?['highest_bidder_user_id'] as String?;
 
     if (bidAmount <= currentHighestBid) {
       if (mounted)
@@ -23213,7 +23273,7 @@ class _AuctionScreenState extends State<AuctionScreen> {
             backgroundColor: Colors.orange));
       return;
     }
-    if (bidAmount > currentUserLamePoints) {
+    if (bidAmount > _currentUserLamePoints) {
       if (mounted)
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
             content: Text("Pas assez de Lame Points."),
@@ -23231,10 +23291,18 @@ class _AuctionScreenState extends State<AuctionScreen> {
       });
 
       if (mounted) {
+        setState(() {
+          _currentUserLamePoints =
+              math.max(0.0, _currentUserLamePoints - bidAmount);
+        });
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
             content: Text("Enchère placée avec succès !"),
             backgroundColor: Colors.green));
         _fetchContestDetails();
+        _fetchUserLamePoints();
+        if (widget.onProfileModified != null) {
+          widget.onProfileModified!();
+        }
       }
     } catch (e) {
       print("Error placing bid via Cloud Function: $e");
@@ -23243,6 +23311,7 @@ class _AuctionScreenState extends State<AuctionScreen> {
             content: Text("Erreur enchère: ${e.toString().split("\n").first}"),
             backgroundColor: Colors.red));
         _fetchContestDetails();
+        _fetchUserLamePoints();
       }
     } finally {
       if (mounted) setState(() => _isLoadingContest = false);
@@ -23251,7 +23320,7 @@ class _AuctionScreenState extends State<AuctionScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final userLamePoints = Get.find<UserStatsController>().totalLameGained;
+    final userLamePoints = _currentUserLamePoints;
 
     final double displayHighestBid =
         (_contestDetails?['current_highest_bid'] as num?)?.toDouble() ??
@@ -23581,7 +23650,14 @@ class _AuctionScreenState extends State<AuctionScreen> {
 
 class RaffleTicketScreen extends StatefulWidget {
   final RewardOffer offer;
-  const RaffleTicketScreen({super.key, required this.offer});
+  final UserProfile? userProfile;
+  final Future<void> Function()? onProfileModified;
+  const RaffleTicketScreen({
+    super.key,
+    required this.offer,
+    this.userProfile,
+    this.onProfileModified,
+  });
 
   @override
   _RaffleTicketScreenState createState() => _RaffleTicketScreenState();
@@ -23591,6 +23667,7 @@ class _RaffleTicketScreenState extends State<RaffleTicketScreen> {
   final TextEditingController _ticketCountController =
       TextEditingController(text: "1");
   int _ticketCount = 1;
+  int _currentUserLamePoints = 0;
 
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   final FirebaseAuth _firebaseAuth = FirebaseAuth.instance;
@@ -23598,6 +23675,8 @@ class _RaffleTicketScreenState extends State<RaffleTicketScreen> {
   @override
   void initState() {
     super.initState();
+    _currentUserLamePoints = widget.userProfile?.lamePoints ?? 0;
+    _fetchUserLamePoints();
     _ticketCountController.addListener(() {
       final newCount = int.tryParse(_ticketCountController.text);
       if (newCount != null && newCount >= 0) {
@@ -23610,6 +23689,23 @@ class _RaffleTicketScreenState extends State<RaffleTicketScreen> {
         });
       }
     });
+  }
+
+  Future<void> _fetchUserLamePoints() async {
+    final currentUser = _firebaseAuth.currentUser;
+    if (currentUser == null) return;
+    try {
+      final userDoc =
+          await _firestore.collection('users').doc(currentUser.uid).get();
+      if (mounted && userDoc.exists) {
+        setState(() {
+          _currentUserLamePoints =
+              (userDoc.data()?['lame_points'] as num?)?.toInt() ?? 0;
+        });
+      }
+    } catch (e) {
+      debugPrint("Erreur chargement solde tombola: $e");
+    }
   }
 
   void _updateTicketCount(String value) {
@@ -23646,7 +23742,6 @@ class _RaffleTicketScreenState extends State<RaffleTicketScreen> {
             backgroundColor: Colors.red));
       return;
     }
-    final currentUserId = currentUser.uid;
 
     final int ticketCostLame =
         (widget.offer.detailsJson?['ticket_cost_eco'] as num?)?.toInt() ??
@@ -23662,30 +23757,14 @@ class _RaffleTicketScreenState extends State<RaffleTicketScreen> {
       return;
     }
 
-    // Lire les vraies lames depuis Firestore (users.lame_points) pour éviter la désynchronisation
-    try {
-      final userDoc =
-          await _firestore.collection('users').doc(currentUserId).get();
-      final int realLamePoints =
-          (userDoc.data()?['lame_points'] as num?)?.toInt() ?? 0;
-      if (totalCost > realLamePoints) {
-        if (mounted)
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-              content: Text(
-                  "Pas assez de Lame Points (vous avez $realLamePoints, coût : $totalCost)."),
-              backgroundColor: Colors.orange));
-        return;
-      }
-    } catch (e) {
-      // Fallback sur le provider si la lecture Firestore échoue
-      final currentUserLamePoints = userStatsProvider.totalLameGained;
-      if (totalCost > currentUserLamePoints) {
-        if (mounted)
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-              content: Text("Vous n'avez pas assez de Lame Points."),
-              backgroundColor: Colors.orange));
-        return;
-      }
+    // Vérifier le solde réel
+    if (totalCost > _currentUserLamePoints) {
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(
+                "Pas assez de Lame Points (vous avez $_currentUserLamePoints, coût : $totalCost)."),
+            backgroundColor: Colors.orange));
+      return;
     }
 
     showDialog(
@@ -23711,12 +23790,19 @@ class _RaffleTicketScreenState extends State<RaffleTicketScreen> {
       userStatsProvider.addLame(-actualTotalCost.toDouble());
 
       if (mounted) {
+        setState(() {
+          _currentUserLamePoints =
+              math.max(0, _currentUserLamePoints - actualTotalCost);
+        });
         Navigator.pop(context); // Fermer la modale de chargement
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
             content: Text(
                 "Achat de $_ticketCount ticket(s) réussi pour $actualTotalCost Lame Points!"),
             backgroundColor: Colors.blue));
         Navigator.pop(context); // Fermer la modale du concours
+        if (widget.onProfileModified != null) {
+          widget.onProfileModified!();
+        }
       }
     } catch (e) {
       if (mounted) {
@@ -23739,7 +23825,7 @@ class _RaffleTicketScreenState extends State<RaffleTicketScreen> {
         widget.offer.ecoCost ??
         10;
     final int totalCost = _ticketCount * ticketCostLame;
-    final userLamePoints = Get.find<UserStatsController>().totalLameGained;
+    final userLamePoints = _currentUserLamePoints;
 
     return Scaffold(
       backgroundColor: Colors.green.shade700,
@@ -24760,6 +24846,7 @@ class KinematicFilter {
   int _lastSimRouteIndex = 0;
   int _snappedGpsIndex = 0;
   int lastRouteIndex = -1;
+  int get lastSimRouteIndex => _lastSimRouteIndex;
 
   // 🔧 CORRECTIF ANTI-TÉLÉPORTATION ROND-POINT : index utilisé UNIQUEMENT
   // par le lissage d'affichage 60fps (_getNearestRoutePoint / snapToRoute).
@@ -25225,7 +25312,15 @@ class KinematicFilter {
         _currentRawGps!.longitude,
       );
 
-      final double heading = lastRealPos!.heading;
+      final double stopThresholdForHeading =
+          _isWalking ? _walkingStopSpeed : _vehicleStopSpeed;
+      final bool isLikelyStationaryNow =
+          _vehicleSpeedMps < stopThresholdForHeading &&
+              _lastRawSpeedMps < stopThresholdForHeading;
+      // À l'arrêt, le heading GPS est bruité/aléatoire : on ignore la pénalité
+      // d'angle dans _findRouteIndex en passant heading=0 uniquement pour ce cas,
+      // et on garde l'index précédent au lieu de le recalculer sans cesse.
+      final double heading = isLikelyStationaryNow ? 0.0 : lastRealPos!.heading;
       final int hint = lastRouteIndex < 0 ? 0 : lastRouteIndex;
 
       // 🔧 Budget de déplacement réaliste depuis le dernier fix GPS : empêche
@@ -25244,6 +25339,22 @@ class KinematicFilter {
           _vehicleSpeedMps * (_lastGpsIntervalSeconds + latencyBudget);
       final double maxAhead = moveBudget + (_isWalking ? 6.0 : 20.0);
       final double maxBehind = _isWalking ? 12.0 : 35.0;
+
+      // Si on est stationnaire et que le déplacement snappé est minime, on garde
+      // l'ancien index/position au lieu de recalculer (évite le clignotement).
+      if (isLikelyStationaryNow && _lastConfirmedSnappedPos != null) {
+        final double drift = Geolocator.distanceBetween(
+          rawPos.latitude,
+          rawPos.longitude,
+          _lastConfirmedSnappedPos!.latitude,
+          _lastConfirmedSnappedPos!.longitude,
+        );
+        final double noiseFloor =
+            _isWalking ? _gpsNoiseFloorWalking : _gpsNoiseFloorVehicle;
+        if (drift < noiseFloor * 2.0) {
+          return simulatedPos; // on ignore ce fix bruité, pas de recalcul de cible
+        }
+      }
 
       int rawIndex = _findRouteIndex(
         rawPos,

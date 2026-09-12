@@ -521,7 +521,7 @@ exports.validateTrip = onCall(async (request) => {
     const source = data.source || 'Trajet';
     const challengeId = data.challengeId || null;
     const tripId = data.tripId || null; // 🆕 L'ID du document trip_logs
-    const isSpecialBonus = data.isSpecialBonus === true || (source && source.toLowerCase().includes('bonus'));
+    const isSpecialBonus = data.isSpecialBonus === true || (source && (source.toLowerCase().includes('bonus') || source.toLowerCase().includes('visite') || source.toLowerCase().includes('cashback')));
 
     // 🚨 FIX 1 : tripId ou données GPS obligatoires pour les trajets normaux (hors défis et bonus spéciaux)
     if (!challengeId && !tripId && !isSpecialBonus) {
@@ -543,16 +543,23 @@ exports.validateTrip = onCall(async (request) => {
     let isVerifiedChallenge = false;
     let challengeReward = 0;
     if (challengeId) {
-        const challengeDoc = await admin.firestore().collection('challenges').doc(challengeId).get();
-        if (challengeDoc.exists && challengeDoc.data().active !== false) {
+        if (challengeId.startsWith('poi_')) {
+            // Défi local généré côté client : pas de doc de référence dans `challenges`,
+            // on se fie au plafond anti-triche générique au lieu d'exiger un doc `challenges`.
+            challengeReward = Math.round(data.amountToAdd || 0);
             isVerifiedChallenge = true;
-            const cData = challengeDoc.data();
-            challengeReward = Math.round(cData.reward_lame ?? cData.reward ?? 0);
-            if (challengeReward <= 0) {
-                throw new HttpsError('invalid-argument', 'Récompense du défi non valide.');
-            }
         } else {
-            throw new HttpsError('not-found', 'Défi ou bonus introuvable ou expiré.');
+            const challengeDoc = await admin.firestore().collection('challenges').doc(challengeId).get();
+            if (challengeDoc.exists && challengeDoc.data().active !== false) {
+                isVerifiedChallenge = true;
+                const cData = challengeDoc.data();
+                challengeReward = Math.round(cData.reward_lame ?? cData.reward ?? 0);
+                if (challengeReward <= 0) {
+                    throw new HttpsError('invalid-argument', 'Récompense du défi non valide.');
+                }
+            } else {
+                throw new HttpsError('not-found', 'Défi ou bonus introuvable ou expiré.');
+            }
         }
     }
 
@@ -560,13 +567,23 @@ exports.validateTrip = onCall(async (request) => {
     // mais on le plafonne à 3x la récompense de base pour bloquer la triche.
     let amountToAdd = Math.round(data.amountToAdd || 0);
     if (isVerifiedChallenge) {
-        if (amountToAdd > challengeReward) {
-            if (amountToAdd > challengeReward * 3.0) {
-                console.warn(`⚠️ [ANTI-TRICHE SERVEUR] Récompense de défi anormalement élevée (${amountToAdd} > ${challengeReward * 3.0}) par ${userId}`);
-                throw new HttpsError('permission-denied', 'Récompense de défi anormalement élevée (triche détectée).');
+        if (challengeId && challengeId.startsWith('poi_')) {
+            if (amountToAdd <= 0) {
+                throw new HttpsError('invalid-argument', 'Montant de Lames pour le défi POI invalide.');
+            }
+            if (amountToAdd > 500) {
+                console.warn(`⚠️ [ANTI-TRICHE SERVEUR] Récompense défi POI anormalement élevée (${amountToAdd}) par ${userId}`);
+                throw new HttpsError('permission-denied', 'Montant de récompense défi POI trop élevé.');
             }
         } else {
-            amountToAdd = challengeReward; // Sécurité : on ne peut pas recevoir moins que la base
+            if (amountToAdd > challengeReward) {
+                if (amountToAdd > challengeReward * 3.0) {
+                    console.warn(`⚠️ [ANTI-TRICHE SERVEUR] Récompense de défi anormalement élevée (${amountToAdd} > ${challengeReward * 3.0}) par ${userId}`);
+                    throw new HttpsError('permission-denied', 'Récompense de défi anormalement élevée (triche détectée).');
+                }
+            } else {
+                amountToAdd = challengeReward; // Sécurité : on ne peut pas recevoir moins que la base
+            }
         }
     }
 
@@ -654,19 +671,34 @@ exports.validateTrip = onCall(async (request) => {
             if (isVerifiedChallenge && challengeId) {
                 const userChallengeRef = admin.firestore().collection('user_challenges').doc(`${userId}_${challengeId}`);
                 const userChallengeDoc = await transaction.get(userChallengeRef);
-                if (!userChallengeDoc.exists || (userChallengeDoc.data().status !== 'inProgress' && userChallengeDoc.data().completed !== true)) {
-                    throw new HttpsError('permission-denied', 'Défi non commencé ou invalide dans vos défis.');
+                const validStatuses = ['inProgress', 'completedPendingReward', 'rewardClaimed'];
+
+                if (challengeId.startsWith('poi_')) {
+                    if (userChallengeDoc.exists && (userChallengeDoc.data().reward_already_credited === true || userChallengeDoc.data().completed === true)) {
+                        throw new HttpsError('already-exists', 'Ce défi a déjà été validé et récompensé.');
+                    }
+                    transaction.set(userChallengeRef, {
+                        user_id: userId,
+                        challenge_id: challengeId,
+                        reward_already_credited: true,
+                        status: 'rewardClaimed',
+                        completed_at: admin.firestore.FieldValue.serverTimestamp()
+                    }, { merge: true });
+                } else {
+                    if (!userChallengeDoc.exists || !validStatuses.includes(userChallengeDoc.data().status)) {
+                        throw new HttpsError('permission-denied', 'Défi non commencé ou invalide dans vos défis.');
+                    }
+                    if (userChallengeDoc.data().reward_already_credited === true || userChallengeDoc.data().completed === true) {
+                        throw new HttpsError('already-exists', 'Ce défi a déjà été validé et récompensé.');
+                    }
+                    transaction.set(userChallengeRef, {
+                        user_id: userId,
+                        challenge_id: challengeId,
+                        reward_already_credited: true,
+                        status: 'rewardClaimed',
+                        completed_at: admin.firestore.FieldValue.serverTimestamp()
+                    }, { merge: true });
                 }
-                if (userChallengeDoc.data().completed === true) {
-                    throw new HttpsError('already-exists', 'Ce défi a déjà été validé et récompensé.');
-                }
-                transaction.set(userChallengeRef, {
-                    user_id: userId,
-                    challenge_id: challengeId,
-                    completed: true,
-                    status: 'completed',
-                    completed_at: admin.firestore.FieldValue.serverTimestamp()
-                }, { merge: true });
             }
 
             // Cooldown de 10 minutes SEULEMENT pour les validations de trajet ou de visite
@@ -1594,6 +1626,9 @@ exports.processDonation = onCall(async (request) => {
             const fetchedCost = rData.eco_cost ?? rData.cost_lame ?? rData.cost;
             if (fetchedCost !== undefined && fetchedCost !== null && !isNaN(parseFloat(fetchedCost))) {
                 cost = parseFloat(fetchedCost);
+                if (cost < 0) {
+                    throw new HttpsError('invalid-argument', 'Coût de l\'offre invalide.');
+                }
             } else {
                 throw new HttpsError('invalid-argument', 'Coût de l\'offre invalide.');
             }
@@ -1630,10 +1665,6 @@ exports.processDonation = onCall(async (request) => {
                 throw new HttpsError('invalid-argument', 'Montant de don libre invalide (minimum 100, maximum 5000 Lames).');
             }
             cost = rawCost;
-        }
-
-        if (isNaN(cost) || cost <= 0) {
-            throw new HttpsError('invalid-argument', 'Montant invalide. Triche détectée.');
         }
 
         const currentLame = userDoc.data().lame_points || 0;
@@ -1777,28 +1808,31 @@ exports.claimCashback = onCall(async (request) => {
 
         const validText = (ocrData.extracted_text || rawText || '').trim();
 
-        // 🚨 FIX 8 : Extraction sécurisée et robuste du montant certifié par l'OCR
-        let extractedAmount = null;
-        if (validText) {
-            const matches = validText.match(/(?:total|net|montant|paye|cb|carte|eur|€)[^\d]*(\d+[\.,]\d{2})/gi);
-            if (matches && matches.length > 0) {
-                for (let i = matches.length - 1; i >= 0; i--) {
-                    const numMatch = matches[i].match(/(\d+[\.,]\d{2})/);
-                    if (numMatch) {
-                        const parsedVal = parseFloat(numMatch[1].replace(',', '.'));
-                        if (parsedVal > 0.50 && parsedVal <= 500.0) {
-                            extractedAmount = parsedVal;
-                            break;
+        // 🚨 FIX 8 : Utilisation prioritaire du montant certifié par l'IA/OCR
+        let amount = Number(ocrData.extracted_amount);
+        if (!amount || isNaN(amount) || amount <= 0 || amount > 500.0) {
+            // Fallback éventuel par regex si extracted_amount n'était pas renseigné
+            if (validText) {
+                const matches = validText.match(/(?:total|net|montant|paye|cb|carte|eur|€)[^\d]*(\d+[\.,]\d{2})/gi);
+                if (matches && matches.length > 0) {
+                    for (let i = matches.length - 1; i >= 0; i--) {
+                        const numMatch = matches[i].match(/(\d+[\.,]\d{2})/);
+                        if (numMatch) {
+                            const parsedVal = parseFloat(numMatch[1].replace(',', '.'));
+                            if (parsedVal > 0.50 && parsedVal <= 500.0) {
+                                amount = parsedVal;
+                                break;
+                            }
                         }
                     }
                 }
             }
         }
 
-        if (!extractedAmount || extractedAmount <= 0) {
-            throw new HttpsError('invalid-argument', 'Impossible de vérifier le montant total sur le ticket certifié.');
+        if (!amount || isNaN(amount) || amount <= 0) {
+            throw new HttpsError('invalid-argument', 'Montant total invalide ou introuvable sur le ticket certifié.');
         }
-        let amount = Math.min(extractedAmount, 100.0); // Plafond anti-triche 100€
+        amount = Math.min(amount, 100.0); // Plafond anti-triche 100€
 
         // 🚨 FIX 8 : Empreinte anti-rejeu basée sur le jeton certifié et le montant
         const receiptHash = crypto.createHash('sha256').update(`${userId}_${storeId}_${amount}_${receiptToken}`).digest('hex');
