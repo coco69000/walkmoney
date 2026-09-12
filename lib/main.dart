@@ -1574,7 +1574,14 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
         }
 
         // 2. Aimant intelligent sur la route
-        LatLng snappedPos = snapToRoute(predictedPos, targetBearing);
+        // 🔧 À l'arrêt / basse vitesse, ni le cap GPS ni le cap lissé ne sont
+        // fiables → pénalité d'angle désactivée (null) pour ne pas accrocher le
+        // mauvais segment au virage.
+        final double? snapHeading = (kinematicFilter.isStationary ||
+                kinematicFilter.arrowSpeedKmh < 3.0)
+            ? null
+            : targetBearing;
+        LatLng snappedPos = snapToRoute(predictedPos, snapHeading);
 
         // 3. LISSAGE MAGIQUE DE LA CAMÉRA (LERP 8% par frame = rotation ultra fluide à 60 FPS)
         if (_smoothedCameraBearing == 0.0) {
@@ -1802,8 +1809,8 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
     // Score de référence : rester sur le segment actuel (hint)
     final LatLng hintProj = _projectCorrected(
         gpsPos, polylineCoordinates[hint], polylineCoordinates[hint + 1]);
-    final double hintDist = Geolocator.distanceBetween(
-        gpsPos.latitude, gpsPos.longitude, hintProj.latitude, hintProj.longitude);
+    final double hintDist = Geolocator.distanceBetween(gpsPos.latitude,
+        gpsPos.longitude, hintProj.latitude, hintProj.longitude);
 
     LatLng closest = hintProj;
     double minDist = hintDist;
@@ -2929,28 +2936,121 @@ class NavigationController extends GetxController {
   }
 
   int _currentGpsIntervalMs = 1000; // Intervalle par défaut (1 seconde)
+  int get currentGpsIntervalMs => _currentGpsIntervalMs;
   bool _isUpdatingGpsStream = false;
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 🔧 WATCHDOG GPS iOS : détecte les trous > 2.5s et réveille le capteur
+  // ══════════════════════════════════════════════════════════════════════════
+  Timer? _gpsWatchdogTimer;
+  int _gpsMissedCount = 0;
+
+  void _startGpsWatchdog() {
+    _gpsWatchdogTimer?.cancel();
+    _gpsMissedCount = 0;
+
+    // Vérifie toutes les 1.5s si un fix GPS est bien arrivé
+    _gpsWatchdogTimer = Timer.periodic(
+      const Duration(milliseconds: 1500),
+      (_) {
+        // Seulement actif pendant la navigation
+        if (homeController.mapStatus.value != Constants.onDestination) {
+          _gpsWatchdogTimer?.cancel();
+          return;
+        }
+
+        if (_lastGpsReceiveTime == null) return;
+
+        final elapsed =
+            DateTime.now().difference(_lastGpsReceiveTime!).inMilliseconds;
+
+        // Si ça fait > 2500ms sans fix GPS → le capteur dort
+        if (elapsed > 2500) {
+          _gpsMissedCount++;
+          debugPrint(
+              "⚠️ GPS Watchdog: pas de fix depuis ${elapsed}ms (missed: $_gpsMissedCount)");
+
+          // Stratégie 1 : demander un fix ponctuel pour réveiller le GPS
+          if (_gpsMissedCount == 1) {
+            Geolocator.getCurrentPosition(
+              desiredAccuracy: LocationAccuracy.bestForNavigation,
+            ).then((pos) {
+              debugPrint("✅ GPS Watchdog: fix de réveil obtenu");
+              _gpsMissedCount = 0;
+            }).catchError((e) {
+              debugPrint("❌ GPS Watchdog: échec fix de réveil: $e");
+            });
+          }
+
+          // Stratégie 2 : si 3 misses consécutifs, recréer le stream (dernier recours, seulement sur iOS)
+          if (_gpsMissedCount >= 3 && Platform.isIOS) {
+            debugPrint("🔄 GPS Watchdog: recyclage du stream iOS");
+            _gpsMissedCount = 0;
+            _startPositionStream();
+          }
+        } else {
+          // Fix reçu récemment, reset le compteur
+          _gpsMissedCount = 0;
+        }
+      },
+    );
+  }
+
+  void _stopGpsWatchdog() {
+    _gpsWatchdogTimer?.cancel();
+    _gpsWatchdogTimer = null;
+    _gpsMissedCount = 0;
+  }
 
   void _startPositionStream() {
     positionStream?.cancel();
 
-    LocationSettings settings = Platform.isAndroid
-        ? AndroidSettings(
-            accuracy: LocationAccuracy.bestForNavigation,
-            distanceFilter: 0,
-            intervalDuration: Duration(milliseconds: _currentGpsIntervalMs),
-          )
-        : AppleSettings(
-            accuracy: LocationAccuracy.bestForNavigation,
-            distanceFilter: 0,
-            activityType: ActivityType.automotiveNavigation,
-          );
+    LocationSettings settings;
+
+    if (Platform.isAndroid) {
+      settings = AndroidSettings(
+        accuracy: LocationAccuracy.bestForNavigation,
+        distanceFilter: 0,
+        intervalDuration: Duration(milliseconds: _currentGpsIntervalMs),
+      );
+    } else {
+      // 🍏 iOS : configuration optimisée pour éviter les trous
+      final currentMode = homeController.currentTravelMode.value;
+      final bool isWalking = currentMode == TravelMode.walking ||
+          currentMode == Constants.modeWalking;
+      final bool isCycling = currentMode == TravelMode.bicycling ||
+          currentMode == Constants.modeCycling;
+
+      settings = AppleSettings(
+        accuracy: LocationAccuracy.bestForNavigation,
+        distanceFilter: 0, // 0 = recevoir TOUS les updates
+        activityType: isWalking
+            ? ActivityType.fitness // Optimisé marche/course
+            : isCycling
+                ? ActivityType.fitness // Optimisé vélo
+                : ActivityType.automotiveNavigation, // Voiture/bus
+        // ✅ CRITIQUE : empêche iOS de mettre en pause les updates GPS
+        pauseLocationUpdatesAutomatically: false,
+        // ✅ Affiche l'indicateur bleu (transparence utilisateur)
+        showBackgroundLocationIndicator: true,
+      );
+    }
 
     positionStream = Geolocator.getPositionStream(locationSettings: settings)
         .listen(_onGpsPositionUpdate);
   }
 
   void _updateGpsInterval(double speedKmh) {
+    // 🛑 SUR iOS : on ne recrée JAMAIS le stream.
+    // iOS ne supporte pas intervalDuration. Recréer le stream provoque
+    // un trou de 1.5 à 2.5s (réinitialisation du CLLocationManager).
+    // On garde UN SEUL stream stable et on laisse le filtre cinématique
+    // s'adapter dynamiquement à l'intervalle réel.
+    if (Platform.isIOS) {
+      return;
+    }
+
+    // 🤖 SUR ANDROID : logique dynamique existante
     int targetIntervalMs = 1000;
 
     // 🚀 LOGIQUE DYNAMIQUE :
@@ -3404,6 +3504,9 @@ class NavigationController extends GetxController {
     // 🔋 RÉGLAGES GPS TEMPS RÉEL (Intervalle dynamique selon la vitesse)
     _currentGpsIntervalMs = 1000; // Initialisation à 1 seconde
     _startPositionStream();
+
+    // ⏱️ Watchdog pour iOS (et Android en sécurité)
+    _startGpsWatchdog();
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -4634,6 +4737,7 @@ class NavigationController extends GetxController {
   }
 
   void stopNavigation({bool keepChallengeCallbacks = false}) {
+    _stopGpsWatchdog();
     _isUpdatingGpsStream = false;
     positionStream?.cancel();
     positionStream = null;
@@ -5071,7 +5175,7 @@ class SpeedometerDisplay extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Text(
-                    "⏱️ GPS CAPTATION",
+                    "📡 GPS CAPTATION",
                     style: TextStyle(
                       color: Colors.white70,
                       fontSize: 9,
@@ -5085,12 +5189,9 @@ class SpeedometerDisplay extends StatelessWidget {
                     children: [
                       Icon(Icons.gps_fixed, color: gpsColor, size: 14),
                       const SizedBox(width: 6),
-                      Text(
+                      const Text(
                         "Intervalle: ",
-                        style: const TextStyle(
-                          color: Colors.white60,
-                          fontSize: 11,
-                        ),
+                        style: TextStyle(color: Colors.white60, fontSize: 11),
                       ),
                       Text(
                         "${gpsIntervalMs} ms",
@@ -5113,12 +5214,9 @@ class SpeedometerDisplay extends StatelessWidget {
                               : Colors.greenAccent,
                           size: 14),
                       const SizedBox(width: 6),
-                      Text(
+                      const Text(
                         "Traitement: ",
-                        style: const TextStyle(
-                          color: Colors.white60,
-                          fontSize: 11,
-                        ),
+                        style: TextStyle(color: Colors.white60, fontSize: 11),
                       ),
                       Text(
                         "${gpsProcessingMs} ms",
@@ -5134,13 +5232,67 @@ class SpeedometerDisplay extends StatelessWidget {
                     ],
                   ),
                   const SizedBox(height: 2),
-                  // Fréquence théorique vs réelle
+                  // ⏱️ NOUVEAU : Latence totale de projection (captage+traitement+rendu)
+                  Row(
+                    children: [
+                      Icon(Icons.speed,
+                          color: homeController.kinematicFilter.totalLatencyMs >
+                                  450
+                              ? Colors.orangeAccent
+                              : Colors.greenAccent,
+                          size: 14),
+                      const SizedBox(width: 6),
+                      const Text(
+                        "Latence proj.: ",
+                        style: TextStyle(color: Colors.white60, fontSize: 11),
+                      ),
+                      Text(
+                        "${homeController.kinematicFilter.totalLatencyMs} ms",
+                        style: TextStyle(
+                          color: homeController.kinematicFilter.totalLatencyMs >
+                                  450
+                              ? Colors.orangeAccent
+                              : Colors.greenAccent,
+                          fontSize: 13,
+                          fontWeight: FontWeight.bold,
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 2),
+                  // 🏹 NOUVEAU : vitesse de la flèche vs vitesse GPS
+                  Row(
+                    children: [
+                      const Icon(Icons.navigation,
+                          color: Colors.blueAccent, size: 14),
+                      const SizedBox(width: 6),
+                      const Text(
+                        "Flèche: ",
+                        style: TextStyle(color: Colors.white60, fontSize: 11),
+                      ),
+                      Text(
+                        "${homeController.kinematicFilter.arrowSpeedKmh.toStringAsFixed(1)} km/h",
+                        style: const TextStyle(
+                          color: Colors.blueAccent,
+                          fontSize: 13,
+                          fontWeight: FontWeight.bold,
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 2),
                   Text(
-                    "Théorique: 1000 ms | Réel: ${gpsIntervalMs} ms",
+                    Platform.isIOS
+                        ? "iOS auto | Réel: ${gpsIntervalMs} ms"
+                        : "Théorique: ${navigationController.currentGpsIntervalMs} ms | Réel: ${gpsIntervalMs} ms",
                     style: TextStyle(
-                      color: gpsIntervalMs <= 1100
+                      color: gpsIntervalMs <= 1300
                           ? Colors.greenAccent
-                          : Colors.orangeAccent,
+                          : gpsIntervalMs <= 2200
+                              ? Colors.orangeAccent
+                              : Colors.redAccent,
                       fontSize: 9,
                       fontStyle: FontStyle.italic,
                     ),
@@ -22080,7 +22232,8 @@ class _RewardScreenState extends State<RewardScreen>
               } else {
                 if (mounted)
                   ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                      content: Text("Veuillez entrer un montant entre 100 et 5000 Lame Points."),
+                      content: Text(
+                          "Veuillez entrer un montant entre 100 et 5000 Lame Points."),
                       backgroundColor: Colors.orange));
               }
             },
@@ -24817,13 +24970,22 @@ class KinematicFilter {
   LatLng? _targetPos; // 🔵 BLEU (projection cible)
   LatLng? _snappedGpsPos;
 
-  // 🔧 AJOUT : référence persistante pour recalage à chaque frame (60fps)
-  // au lieu d'une seule fois par fix GPS (~1x/sec). Avant, la flèche
-  // n'était recorrigée vers le jaune/bleu qu'une fois par seconde, puis
-  // continuait seule (dead-reckoning) à vitesse constante entre les deux
-  // — d'où la dérive en avance qui s'accumulait avant chaque correction.
-  LatLng? _lastReferencePos;
-  int _lastReferenceIndex = -1;
+  // ════════════════════════════════════════════════════════════════
+  // NOUVEAU : mouvement "flèche → point bleu en ~1s"
+  // Le point bleu n'est recalculé QUE quand un nouveau GPS arrive.
+  // ════════════════════════════════════════════════════════════════
+  LatLng? _arrowAnchorPos; // Position de la flèche au moment du calcul du bleu
+  int _arrowAnchorIndex = -1; // Index route de l'ancre
+  double _blueTravelDistance = 0.0; // Distance signée ancre → point bleu
+  double _blueTravelTime =
+      1.0; // Temps alloué pour atteindre le bleu (≈ intervalle GPS)
+  double _arrowTargetSpeed =
+      0.0; // Vitesse cible de la flèche pour atteindre le bleu
+
+  // Getters pour l'affichage debug
+  double get arrowSpeedKmh => _arrowSpeedMps * 3.6;
+  double get arrowTargetSpeedKmh => _arrowTargetSpeed * 3.6;
+
   bool _lastIsStopped = false;
 
   DateTime? _lastPredictTime;
@@ -24845,6 +25007,7 @@ class KinematicFilter {
 
   int _lastSimRouteIndex = 0;
   int _snappedGpsIndex = 0;
+  int get snappedGpsIndex => _snappedGpsIndex;
   int lastRouteIndex = -1;
   int get lastSimRouteIndex => _lastSimRouteIndex;
 
@@ -24870,6 +25033,7 @@ class KinematicFilter {
 
   int _targetRouteIndex = -1;
   DateTime? _targetUpdatedAt;
+  DateTime? get targetUpdatedAt => _targetUpdatedAt;
 
   /// Latence totale lissée utilisée pour projeter le point bleu plus loin.
   /// Marche : max ~0.90s. Vélo/véhicule : max ~1.40s.
@@ -24890,21 +25054,21 @@ class KinematicFilter {
     required int fixAgeMs,
     int renderMs = 16,
   }) {
+    // ✅ Sur iOS, l'intervalle peut varier entre 800ms et 2500ms.
+    // On lisse sur une plage plus large pour éviter les à-coups.
     final double interval = (intervalMs / 1000.0).clamp(0.25, 3.0).toDouble();
-
     final double proc = (processingMs / 1000.0).clamp(0.0, 1.0).toDouble();
-
-    final double age = (fixAgeMs / 1000.0).clamp(0.0, 1.5).toDouble();
-
+    final double age = (fixAgeMs / 1000.0).clamp(0.0, 2.0).toDouble();
     final double render = (renderMs / 1000.0).clamp(0.004, 0.050).toDouble();
 
-    _measuredIntervalSeconds = interval;
-    _renderLatencySeconds = render;
+    // Lissage plus doux sur iOS (intervalle instable)
+    final double smoothFactor = Platform.isIOS ? 0.50 : 0.70;
 
-    // Lissage exponentiel pour éviter les pics brutaux.
+    _measuredIntervalSeconds = (_measuredIntervalSeconds * smoothFactor) +
+        (interval * (1.0 - smoothFactor));
+    _renderLatencySeconds = render;
     _smoothedProcessingLatencySeconds =
         (_smoothedProcessingLatencySeconds * 0.70) + (proc * 0.30);
-
     _smoothedFixAgeSeconds = (_smoothedFixAgeSeconds * 0.70) + (age * 0.30);
   }
 
@@ -24913,6 +25077,7 @@ class KinematicFilter {
   LatLng? _lastConfirmedSnappedPos;
   int _lastConfirmedRouteIndex = -1;
   DateTime? _lastGoodGpsFixTime;
+  DateTime? get lastGoodGpsFixTime => _lastGoodGpsFixTime;
   int _consecutiveRejectedFixes = 0;
 
   // CORRIGÉ : getters publics pour permettre à NavigationController de
@@ -24949,14 +25114,8 @@ class KinematicFilter {
 
   static const double _hardBrakeDecel = 1.6; // m/s²
 
-  static const double _maxForwardCorrection = 10.0; // m/s
   static const double _maxReverseWalking = 1.7; // m/s
   static const double _maxReverseVehicle = 3.8; // m/s
-
-  static const double _snapDistanceWalking = 25.0; // mètres
-  static const double _snapDistanceVehicle = 70.0; // mètres
-
-  static const double _maxStoppedRecoverySeconds = 2.0;
 
   // ═══ AJOUT : seuils qualité/cohérence GPS ═══
   // Précision au-delà de laquelle un fix est jugé trop mauvais pour
@@ -24984,22 +25143,6 @@ class KinematicFilter {
   // par accepter quand même (mieux vaut ça qu'un point bleu figé pour de
   // bon si le déplacement était réel dans une zone GPS difficile).
   static const int _maxConsecutiveRejectedFixes = 4;
-
-  // ══════════════════════════════════════════════════════════════
-  // 🎯 PALIERS DE COMPORTEMENT (AJOUT)
-  // ══════════════════════════════════════════════════════════════
-
-  /// Petit écart : la flèche CONTINUE d'avancer mais plus lentement
-  static const double _smallGapAheadWalking = 5.0; // mètres
-  static const double _smallGapAheadVehicle = 10.0; // mètres
-
-  /// Écart moyen : la flèche S'ARRÊTE et attend le GPS
-  static const double _mediumGapAheadWalking = 15.0; // mètres
-  static const double _mediumGapAheadVehicle = 35.0; // mètres
-
-  /// Gros écart : la flèche RECULE (seulement si vraiment nécessaire)
-  static const double _hardReverseGapWalking = 25.0; // mètres
-  static const double _hardReverseGapVehicle = 70.0; // mètres
 
   /// Détection d'arrêt confirmé
   static const double _stopConfirmSeconds = 0.9;
@@ -25280,6 +25423,9 @@ class KinematicFilter {
   }
 
   /// 🚀 MOTEUR DE PROJECTION (60 FPS)
+  /// Le point BLEU n'est recalculé QUE lorsqu'un nouveau point GPS arrive.
+  /// La flèche se déplace vers le point bleu en ~1s (intervalle GPS),
+  /// et CONTINUE sur sa lancée si elle l'atteint avant le prochain GPS.
   LatLng? predictNextPosition(List<LatLng> routePolyline) {
     if (lastRealPos == null || _currentRawGps == null || simulatedPos == null) {
       return null;
@@ -25288,13 +25434,10 @@ class KinematicFilter {
     final DateTime now = DateTime.now();
     double dt = now.difference(_lastPredictTime ?? now).inMilliseconds / 1000.0;
     _lastPredictTime = now;
+    // Bridage anti-saccade : pas de saut géant d'un coup
+    if (dt <= 0.0 || dt > 0.033) dt = 0.016;
 
-    // 🔧 CORRECTION CRITIQUE :
-    // L'ancien clamp (0.2) autorisait un lag de 200ms, calculant un déplacement géant d'un coup -> Saccade.
-    // On bride dt à 33ms (30 FPS max) pour lisser les baisses de régime et éviter les téléportations.
-    if (dt <= 0.0 || dt > 0.033) dt = 0.016; // 0.016 = ~60 FPS stable
-
-    // ═══ AJOUT : fusion GPS+accéléromètre rafraîchie à chaque frame ═══
+    // Fusion GPS + accéléromètre (fraîchie à chaque frame)
     _refreshAccelFusion();
     _applyBrakingFusion(dt);
 
@@ -25303,561 +25446,102 @@ class KinematicFilter {
       return simulatedPos;
     }
 
-    // Si on vient de recevoir un nouveau point GPS, on recalcule la cible
+    // ════════════════════════════════════════════════════════════
+    // 1. NOUVEAU POINT GPS → on recalcule le POINT BLEU (projection)
+    //    C'est le SEUL moment où le point bleu bouge.
+    // ════════════════════════════════════════════════════════════
     if (_isNewGpsPoint) {
       _isNewGpsPoint = false;
-
-      final LatLng rawPos = LatLng(
-        _currentRawGps!.latitude,
-        _currentRawGps!.longitude,
-      );
-
-      final double stopThresholdForHeading =
-          _isWalking ? _walkingStopSpeed : _vehicleStopSpeed;
-      final bool isLikelyStationaryNow =
-          _vehicleSpeedMps < stopThresholdForHeading &&
-              _lastRawSpeedMps < stopThresholdForHeading;
-      // À l'arrêt, le heading GPS est bruité/aléatoire : on ignore la pénalité
-      // d'angle dans _findRouteIndex en passant heading=0 uniquement pour ce cas,
-      // et on garde l'index précédent au lieu de le recalculer sans cesse.
-      final double heading = isLikelyStationaryNow ? 0.0 : lastRealPos!.heading;
-      final int hint = lastRouteIndex < 0 ? 0 : lastRouteIndex;
-
-      // 🔧 Budget de déplacement réaliste depuis le dernier fix GPS : empêche
-      // le snap de se verrouiller loin en avant "par-dessus" un virage.
-      final double stopThresholdForBudget =
-          _isWalking ? _walkingStopSpeed : _vehicleStopSpeed;
-
-      final bool likelyStoppedBudget =
-          _vehicleSpeedMps < stopThresholdForBudget &&
-              _lastRawSpeedMps < stopThresholdForBudget;
-
-      final double latencyBudget =
-          likelyStoppedBudget ? 0.0 : totalLatencySeconds;
-
-      final double moveBudget =
-          _vehicleSpeedMps * (_lastGpsIntervalSeconds + latencyBudget);
-      final double maxAhead = moveBudget + (_isWalking ? 6.0 : 20.0);
-      final double maxBehind = _isWalking ? 12.0 : 35.0;
-
-      // Si on est stationnaire et que le déplacement snappé est minime, on garde
-      // l'ancien index/position au lieu de recalculer (évite le clignotement).
-      if (isLikelyStationaryNow && _lastConfirmedSnappedPos != null) {
-        final double drift = Geolocator.distanceBetween(
-          rawPos.latitude,
-          rawPos.longitude,
-          _lastConfirmedSnappedPos!.latitude,
-          _lastConfirmedSnappedPos!.longitude,
-        );
-        final double noiseFloor =
-            _isWalking ? _gpsNoiseFloorWalking : _gpsNoiseFloorVehicle;
-        if (drift < noiseFloor * 2.0) {
-          return simulatedPos; // on ignore ce fix bruité, pas de recalcul de cible
-        }
-      }
-
-      int rawIndex = _findRouteIndex(
-        rawPos,
-        heading,
-        routePolyline,
-        hint,
-        maxAheadMeters: maxAhead,
-        maxBehindMeters: maxBehind,
-      );
-
-      final LatLng candidateSnapped = _projectOnSegment(
-        rawPos,
-        routePolyline[rawIndex],
-        routePolyline[rawIndex + 1],
-      );
-
-      // ═══════════════════════════════════════════════════════════
-      // 🔍 AJOUT : FILTRE QUALITÉ / COHÉRENCE GPS
-      // ═══════════════════════════════════════════════════════════
-      // Objectif : le point bleu ne doit jamais "sauter" loin à cause
-      // d'un fix GPS aberrant (route sinueuse, arbres, immeubles, rebond
-      // multi-trajet). On vérifie 2 choses avant d'accepter un fix :
-      //   1. Sa précision (accuracy) n'est pas trop mauvaise
-      //   2. Le saut par rapport au dernier point confirmé le long de
-      //      l'ITINÉRAIRE (pas à vol d'oiseau) reste physiquement possible
-      final double maxAccuracyAllowed =
-          _isWalking ? _maxAccuracyWalking : _maxAccuracyVehicle;
-      final double degradedAccuracy =
-          _isWalking ? _degradedAccuracyWalking : _degradedAccuracyVehicle;
-      final double maxPlausibleSpeed =
-          _isWalking ? _maxPlausibleSpeedWalking : _maxPlausibleSpeedVehicle;
-
-      bool acceptFix = true;
-
-      // 1. Précision GPS trop mauvaise → fix suspect
-      if (_lastRawAccuracy > maxAccuracyAllowed) {
-        acceptFix = false;
-      }
-
-      // 2. Cohérence : saut trop rapide pour être réel par rapport au
-      //    dernier point confirmé le long de l'itinéraire
-      if (acceptFix &&
-          _lastConfirmedSnappedPos != null &&
-          _lastConfirmedRouteIndex >= 0) {
-        // 🔧 CORRECTIF ATTENTE GPS : filtre SIGNÉ au lieu de .abs(). L'ancien
-        // filtre utilisait une valeur absolue, donc un vrai fix GPS arrivant
-        // LÉGÈREMENT DERRIÈRE la dernière position confirmée (normal après
-        // que la flèche ait sauté trop loin en avant dans un virage) était
-        // rejeté comme si c'était un saut aberrant. La flèche restait alors
-        // bloquée devant, en attendant que le GPS "la rattrape". On laisse
-        // maintenant plus de mou vers l'arrière (récupération) que vers
-        // l'avant (saut aberrant).
-        final double jumpSigned = _signedRouteDistance(
-          _lastConfirmedSnappedPos!,
-          _lastConfirmedRouteIndex,
-          candidateSnapped,
-          rawIndex,
-          routePolyline,
-        );
-
-        final double elapsed = _lastGpsIntervalSeconds.clamp(0.2, 5.0);
-        final double margin = _isWalking ? 4.0 : 12.0;
-        final double limitAhead = (maxPlausibleSpeed * elapsed) + margin;
-        final double limitBehind = limitAhead + (_isWalking ? 10.0 : 30.0);
-
-        // On n'applique ce veto que si la précision n'est pas excellente :
-        // un fix très précis qui indique un grand saut est probablement
-        // un vrai déplacement rapide (voiture qui accélère par ex.).
-        if ((jumpSigned > limitAhead || jumpSigned < -limitBehind) &&
-            _lastRawAccuracy > degradedAccuracy) {
-          acceptFix = false;
-        }
-      }
-
-      // 3. Filet de sécurité anti-blocage : si on rejette trop de fixes
-      //    d'affilée, on finit par accepter (mieux vaut ça qu'un point
-      //    bleu figé indéfiniment si le déplacement était en fait réel).
-      if (!acceptFix) {
-        _consecutiveRejectedFixes++;
-        if (_consecutiveRejectedFixes > _maxConsecutiveRejectedFixes) {
-          acceptFix = true;
-        }
-      }
-
-      if (!acceptFix) {
-        // Fix ignoré : la flèche continue sur sa lancée avec la dernière
-        // cible fiable, au lieu d'être tirée vers un point aberrant.
-        return simulatedPos;
-      }
-
-      _consecutiveRejectedFixes = 0;
-      _lastGoodGpsFixTime = DateTime.now();
-
-      lastRouteIndex = rawIndex;
-      _snappedGpsIndex = rawIndex;
-      _snappedGpsPos = candidateSnapped;
-
-      final double stopThreshold =
-          _isWalking ? _walkingStopSpeed : _vehicleStopSpeed;
-
-      final bool isStopped =
-          _vehicleSpeedMps < stopThreshold && _lastRawSpeedMps < stopThreshold;
-
-      // ═══════════════════════════════════════════════════════════
-      // 🔍 AJOUT : PLANCHER DE BRUIT GPS À L'ARRÊT (ANTI-RAMPEMENT RONDS-POINTS)
-      // ═══════════════════════════════════════════════════════════
-      // À l'arrêt, un léger jitter GPS peut sembler être une petite
-      // avancée réelle et faire "ramper" la flèche en avant peu à peu.
-      // Si le déplacement snappé est plus petit que le bruit GPS typique,
-      // on garde l'ancienne référence au lieu de suivre le jitter.
-      if (isStopped &&
-          _lastConfirmedSnappedPos != null &&
-          _lastConfirmedRouteIndex >= 0) {
-        final double noiseFloor =
-            _isWalking ? _gpsNoiseFloorWalking : _gpsNoiseFloorVehicle;
-
-        final double driftFromLastConfirmed = _signedRouteDistance(
-          _lastConfirmedSnappedPos!,
-          _lastConfirmedRouteIndex,
-          _snappedGpsPos!,
-          rawIndex,
-          routePolyline,
-        ).abs();
-
-        if (driftFromLastConfirmed < noiseFloor) {
-          _snappedGpsPos = _lastConfirmedSnappedPos;
-          rawIndex = _lastConfirmedRouteIndex;
-          lastRouteIndex = rawIndex;
-          _snappedGpsIndex = rawIndex;
-        }
-      }
-
-      _lastConfirmedSnappedPos = _snappedGpsPos;
-      _lastConfirmedRouteIndex = lastRouteIndex;
-
-      final double latencyCompensation = isStopped ? 0.0 : totalLatencySeconds;
-
-      double lookahead = _normalLookaheadSeconds;
-
-      if (isStopped) {
-        lookahead = 0.0;
-      } else {
-        lookahead = _brakingLookaheadSeconds +
-            (1.0 - _brakingIntensity) *
-                (_normalLookaheadSeconds - _brakingLookaheadSeconds);
-
-        // ⏱️ Compensation de la latence GPS + traitement + rendu.
-        lookahead += latencyCompensation;
-      }
-
-      // ═══ AJOUT : projection KINÉMATIQUE (et non plus vitesse constante) ═══
-      // Point bleu : projection du GPS dans le futur, en tenant compte de la
-      // décélération/accélération mesurée (fusion GPS+accéléromètre) via
-      // d(t) = v0*t − ½·a·t² au lieu du simple d = v·t. Ça évite que la
-      // cible ne parte trop loin en avant pendant un freinage brusque,
-      // puisqu'elle "sait" que la vitesse est en train de chuter.
-      final double lookaheadDistance = _kinematicLookaheadDistance(
-        _vehicleSpeedMps,
-        lookahead,
-      );
-
-      // ═══ VÉRIFICATION DE COHÉRENCE BLEU ↔ JAUNE (distance itinéraire) ═══
-      // Le point bleu (cible) ne doit jamais être avancé, le long de la
-      // route, plus loin que ce que la vitesse réellement mesurée justifie.
-      // Comme la cible est construite en avançant sur le tracé depuis le
-      // point jaune (GPS brut snappé), la distance "logique" à comparer
-      // est directement la distance parcourue sur l'itinéraire
-      // (lookaheadDistance), jamais une distance à vol d'oiseau : sur un
-      // virage ou un rond-point, le vol d'oiseau sous-estime l'écart réel
-      // et laissait passer des cas incohérents.
-      final double maxCoherentGap =
-          (_vehicleSpeedMps * (_normalLookaheadSeconds + latencyCompensation)) +
-              (_isWalking ? 4.0 : 8.0); // marge de sécurité (bruit GPS)
-
-      final double coherentLookaheadDistance =
-          lookaheadDistance > maxCoherentGap
-              ? maxCoherentGap
-              : lookaheadDistance;
-
-      _targetPos = _advanceForwardAlongRoute(
-        _snappedGpsPos!,
-        coherentLookaheadDistance,
-        routePolyline,
-        rawIndex,
-      );
-
-      _targetRouteIndex = _findRouteIndex(
-        _targetPos!,
-        heading,
-        routePolyline,
-        rawIndex,
-        maxAheadMeters: 150.0,
-        maxBehindMeters: 40.0,
-      );
-
-      _targetUpdatedAt = DateTime.now();
-
-      // Si on est arrêté, la cible redevient le point GPS projeté
-      final LatLng referencePos = isStopped ? _snappedGpsPos! : _targetPos!;
-
-      final int referenceIndex = isStopped
-          ? rawIndex
-          : _findRouteIndex(referencePos, heading, routePolyline, rawIndex);
-
-      // 🔧 On mémorise la référence (recalculée uniquement au rythme du GPS,
-      // ~1x/sec, ancrée sur le point jaune) pour que la correction de
-      // vitesse ci-dessous puisse s'exécuter à CHAQUE FRAME (60fps) au lieu
-      // d'une seule fois par fix GPS.
-      _lastReferencePos = referencePos;
-      _lastReferenceIndex = referenceIndex;
-      _lastIsStopped = isStopped;
+      _computeBlueTarget(routePolyline);
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // ⏱️ AVANCE CONTINUE DU POINT DE PROJECTION (POINT B)
-    // Le point bleu ne doit pas rester figé entre deux fixes GPS.
-    // ═══════════════════════════════════════════════════════════
-    if (_targetPos != null &&
-        _targetRouteIndex >= 0 &&
-        routePolyline.length >= 2 &&
-        !isStationary) {
-      final double sinceTargetUpdate = _targetUpdatedAt != null
-          ? now.difference(_targetUpdatedAt!).inMilliseconds / 1000.0
-          : 999.0;
-
-      // Si le GPS est resté muet trop longtemps, on évite un saut énorme.
-      if (sinceTargetUpdate > 1.5) {
-        _targetUpdatedAt = now;
-      } else if (sinceTargetUpdate > 0.016) {
-        final double targetMove = _kinematicLookaheadDistance(
-          _vehicleSpeedMps,
-          sinceTargetUpdate,
-        );
-
-        if (targetMove > 0.008) {
-          _targetPos = _advanceForwardAlongRoute(
-            _targetPos!,
-            targetMove,
-            routePolyline,
-            _targetRouteIndex,
-          );
-
-          _targetRouteIndex = _findRouteIndex(
-            _targetPos!,
-            lastRealPos?.heading ?? 0.0,
-            routePolyline,
-            _targetRouteIndex,
-            maxAheadMeters: 80.0,
-            maxBehindMeters: 30.0,
-          );
-
-          _targetUpdatedAt = now;
-          if (!_lastIsStopped) {
-            _lastReferencePos = _targetPos;
-            _lastReferenceIndex = _targetRouteIndex;
-          }
-        }
-      }
+    // Pas encore de point bleu calculé → on ne bouge pas
+    if (_targetPos == null) {
+      return simulatedPos;
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // 🔧 CORRECTION DE VITESSE DE LA FLÈCHE — À CHAQUE FRAME (60fps)
-    // ═══════════════════════════════════════════════════════════
-    // AVANT : tout ce bloc était À L'INTÉRIEUR du "if (_isNewGpsPoint)",
-    // donc exécuté une seule fois par seconde. Entre deux fixs GPS, la
-    // flèche avançait seule (dead-reckoning) à _arrowSpeedMps constant,
-    // en repartant toujours de sa PROPRE position précédente (le "bleu")
-    // au lieu d'être recomparée au jaune. Résultat : dès que la vitesse de
-    // la flèche était même légèrement surestimée, l'écart s'accumulait
-    // pendant toute la seconde avant d'être corrigé → avance excessive.
-    // MAINTENANT : on recompare la flèche à sa référence (dérivée du
-    // jaune) à chaque frame, donc la correction est quasi instantanée et
-    // ne peut plus dériver loin avant d'être rattrapée.
-    if (_lastReferencePos != null && simulatedPos != null) {
-      final LatLng referencePos = _lastReferencePos!;
-      final int referenceIndex = _lastReferenceIndex;
-      final bool isStopped = _lastIsStopped;
-      final double heading = lastRealPos?.heading ?? 0.0;
-      final double stopThreshold =
-          _isWalking ? _walkingStopSpeed : _vehicleStopSpeed;
+    // ════════════════════════════════════════════════════════════
+    // 2. DÉPLACEMENT DE LA FLÈCHE vers le point bleu.
+    //    Vitesse cible = calculée pour atteindre le bleu en ~1s.
+    //    Si la flèche dépasse le bleu (GPS en retard), elle CONTINUE
+    //    à la même vitesse jusqu'à la prochaine projection.
+    // ════════════════════════════════════════════════════════════
+    double targetSpeed = _arrowTargetSpeed;
 
-      final int simIndex = _findRouteIndex(
-        simulatedPos!,
-        heading,
-        routePolyline,
-        _lastSimRouteIndex,
-      );
-
-      _lastSimRouteIndex = simIndex;
-
-      // signedError > 0 : la cible est devant la flèche
-      // signedError < 0 : la cible est derrière la flèche
-      final double signedError = _signedRouteDistance(
-        simulatedPos!,
-        simIndex,
-        referencePos,
-        referenceIndex,
-        routePolyline,
-      );
-
-      final double absError = signedError.abs();
-
-      final double maxReverse =
-          _isWalking ? _maxReverseWalking : _maxReverseVehicle;
-
-      double snapLimit =
-          _isWalking ? _snapDistanceWalking : _snapDistanceVehicle;
-
-      if (_brakingIntensity > 0.65) snapLimit *= 0.70;
-
-      final bool tooLongToRecover = isStopped &&
-          maxReverse > 0.0 &&
-          (absError / maxReverse) > _maxStoppedRecoverySeconds;
-
-      // Si l’écart est trop grand, on téléporte proprement la flèche
-      if (absError > snapLimit || tooLongToRecover) {
-        simulatedPos = referencePos;
-        _lastSimRouteIndex = referenceIndex;
-        _arrowSpeedMps = isStopped ? 0.0 : _vehicleSpeedMps;
-
-        // ✅ Si la référence est derrière la flèche, on considère que l'on recule.
-        isBackwardRecovery = signedError < -0.35;
-
-        return simulatedPos;
-      }
-
-      final double catchupTime = _computeCatchupTime(absError, isStopped);
-      double desiredSpeed = 0.0;
-
-      // ── Détection d'arrêt confirmé ──
-      // 🔧 PRIORITÉ À L'ACCÉLÉROMÈTRE, marche ET vélo/véhicule : il détecte
-      // l'absence de mouvement quasi instantanément, alors que le GPS seul
-      // (surtout à basse vitesse, ou bruité) peut mettre jusqu'à 1s à
-      // confirmer un arrêt réel → la flèche "rampait" en avant en attendant.
-      final bool accelConfirmsStill =
-          !accelDetector.isBraking && !accelDetector.isAccelerating;
-      final bool isReallyStopped = _stoppedForSeconds >= _stopConfirmSeconds ||
-          (_vehicleSpeedMps < stopThreshold &&
-              _lastRawSpeedMps < stopThreshold) ||
-          (accelConfirmsStill &&
-              _vehicleSpeedMps < stopThreshold &&
-              _stoppedForSeconds >= 0.3);
-
-      // ── GAP = distance entre flèche et GPS (positif = flèche devant) ──
-      final double gapAhead = -signedError; // positif si flèche DEVANT le GPS
-
-      if (signedError < -0.35) {
-        // ═══════════════════════════════════════════════════
-        // LA FLÈCHE EST DEVANT LE GPS
-        // ═══════════════════════════════════════════════════
-        final double smallGap =
-            _isWalking ? _smallGapAheadWalking : _smallGapAheadVehicle;
-        final double mediumGap =
-            _isWalking ? _mediumGapAheadWalking : _mediumGapAheadVehicle;
-        final double reverseGap =
-            _isWalking ? _hardReverseGapWalking : _hardReverseGapVehicle;
-
-        if (isReallyStopped) {
-          // ── ARRÊTÉ : reculer si écart significatif ──
-          // 🔧 Tolérance réduite : la flèche doit se superposer au point
-          // jaune à l'arrêt, pas rester visiblement devant.
-          final double tolerance = _isWalking ? 0.6 : 1.2;
-          if (gapAhead <= tolerance) {
-            desiredSpeed = 0.0; // trop petit, on bouge pas
-          } else {
-            final double ratio = _clamp(
-              (gapAhead - tolerance) / math.max(reverseGap - tolerance, 1.0),
-              0.15,
-              1.0,
-            );
-            // 🔧 Retour en arrière plus franc dès le début (0.50 au lieu de
-            // 0.30) pour que la flèche rattrape le jaune plus vite au lieu
-            // de "traîner" en avant après l'arrêt.
-            desiredSpeed = -maxReverse * (0.50 + (0.50 * ratio));
-
-            // Si trop long → snap
-            final double recoveryTime = gapAhead / math.max(maxReverse, 0.1);
-            if (recoveryTime > _maxStoppedRecoverySeconds) {
-              simulatedPos = referencePos;
-              _lastSimRouteIndex = referenceIndex;
-              _arrowSpeedMps = 0.0;
-              isBackwardRecovery = false;
-              return simulatedPos;
-            }
-          }
-        } else {
-          // ── EN MOUVEMENT : logique par paliers ──
-          if (gapAhead <= smallGap) {
-            // ✅ PETIT ÉCART : avancer mais plus lentement
-            final double gapRatio =
-                _clamp(gapAhead / math.max(smallGap, 0.1), 0.0, 1.0);
-            double slowFactor =
-                0.70 - (0.35 * gapRatio) - (0.25 * _brakingIntensity);
-            slowFactor = _clamp(slowFactor, 0.20, 0.80);
-            desiredSpeed = _vehicleSpeedMps * slowFactor;
-
-            if (_brakingIntensity > 0.70) {
-              desiredSpeed = math.min(desiredSpeed, _vehicleSpeedMps * 0.25);
-            }
-          } else if (gapAhead <= mediumGap) {
-            // 🔧 ÉCART MOYEN : rampe douce vers l'arrêt au lieu d'un arrêt
-            // sec (l'ancien comportement donnait l'impression que la flèche
-            // "attendait" brutalement le GPS).
-            final double t = _clamp(
-              (gapAhead - smallGap) / math.max(mediumGap - smallGap, 0.1),
-              0.0,
-              1.0,
-            );
-            desiredSpeed = _vehicleSpeedMps * (0.35 * (1.0 - t));
-          } else {
-            // 🔙 GROS ÉCART : reculer proportionnellement
-            final double ratio = _clamp(
-              (gapAhead - mediumGap) / math.max(reverseGap - mediumGap, 1.0),
-              0.0,
-              1.0,
-            );
-            final double reverseFactor =
-                (0.30 + (0.70 * ratio)) * (0.55 + (0.45 * _brakingIntensity));
-            desiredSpeed = -maxReverse * _clamp(reverseFactor, 0.0, 1.0);
-          }
-        }
-      } else {
-        // ═══════════════════════════════════════════════════
-        // LA FLÈCHE EST DERRIÈRE OU SUR LE GPS → rattraper
-        // ═══════════════════════════════════════════════════
-        if (isReallyStopped) {
-          desiredSpeed = signedError / catchupTime;
-          desiredSpeed = _clamp(desiredSpeed, 0.0, _isWalking ? 1.2 : 2.5);
-        } else {
-          double correction = signedError / catchupTime;
-          // 🔧 10 m/s de correction à pied équivaut à un téléport visible ;
-          // on plafonne beaucoup plus bas dans ce mode.
-          final double maxCorr = _isWalking ? 3.0 : _maxForwardCorrection;
-          correction = _clamp(correction, 0.0, maxCorr);
-          desiredSpeed = _vehicleSpeedMps + correction;
-          desiredSpeed = _clamp(desiredSpeed, 0.0, _vehicleSpeedMps + maxCorr);
-        }
-      }
-
-      // Lissage de la vitesse de la flèche : accélération / freinage progressif
-      double maxAccel = _isWalking ? 2.2 : 4.5;
-      double maxDecel = _isWalking ? 3.8 : 8.0;
-
-      if (_brakingIntensity > 0.5) maxDecel *= 1.35;
-
-      // ═══ AJOUT : boost symétrique quand l'accéléromètre détecte une
-      // accélération franche (redémarrage, dépassement) → la flèche
-      // rattrape la vitesse réelle plus vite au lieu de traîner.
-      if (_accelBoostIntensity > 0.5) maxAccel *= 1.35;
-
-      double delta = desiredSpeed - _arrowSpeedMps;
-
-      // 🔧 On utilise le dt de LA FRAME (~1/60s) et non plus l'intervalle
-      // GPS (~1s), puisque ce bloc tourne maintenant à chaque frame : avec
-      // l'ancien _lastGpsIntervalSeconds, maxDelta aurait été ~60x trop
-      // grand ici et aurait autorisé un changement de vitesse quasi
-      // instantané à chaque frame (à-coups).
-      final double maxDelta = delta >= 0.0 ? maxAccel * dt : maxDecel * dt;
-
-      if (delta > maxDelta) delta = maxDelta;
-      if (delta < -maxDelta) delta = -maxDelta;
-
-      _arrowSpeedMps += delta;
-
-      // Si on est arrêté et très proche du GPS, on stoppe complètement
-      if (absError < 0.75 && isStopped) {
-        _arrowSpeedMps = 0.0;
-      }
-
-      _arrowSpeedMps = _clamp(
-        _arrowSpeedMps,
-        -maxReverse,
-        math.max(30.0, _vehicleSpeedMps + 8.0),
-      );
-    }
-
-    // Sécurité : si plus de GPS depuis un moment, on ralentit la flèche
+    // Sécurité : si le GPS est muet depuis trop longtemps, on ralentit
+    // progressivement la flèche pour ne pas partir à l'infini.
     if (_lastGpsUpdateTime != null) {
       final double gpsAge =
-          DateTime.now().difference(_lastGpsUpdateTime!).inMilliseconds /
-              1000.0;
-
-      if (gpsAge > 2.5) {
-        _arrowSpeedMps *= 0.82;
-        if (_arrowSpeedMps.abs() < 0.05) _arrowSpeedMps = 0.0;
+          now.difference(_lastGpsUpdateTime!).inMilliseconds / 1000.0;
+      if (gpsAge > 3.0) {
+        final double decay = _clamp(1.0 - ((gpsAge - 3.0) / 5.0), 0.0, 1.0);
+        targetSpeed *= decay;
       }
     }
 
+    // À l'arrêt confirmé et collé au bleu → stop complet
+    if (_lastIsStopped && _targetRouteIndex >= 0) {
+      final double distToBlue = _signedRouteDistance(
+        simulatedPos!,
+        _lastSimRouteIndex,
+        _targetPos!,
+        _targetRouteIndex,
+        routePolyline,
+      ).abs();
+      if (distToBlue < 0.75) {
+        targetSpeed = 0.0;
+      }
+    }
+
+    // Lissage accélération / freinage (pas d'à-coups)
+    double maxAccel = _isWalking ? 2.2 : 4.5;
+    double maxDecel = _isWalking ? 3.8 : 8.0;
+    if (_brakingIntensity > 0.5) maxDecel *= 1.35;
+    if (_accelBoostIntensity > 0.5) maxAccel *= 1.35;
+
+    double delta = targetSpeed - _arrowSpeedMps;
+    final double maxDelta = delta >= 0.0 ? maxAccel * dt : maxDecel * dt;
+    if (delta > maxDelta) delta = maxDelta;
+    if (delta < -maxDelta) delta = -maxDelta;
+    _arrowSpeedMps += delta;
+
+    // Déplacement le long de l'itinéraire
     final double moveDistance = _arrowSpeedMps * dt;
     isBackwardRecovery = moveDistance < -0.02;
 
     if (moveDistance.abs() > 0.008) {
-      final double heading = lastRealPos?.heading ?? 0.0;
+      // 🔧 Cap GPS utilisé pour la pénalité d'angle UNIQUEMENT > ~3 km/h.
+      final double? simHeading =
+          (_arrowSpeedMps * 3.6) > 3.0 ? lastRealPos!.heading : null;
 
-      final int simIndex = _findRouteIndex(
+      int simIndex = _findRouteIndex(
         simulatedPos!,
-        heading,
+        simHeading,
         routePolyline,
         _lastSimRouteIndex,
+        maxAheadMeters: 30.0,
+        maxBehindMeters: 20.0,
+        hysteresisMeters: 2.0,
       );
 
-      _lastSimRouteIndex = simIndex;
+      // 🔧 GARDE ANTI-TÉLÉPORTATION : si le segment trouvé implique de
+      // re-projeter la flèche loin d'elle-même (coin de virage clampé),
+      // on reste sur le segment courant.
+      final int maxSeg = routePolyline.length - 2;
+      final int curIdx = _lastSimRouteIndex.clamp(0, maxSeg);
+      final LatLng projNew = _projectOnSegment(
+          simulatedPos!, routePolyline[simIndex], routePolyline[simIndex + 1]);
+      final LatLng projCur = _projectOnSegment(
+          simulatedPos!, routePolyline[curIdx], routePolyline[curIdx + 1]);
+      final double dNew = Geolocator.distanceBetween(simulatedPos!.latitude,
+          simulatedPos!.longitude, projNew.latitude, projNew.longitude);
+      final double dCur = Geolocator.distanceBetween(simulatedPos!.latitude,
+          simulatedPos!.longitude, projCur.latitude, projCur.longitude);
+      if (dNew > dCur + 5.0) {
+        simIndex = curIdx;
+      }
 
+      _lastSimRouteIndex = simIndex;
       simulatedPos = _moveAlongRouteSigned(
         simulatedPos!,
         moveDistance,
@@ -25869,25 +25553,253 @@ class KinematicFilter {
     return simulatedPos;
   }
 
-  double _computeCatchupTime(double absError, bool isStopped) {
+  /// 🎯 Calcule le POINT BLEU (projection) à partir du nouveau point GPS.
+  /// Appelée UNIQUEMENT quand _isNewGpsPoint == true.
+  /// Détermine aussi la vitesse cible de la flèche pour atteindre ce bleu
+  /// dans le temps d'un intervalle GPS (~1s).
+  void _computeBlueTarget(List<LatLng> routePolyline) {
+    final LatLng rawPos =
+        LatLng(_currentRawGps!.latitude, _currentRawGps!.longitude);
+
+    final double stopThreshold =
+        _isWalking ? _walkingStopSpeed : _vehicleStopSpeed;
+    final bool isStopped =
+        _vehicleSpeedMps < stopThreshold && _lastRawSpeedMps < stopThreshold;
+
+    // 🔧 CORRECTIF SAUT AU VIRAGE : à l'arrêt ou < ~3 km/h le cap GPS est du
+    // bruit. L'ancien 0.0 biaisait vers le NORD (segments d'avant-virage) et
+    // projetait le bleu sur le coin (projection clampée). null = aucune pénalité.
+    final double? heading =
+        (isStopped || _vehicleSpeedMps < 0.85) ? null : lastRealPos!.heading;
+    final int hint = lastRouteIndex < 0 ? 0 : lastRouteIndex;
+
+    // Budget de déplacement réaliste depuis le dernier fix
+    final double latencyBudget = isStopped ? 0.0 : totalLatencySeconds;
+    final double moveBudget =
+        _vehicleSpeedMps * (_lastGpsIntervalSeconds + latencyBudget);
+    final double maxAhead = moveBudget + (_isWalking ? 6.0 : 20.0);
+    final double maxBehind = _isWalking ? 12.0 : 35.0;
+
+    // 🛑 Verrou anti-jitter à l'arrêt : si le déplacement brut est inférieur au bruit GPS,
+    // on garde le point bleu actuel sans recalculer (évite les sauts d'avant en arrière).
+    if (isStopped && _lastConfirmedSnappedPos != null) {
+      final double drift = Geolocator.distanceBetween(
+        rawPos.latitude,
+        rawPos.longitude,
+        _lastConfirmedSnappedPos!.latitude,
+        _lastConfirmedSnappedPos!.longitude,
+      );
+      final double noiseFloor =
+          _isWalking ? _gpsNoiseFloorWalking : _gpsNoiseFloorVehicle;
+      if (drift < noiseFloor * 2.0) {
+        return; // on ignore ce fix bruité, pas de recalcul de cible
+      }
+    }
+
+    int rawIndex = _findRouteIndex(
+      rawPos,
+      heading,
+      routePolyline,
+      hint,
+      maxAheadMeters: maxAhead,
+      maxBehindMeters: maxBehind,
+      hysteresisMeters: 3.0,
+    );
+
+    final LatLng candidateSnapped = _projectOnSegment(
+      rawPos,
+      routePolyline[rawIndex],
+      routePolyline[rawIndex + 1],
+    );
+
+    // ════════════════════════════════════════════════════════════
+    // FILTRE QUALITÉ / COHÉRENCE GPS (anti-téléportation) — conservé
+    // ════════════════════════════════════════════════════════════
+    final double maxAccuracyAllowed =
+        _isWalking ? _maxAccuracyWalking : _maxAccuracyVehicle;
+    // Note: degradedAccuracy supprimée — le rejet saut arrière ne conditionne
+    // plus à la précision (cf. correctif virage).
+    final double maxPlausibleSpeed =
+        _isWalking ? _maxPlausibleSpeedWalking : _maxPlausibleSpeedVehicle;
+
+    bool acceptFix = true;
+
+    // 1. Précision GPS trop mauvaise → fix suspect
+    if (_lastRawAccuracy > maxAccuracyAllowed) {
+      acceptFix = false;
+    }
+
+    // 2. Saut le long de l'itinéraire physiquement impossible
+    if (acceptFix &&
+        _lastConfirmedSnappedPos != null &&
+        _lastConfirmedRouteIndex >= 0) {
+      final double jumpSigned = _signedRouteDistance(
+        _lastConfirmedSnappedPos!,
+        _lastConfirmedRouteIndex,
+        candidateSnapped,
+        rawIndex,
+        routePolyline,
+      );
+      final double elapsed = _lastGpsIntervalSeconds.clamp(0.2, 5.0);
+      final double margin = _isWalking ? 4.0 : 12.0;
+      final double limitAhead = (maxPlausibleSpeed * elapsed) + margin;
+      final double limitBehind = limitAhead + (_isWalking ? 10.0 : 30.0);
+      // 🔧 Un saut ARRIÈRE est toujours suspect (mauvais segment accroché au
+      // virage) → rejet même si la précision GPS est bonne.
+      if (jumpSigned > limitAhead || jumpSigned < -limitBehind) {
+        acceptFix = false;
+      }
+    }
+
+    // 3. Filet anti-blocage : trop de rejets consécutifs → on accepte
+    if (!acceptFix) {
+      _consecutiveRejectedFixes++;
+      if (_consecutiveRejectedFixes > _maxConsecutiveRejectedFixes) {
+        acceptFix = true;
+      }
+    }
+
+    // Fix rejeté : on GARDE l'ancien point bleu.
+    // La flèche continue sur sa lancée (comportement demandé).
+    if (!acceptFix) {
+      return;
+    }
+
+    _consecutiveRejectedFixes = 0;
+    _lastGoodGpsFixTime = DateTime.now();
+    lastRouteIndex = rawIndex;
+    _snappedGpsIndex = rawIndex;
+    _snappedGpsPos = candidateSnapped;
+
+    // ════════════════════════════════════════════════════════════
+    // PLANCHER DE BRUIT GPS À L'ARRÊT (anti-rampement ronds-points)
+    // ════════════════════════════════════════════════════════════
+    if (isStopped &&
+        _lastConfirmedSnappedPos != null &&
+        _lastConfirmedRouteIndex >= 0) {
+      final double noiseFloor =
+          _isWalking ? _gpsNoiseFloorWalking : _gpsNoiseFloorVehicle;
+      final double drift = _signedRouteDistance(
+        _lastConfirmedSnappedPos!,
+        _lastConfirmedRouteIndex,
+        _snappedGpsPos!,
+        rawIndex,
+        routePolyline,
+      ).abs();
+      if (drift < noiseFloor) {
+        _snappedGpsPos = _lastConfirmedSnappedPos;
+        rawIndex = _lastConfirmedRouteIndex;
+        lastRouteIndex = rawIndex;
+        _snappedGpsIndex = rawIndex;
+      }
+    }
+
+    _lastConfirmedSnappedPos = _snappedGpsPos;
+    _lastConfirmedRouteIndex = lastRouteIndex;
+
+    // ════════════════════════════════════════════════════════════
+    // CALCUL DU POINT BLEU : GPS snappé + lookahead
+    // Le lookahead inclut la COMPENSATION DE LATENCE (captage +
+    // traitement + rendu) → le bleu est projeté plus loin pour
+    // absorber le retard d'affichage.
+    // ════════════════════════════════════════════════════════════
+    double lookahead;
     if (isStopped) {
-      return _clamp(
-        0.75 + (absError / 28.0),
-        0.75,
-        1.8,
+      lookahead = 0.0;
+    } else {
+      lookahead = _brakingLookaheadSeconds +
+          (1.0 - _brakingIntensity) *
+              (_normalLookaheadSeconds - _brakingLookaheadSeconds);
+      // ⏱️ Compensation latence totale (fixAge + traitement + rendu)
+      lookahead += totalLatencySeconds;
+    }
+
+    final double lookaheadDistance =
+        _kinematicLookaheadDistance(_vehicleSpeedMps, lookahead);
+
+    // Cohérence bleu ↔ jaune : le bleu ne doit pas partir trop loin
+    final double maxCoherentGap =
+        (_vehicleSpeedMps * (_normalLookaheadSeconds + totalLatencySeconds)) +
+            (_isWalking ? 4.0 : 8.0);
+    final double coherentLookahead =
+        lookaheadDistance > maxCoherentGap ? maxCoherentGap : lookaheadDistance;
+
+    _targetPos = _advanceForwardAlongRoute(
+      _snappedGpsPos!,
+      coherentLookahead,
+      routePolyline,
+      rawIndex,
+    );
+    // À l'arrêt, le bleu = le point jaune (pas d'anticipation)
+    if (isStopped) {
+      _targetPos = _snappedGpsPos;
+    }
+
+    _targetRouteIndex = _findRouteIndex(
+      _targetPos!,
+      heading,
+      routePolyline,
+      rawIndex,
+      maxAheadMeters: 150.0,
+      maxBehindMeters: 40.0,
+    );
+    _targetUpdatedAt = DateTime.now();
+
+    // ════════════════════════════════════════════════════════════
+    // CALCUL DE LA VITESSE FLÈCHE en fonction de l'écart au bleu
+    // ════════════════════════════════════════════════════════════
+    _arrowAnchorPos = simulatedPos;
+    _arrowAnchorIndex = _findRouteIndex(
+      simulatedPos!,
+      heading,
+      routePolyline,
+      _lastSimRouteIndex,
+    );
+
+    // Distance signée flèche → bleu :
+    //   > 0 : le bleu est DEVANT la flèche (retard à rattraper)
+    //   < 0 : la flèche est DEVANT le bleu (dépassement)
+    _blueTravelDistance = _signedRouteDistance(
+      _arrowAnchorPos!,
+      _arrowAnchorIndex,
+      _targetPos!,
+      _targetRouteIndex,
+      routePolyline,
+    );
+
+    // Temps alloué = intervalle GPS (~1s)
+    _blueTravelTime = _lastGpsIntervalSeconds.clamp(0.4, 2.5).toDouble();
+
+    final double maxFwd = _isWalking ? 6.0 : 40.0;
+    final double maxRev = _isWalking ? _maxReverseWalking : _maxReverseVehicle;
+
+    if (isStopped) {
+      // À l'arrêt : rejoint doucement le bleu puis stoppe
+      _arrowTargetSpeed = _clamp(
+        _blueTravelDistance / 1.0,
+        -maxRev,
+        _isWalking ? 1.2 : 2.5,
+      );
+    } else if (_blueTravelDistance >= 0.0) {
+      // ── CAS NORMAL : bleu devant, flèche en retard ──
+      // Vitesse = distance / temps → elle rattrape le bleu en ~1s.
+      // Plus le retard est grand, plus elle accélère.
+      _arrowTargetSpeed = _blueTravelDistance / _blueTravelTime;
+      _arrowTargetSpeed = _clamp(_arrowTargetSpeed, 0.0, maxFwd);
+    } else {
+      // ── DÉPASSEMENT : la flèche est déjà devant le bleu ──
+      // Le timing n'étant jamais précis, on AUTORISE la flèche à
+      // dépasser le bleu : elle CONTINUE d'avancer à sa vitesse
+      // actuelle (sans reculer ni s'arrêter), jusqu'au prochain GPS
+      // qui recalculera un nouveau bleu plus loin.
+      _arrowTargetSpeed = _clamp(
+        _arrowSpeedMps,
+        _vehicleSpeedMps * 0.6,
+        maxFwd,
       );
     }
 
-    if (_brakingIntensity > 0.75) return 0.55;
-    if (_brakingIntensity > 0.45) return 0.85;
-
-    // 🔧 Rattrapage légèrement plus rapide en régime normal (flèche en
-    // retard sur sa cible) : avant 0.85–1.35s, maintenant 0.70–1.10s.
-    return _clamp(
-      1.05 - (absError / 120.0),
-      0.70,
-      1.10,
-    );
+    _lastIsStopped = isStopped;
   }
 
   double _clamp(double value, double min, double max) {
@@ -25899,29 +25811,25 @@ class KinematicFilter {
 
   int _findRouteIndex(
     LatLng pos,
-    double heading,
+    double? heading, // 🔧 nullable : null = AUCUNE pénalité d'angle
     List<LatLng> polyline,
     int hintIndex, {
-    // 🔧 CORRECTIF SAUT DANS LES VIRAGES : fenêtre bornée en MÈTRES au lieu
-    // d'un nombre fixe de segments (+70 segments pouvait représenter des
-    // centaines de mètres sur des routes avec de petits segments, et la
-    // projection euclidienne "coupait" alors le virage en se verrouillant
-    // trop loin en avant).
     double maxAheadMeters = double.infinity,
     double maxBehindMeters = double.infinity,
+    double hysteresisMeters =
+        0.0, // 🔧 marge pour rester sur le segment courant
   }) {
     if (polyline.length < 2) return 0;
-    if (heading.isNaN || heading.isInfinite) heading = 0.0;
-
+    final bool useHeading =
+        heading != null && !heading.isNaN && !heading.isInfinite;
     final int maxSeg = polyline.length - 2;
     final int hint = hintIndex.clamp(0, maxSeg);
 
     double segLen(int i) => Geolocator.distanceBetween(
-          polyline[i].latitude,
-          polyline[i].longitude,
-          polyline[i + 1].latitude,
-          polyline[i + 1].longitude,
-        );
+        polyline[i].latitude,
+        polyline[i].longitude,
+        polyline[i + 1].latitude,
+        polyline[i + 1].longitude);
 
     int start = hint;
     double accBehind = 0.0;
@@ -25929,7 +25837,6 @@ class KinematicFilter {
       accBehind += segLen(start - 1);
       start--;
     }
-
     int end = hint;
     double accAhead = 0.0;
     while (end < maxSeg && accAhead < maxAheadMeters) {
@@ -25937,50 +25844,46 @@ class KinematicFilter {
       end++;
     }
 
+    double scoreOf(int i) {
+      final LatLng proj = _projectOnSegment(pos, polyline[i], polyline[i + 1]);
+      double d = Geolocator.distanceBetween(
+          pos.latitude, pos.longitude, proj.latitude, proj.longitude);
+      if (useHeading) {
+        final double segBearing = Geolocator.bearingBetween(
+            polyline[i].latitude,
+            polyline[i].longitude,
+            polyline[i + 1].latitude,
+            polyline[i + 1].longitude);
+        double angleDiff = (segBearing - heading)
+            .abs(); // heading non-null garanti par useHeading
+        if (angleDiff > 180.0) angleDiff = 360.0 - angleDiff;
+        if (angleDiff > 100.0) {
+          d += 80.0;
+        } else if (angleDiff > 60.0) {
+          d += 25.0;
+        }
+      }
+      return d;
+    }
+
     int bestIndex = start;
     double minScore = double.infinity;
-
     for (int i = start; i <= end; i++) {
-      if (i < 0 || i > maxSeg) continue;
-
-      final LatLng proj = _projectOnSegment(
-        pos,
-        polyline[i],
-        polyline[i + 1],
-      );
-
-      final double d = Geolocator.distanceBetween(
-        pos.latitude,
-        pos.longitude,
-        proj.latitude,
-        proj.longitude,
-      );
-
-      final double segBearing = Geolocator.bearingBetween(
-        polyline[i].latitude,
-        polyline[i].longitude,
-        polyline[i + 1].latitude,
-        polyline[i + 1].longitude,
-      );
-
-      double angleDiff = (segBearing - heading).abs();
-      if (angleDiff > 180.0) angleDiff = 360.0 - angleDiff;
-
-      double penalty = 0.0;
-      if (angleDiff > 100.0) {
-        penalty = 80.0;
-      } else if (angleDiff > 60.0) {
-        penalty = 25.0;
-      }
-
-      final double score = d + penalty;
-
-      if (score < minScore) {
-        minScore = score;
+      final double s = scoreOf(i);
+      if (s < minScore) {
+        minScore = s;
         bestIndex = i;
       }
     }
 
+    // 🔧 HYSTÉRÉSIS : on ne quitte le segment courant que si un autre est
+    // nettement meilleur → plus de flip-flop au virage.
+    if (hysteresisMeters > 0.0 && bestIndex != hint) {
+      final double hintScore = scoreOf(hint);
+      if (hintScore - minScore < hysteresisMeters) {
+        bestIndex = hint;
+      }
+    }
     return bestIndex;
   }
 
@@ -26110,6 +26013,13 @@ class KinematicFilter {
       polyline[idx],
       polyline[idx + 1],
     );
+    // 🔧 ANTI-TÉLÉPORT : projection clampée au coin du virage = saut de >8 m.
+    // Dans ce cas on avance depuis la position brute, sans re-projeter.
+    final double projJump = Geolocator.distanceBetween(
+        startPos.latitude, startPos.longitude, proj.latitude, proj.longitude);
+    if (projJump > 8.0) {
+      proj = startPos;
+    }
 
     double remainingDistance = distanceMeters;
     LatLng currentPos = proj;
@@ -26154,6 +26064,13 @@ class KinematicFilter {
       polyline[idx],
       polyline[idx + 1],
     );
+    // 🔧 ANTI-TÉLÉPORT : projection clampée au coin du virage = saut de >8 m.
+    // Dans ce cas on avance depuis la position brute, sans re-projeter.
+    final double projJump = Geolocator.distanceBetween(
+        startPos.latitude, startPos.longitude, proj.latitude, proj.longitude);
+    if (projJump > 8.0) {
+      proj = startPos;
+    }
 
     double remainingDistance = distanceMeters;
     LatLng currentPos = proj;
@@ -26231,10 +26148,6 @@ class KinematicFilter {
     _targetPos = null;
     _snappedGpsPos = null;
 
-    // 🔧 AJOUT : reset de la référence persistante utilisée par la
-    // correction 60fps
-    _lastReferencePos = null;
-    _lastReferenceIndex = -1;
     _lastIsStopped = false;
 
     _lastPredictTime = null;
@@ -26270,5 +26183,12 @@ class KinematicFilter {
     _measuredIntervalSeconds = 1.0;
     _targetRouteIndex = -1;
     _targetUpdatedAt = null;
+
+    // NOUVEAU : reset du mouvement flèche → bleu
+    _arrowAnchorPos = null;
+    _arrowAnchorIndex = -1;
+    _blueTravelDistance = 0.0;
+    _blueTravelTime = 1.0;
+    _arrowTargetSpeed = 0.0;
   }
 }
