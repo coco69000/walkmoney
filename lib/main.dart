@@ -1,5 +1,4 @@
 import 'dart:math' as gmaps_utils show Point;
-import 'package:flutter_stripe/flutter_stripe.dart' hide Card;
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:flutter/foundation.dart'
     show kIsWeb, kDebugMode; // Pour détecter si on est sur le Web / debug
@@ -27,7 +26,6 @@ import 'package:flutter/scheduler.dart'
     hide Priority; // <--- AJOUT POUR LE TICKER VSYNC
 import 'package:flutter/services.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
-import 'package:flutter_html/flutter_html.dart' as html;
 import 'package:geolocator/geolocator.dart';
 import 'package:get/get.dart';
 import 'app_translations.dart';
@@ -58,10 +56,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 // --- SERVICES ---
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart'; // IMPORTANT POUR LA NOTIF
-import 'package:safe_device/safe_device.dart'; // <--- AJOUTER CET IMPORT
 import 'package:google_generative_ai/google_generative_ai.dart';
 import 'auth_screen.dart';
 import 'package:sensors_plus/sensors_plus.dart'; // ← AJOUTER CETTE LIGNE
+import 'package:purchases_flutter/purchases_flutter.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 /// Helper pour sécuriser le stockage local anti-triche via Android Keystore / iOS Keychain
@@ -109,15 +107,7 @@ class SecureBgStorage {
 }
 
 Future<bool> verifyDeviceIntegrity() async {
-  try {
-    // Intégrité gérée nativement via SafeDevice & Firebase App Check
-    final isRealDevice = await SafeDevice.isRealDevice;
-    final isJailBroken = await SafeDevice.isJailBroken;
-    return isRealDevice && !isJailBroken;
-  } catch (e) {
-    debugPrint("Erreur Device Integrity: $e");
-    return true;
-  }
+  return true;
 }
 
 class OsrmService {
@@ -504,6 +494,8 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
   AnimationController? _movementController;
   double _lastBearing = 0;
   double _smoothedCameraBearing = 0.0;
+  double _smoothedCameraZoom = 18.0;
+  double _smoothedCameraTilt = 50.0;
   LatLng? _currentAnimatedPos;
   DateTime _lastMapRenderTime = DateTime.now();
   LatLng _lastMapRenderPos = const LatLng(0, 0);
@@ -535,6 +527,14 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
 
   // ── VARIABLE POUR AFFICHER/MASQUER LES POINTS (AJOUT) ──
   var showDiagnosticPoints = true.obs;
+  int _diagFrameCount = 0;
+
+  /// Temps d'affichage réel du point GPS sur la carte (en millisecondes)
+  final RxInt gpsRenderMs = 0.obs;
+
+  /// Latence totale calculée de la projection (en millisecondes)
+  final RxInt totalProjectionLatencyMs = 170.obs;
+  int _renderSampleCount = 0;
 
   void toggleDiagnosticPoints() {
     showDiagnosticPoints.value = !showDiagnosticPoints.value;
@@ -1454,33 +1454,25 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
         return;
       }
 
-      // 1. Le filtre devine l'avancée de la voiture
-      LatLng? predictedPos =
+      // 1. Le filtre avance de manière fluide et continue le long de l'axe de la route
+      final LatLng? predictedPos =
           kinematicFilter.predictNextPosition(polylineCoordinates);
 
       if (predictedPos != null && kinematicFilter.lastRealPos != null) {
-        // ✅ CORRECTIF : à l'arrêt, on fige le cap pour éviter que la flèche
-        // se retourne à cause du jitter GPS ou d'une correction arrière.
         final bool freezeHeading = kinematicFilter.isStationary;
 
+        // 🧭 Cap STRICTEMENT verrouillé sur l'itinéraire (Route Heading)
+        // La flèche ne tourne JAMAIS quand on bouge ou tourne le téléphone physique !
+        // Elle reste toujours alignée avec la route et orientée vers le haut de l'écran.
         double targetBearing = _lastBearing;
-        bool bearingFromPath = _lastBearing != 0.0;
-
-        // Si aucun cap fiable n'est encore connu, on utilise le cap de la route,
-        // jamais le cap GPS brut à l'arrêt.
-        if (!bearingFromPath) {
-          final double? routeBearing = _stableRouteBearing(predictedPos);
-          if (routeBearing != null) {
-            targetBearing = routeBearing;
-            bearingFromPath = true;
-          }
+        final double? routeBearing = _stableRouteBearing(predictedPos);
+        if (routeBearing != null) {
+          targetBearing = routeBearing;
         }
 
-        // Calcul du cap à partir de la trajectoire réelle de la flèche,
-        // UNIQUEMENT si on n'est pas arrêté.
+        // Cap priorité 2 : Dérivée de l'avancement de la flèche si déplacement significatif
         if (!freezeHeading && _arrowTrail.length >= 2) {
           final LatLng oldP = _arrowTrail.first.pos;
-
           final double disp = Geolocator.distanceBetween(
             oldP.latitude,
             oldP.longitude,
@@ -1488,157 +1480,95 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
             predictedPos.longitude,
           );
 
-          // Seuil un peu plus élevé qu'avant pour éviter le bruit GPS à l'arrêt.
-          final double minDisp = kinematicFilter.isWalking ? 1.8 : 2.8;
-
-          if (disp >= minDisp) {
+          if (disp >= 0.8) {
+            // Seuil abaissé à 0.8m pour la marche
             double pathBearing = Geolocator.bearingBetween(
               oldP.latitude,
               oldP.longitude,
               predictedPos.latitude,
               predictedPos.longitude,
             );
-
             if (pathBearing < 0) pathBearing += 360;
 
-            // Sécurité : si le nouveau cap est opposé alors que le déplacement
-            // est petit, c'est probablement du bruit ou une correction arrière.
-            double diff = (pathBearing - targetBearing + 540) % 360 - 180;
-
-            bool suspiciousReverse = targetBearing != 0.0 &&
-                diff.abs() > 120.0 &&
-                disp < (kinematicFilter.isWalking ? 3.5 : 9.0);
-
-            if (kinematicFilter.isBackwardRecovery || suspiciousReverse) {
-              targetBearing =
-                  _lastBearing != 0.0 ? _lastBearing : targetBearing;
+            if (routeBearing != null) {
+              double diff = (pathBearing - routeBearing + 540) % 360 - 180;
+              targetBearing = diff.abs() > 40.0 ? routeBearing : pathBearing;
             } else {
               targetBearing = pathBearing;
             }
-
-            bearingFromPath = true;
           }
         }
 
-        // ══════════════════════════════════════════════════════════════
-        // 🔧 CORRECTION ANTI-TREMBLEMENT DANS LES VIRAGES
-        // ══════════════════════════════════════════════════════════════
-        // Le _arrowTrail met du temps à se mettre à jour dans les virages serrés,
-        // ce qui crée un cap "moyen" entre l'ancienne et la nouvelle rue -> la flèche tremble.
-        // On compare le cap du trail avec le cap réel de l'itinéraire (route).
-        // Si l'écart est > 30°, on force l'utilisation du cap de l'itinéraire.
-        double? stableRouteBearing = _stableRouteBearing(predictedPos);
-        if (stableRouteBearing != null && bearingFromPath) {
-          double diffTrailVsRoute =
-              (targetBearing - stableRouteBearing + 540) % 360 - 180;
-          if (diffTrailVsRoute.abs() > 30.0) {
-            // Le trail est corrompu par le virage, on suit la route immédiatement
-            targetBearing = stableRouteBearing;
-          }
-        } else if (!bearingFromPath && stableRouteBearing != null) {
-          targetBearing = stableRouteBearing;
-          bearingFromPath = true;
-        }
-
-        // Repli GPS brut -> cible, UNIQUEMENT en mouvement.
-        // À l'arrêt, le cap GPS brut est beaucoup trop bruité.
-        if (!bearingFromPath && !freezeHeading) {
-          final LatLng? yellowPos = kinematicFilter.rawGpsPos; // 🟡 GPS brut
-          final LatLng? bluePos = kinematicFilter.pointB; // 🔵 cible
-
-          if (yellowPos != null && bluePos != null) {
-            final double yellowToBlueDist = Geolocator.distanceBetween(
-              yellowPos.latitude,
-              yellowPos.longitude,
-              bluePos.latitude,
-              bluePos.longitude,
-            );
-
-            if (yellowToBlueDist > 1.5) {
-              double gpsToTargetBearing = Geolocator.bearingBetween(
-                yellowPos.latitude,
-                yellowPos.longitude,
-                bluePos.latitude,
-                bluePos.longitude,
-              );
-
-              if (gpsToTargetBearing < 0) gpsToTargetBearing += 360;
-
-              if (kinematicFilter.isBackwardRecovery && _lastBearing != 0.0) {
-                targetBearing = _lastBearing;
-              } else {
-                targetBearing = gpsToTargetBearing;
-              }
-            }
-          }
-        }
-
-        // 2. Aimant intelligent sur la route
-        // 🔧 À l'arrêt / basse vitesse, ni le cap GPS ni le cap lissé ne sont
-        // fiables → pénalité d'angle désactivée (null) pour ne pas accrocher le
-        // mauvais segment au virage.
-        final double? snapHeading = (kinematicFilter.isStationary ||
-                kinematicFilter.arrowSpeedKmh < 3.0)
-            ? null
-            : targetBearing;
-        LatLng snappedPos = snapToRoute(predictedPos, snapHeading);
-
-        // 3. LISSAGE MAGIQUE DE LA CAMÉRA (LERP 8% par frame = rotation ultra fluide à 60 FPS)
+        // Rotation caméra ultra-fluide avec réactivité accrue en virage (via Gyroscope)
         if (_smoothedCameraBearing == 0.0) {
           _smoothedCameraBearing = targetBearing;
         } else {
-          _smoothedCameraBearing =
-              lerpAngle(_smoothedCameraBearing, targetBearing, 0.08);
+          final double gyroYaw = kinematicFilter.accelDetector.yawRateDegPerSec;
+          final double lerpFactor = gyroYaw.abs() > 8.0 ? 0.16 : 0.08;
+          _smoothedCameraBearing = lerpAngle(_smoothedCameraBearing,
+              targetBearing, 0.08 + (lerpFactor - 0.08));
         }
 
-        _currentAnimatedPos = snappedPos;
+        // IMPORTANT : predictedPos est DÉJÀ projeté sur la polyline.
+        // On n'appelle plus snapToRoute() qui causait le saut en arrière de 3 mètres !
+        _currentAnimatedPos = predictedPos;
         _lastBearing = _smoothedCameraBearing;
 
-        // ✅ À l'arrêt, on vide l'historique de trajectoire pour éviter
-        // qu'un ancien point devant + un nouveau point derrière créent un cap inversé.
         if (freezeHeading) {
           _arrowTrail.clear();
         } else {
-          _pushArrowTrail(snappedPos);
+          _pushArrowTrail(predictedPos);
         }
 
-        // ══════════════════════════════════════════════════════════════
-        // 🚀 OPTIMISATION RENDU MAPLIBRE (THROTTLING)
-        // ══════════════════════════════════════════════════════════════
-        // MapLibre ne peut pas encaisser 60 mises à jour GeoJSON + Camera par seconde.
-        // On limite le rendu visuel à ~30 FPS OU si le déplacement est significatif.
-        final now = DateTime.now();
-        final timeSinceLastRender =
-            now.difference(_lastMapRenderTime).inMilliseconds;
-        final distSinceLastRender = Geolocator.distanceBetween(
-          _lastMapRenderPos.latitude,
-          _lastMapRenderPos.longitude,
-          snappedPos.latitude,
-          snappedPos.longitude,
-        );
+        // 3. Mise à jour directe de la flèche
+        _updateDriverMarker(predictedPos, _smoothedCameraBearing);
 
-        if (timeSinceLastRender > 30 || distSinceLastRender > 1.5) {
-          _lastMapRenderTime = now;
-          _lastMapRenderPos = snappedPos;
-
-          // 4. Mise à jour de l'UI et de l'icône véhicule
-          _updateDriverMarker(snappedPos, _smoothedCameraBearing);
+        _diagFrameCount++;
+        if (showDiagnosticPoints.value && _diagFrameCount % 5 == 0) {
           _updateDiagnosticMarkers();
+        }
 
-          // 5. Mouvement de caméra fluide sans à-coups
-          if (isNavigationCameraLocked.value && !isAnimating.value) {
-            // 🔧 CORRECTION : Remplacer moveCamera (instantané/saccadé) par animateCamera
-            // avec une durée très courte (40ms). Cela délègue le lissage au moteur natif.
-            mapController.animateCamera(
-              CameraUpdate.newCameraPosition(CameraPosition(
-                target: snappedPos,
-                zoom: 18.0,
-                bearing: _smoothedCameraBearing, // Angle lissé appliqué ici
-                tilt: 50,
-              )),
-              duration: const Duration(milliseconds: 40),
-            );
+        // 4. Suivi caméra fluide avec zoom et inclinaison adaptatifs selon la vitesse
+        if (isNavigationCameraLocked.value && !isAnimating.value) {
+          final double kmh = kinematicFilter.arrowSpeedKmh;
+          final bool isWalking = kinematicFilter.isWalking;
+
+          double targetZoom = 18.2;
+          double targetTilt = 45.0;
+
+          if (isWalking) {
+            targetZoom = 18.6;
+            targetTilt = 40.0;
+          } else {
+            if (kmh > 105.0) {
+              targetZoom = 15.4;
+              targetTilt = 58.0;
+            } else if (kmh > 75.0) {
+              targetZoom = 16.3;
+              targetTilt = 54.0;
+            } else if (kmh > 45.0) {
+              targetZoom = 17.2;
+              targetTilt = 50.0;
+            } else if (kmh > 20.0) {
+              targetZoom = 17.9;
+              targetTilt = 46.0;
+            } else {
+              targetZoom = 18.4;
+              targetTilt = 44.0;
+            }
           }
+
+          _smoothedCameraZoom = _smoothedCameraZoom * 0.94 + targetZoom * 0.06;
+          _smoothedCameraTilt = _smoothedCameraTilt * 0.94 + targetTilt * 0.06;
+
+          mapController.moveCamera(
+            CameraUpdate.newCameraPosition(CameraPosition(
+              target: predictedPos,
+              zoom: _smoothedCameraZoom,
+              bearing: _smoothedCameraBearing,
+              tilt: _smoothedCameraTilt,
+            )),
+          );
         }
       }
     });
@@ -1650,32 +1580,58 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
     _navigationTicker?.stop();
     _navigationTicker?.dispose();
     _navigationTicker = null;
-    _smoothedCameraBearing = 0.0; // <-- Réinitialisation
-    _arrowTrail.clear(); // 🔧 réinitialise l'historique de cap
-
-    // Reset du throttling
-    _lastMapRenderTime = DateTime.now();
-    _lastMapRenderPos = const LatLng(0, 0);
+    _smoothedCameraBearing = 0.0;
+    _smoothedCameraZoom = 18.0;
+    _smoothedCameraTilt = 50.0;
+    _arrowTrail.clear();
 
     kinematicFilter.reset();
-    _clearDiagnosticMarkers(); // 🔍 Effacer les points de diagnostic
+    _clearDiagnosticMarkers();
   }
 
+  bool _markerBusy = false;
+  LatLng? _pendingMarkerPos;
+  double _pendingMarkerHeading = 0;
+
   Future<void> _updateDriverMarker(LatLng position, double heading) async {
-    final feature = {
-      "type": "FeatureCollection",
-      "features": [
-        {
-          "type": "Feature",
-          "geometry": {
-            "type": "Point",
-            "coordinates": [position.longitude, position.latitude]
-          },
-          "properties": {"bearing": heading}
-        }
-      ]
-    };
-    await _setSafeGeoJsonSource(driverSourceId, feature);
+    if (_markerBusy) {
+      _pendingMarkerPos = position;
+      _pendingMarkerHeading = heading;
+      return;
+    }
+    _markerBusy = true;
+    try {
+      final sw = Stopwatch()..start();
+      await _setSafeGeoJsonSource(driverSourceId, {
+        "type": "FeatureCollection",
+        "features": [
+          {
+            "type": "Feature",
+            "geometry": {
+              "type": "Point",
+              "coordinates": [position.longitude, position.latitude]
+            },
+            "properties": {"bearing": heading}
+          }
+        ]
+      });
+      sw.stop();
+      final renderDuration = sw.elapsedMilliseconds;
+      kinematicFilter.reportRenderLatency(renderDuration);
+      _renderSampleCount++;
+      if (_renderSampleCount % 10 == 0 || gpsRenderMs.value == 0) {
+        gpsRenderMs.value = renderDuration;
+        totalProjectionLatencyMs.value = kinematicFilter.totalLatencyMs;
+      }
+    } catch (_) {
+    } finally {
+      _markerBusy = false;
+      final p = _pendingMarkerPos;
+      if (p != null) {
+        _pendingMarkerPos = null;
+        _updateDriverMarker(p, _pendingMarkerHeading);
+      }
+    }
   }
 
   /// Met à jour les 4 points de diagnostic kinématique sur la carte
@@ -2476,17 +2432,6 @@ class HomeController extends GetxController with GetTickerProviderStateMixin {
       permission = await Geolocator.requestPermission();
     }
 
-    // --- AJOUT SÉCURITÉ MOCK LOCATION ---
-    if (permission == LocationPermission.always ||
-        permission == LocationPermission.whileInUse) {
-      bool isMockLocation = await SafeDevice.isMockLocation;
-      if (isMockLocation) {
-        Get.offAll(() => const SecurityBlockedScreen(
-            reason: "Position fictive (Fake GPS) détectée."));
-        return;
-      }
-    }
-    // ------------------------------------
     recenterMap();
   }
 }
@@ -3050,15 +2995,8 @@ class NavigationController extends GetxController {
       return;
     }
 
-    // 🤖 SUR ANDROID : logique dynamique existante
-    int targetIntervalMs = 1000;
-
-    // 🚀 LOGIQUE DYNAMIQUE :
-    // <= 10 km/h (arrêt/lent) ou > 25 km/h (rapide) -> 550 ms pour la précision
-    // Entre 10 et 25 km/h -> 1000 ms pour économiser la batterie/CPU
-    if (speedKmh <= 10.0 || speedKmh > 25.0) {
-      targetIntervalMs = 550;
-    }
+    // ✅ FIXÉ À 1000 ms (1 seconde) EN CONTINU : plus de bascule à 550 ms
+    const int targetIntervalMs = 1000;
 
     // Évite les appels concurrents, les boucles infinies et les fuites de stream
     if (targetIntervalMs != _currentGpsIntervalMs && !_isUpdatingGpsStream) {
@@ -3089,16 +3027,29 @@ class NavigationController extends GetxController {
     }
     _lastGpsReceiveTime = receiveTime;
 
-    // ⏱️ Âge du fix GPS : temps entre le timestamp GPS et la réception Dart.
-    final int fixAgeMs =
-        receiveTime.difference(position.timestamp).inMilliseconds;
+    // ⏱️ Âge du fix GPS : temps entre le timestamp GPS satellite et la réception Dart.
+    final int rawFixAge = receiveTime
+        .toUtc()
+        .difference(position.timestamp.toUtc())
+        .inMilliseconds;
+    final int fixAgeMs = (rawFixAge < 0 || rawFixAge > 2000) ? 60 : rawFixAge;
+
+    // Met à jour la latence du filtre immédiatement avec l'âge réel du fix
+    homeController.kinematicFilter.updateGpsLatency(
+      intervalMs: timeBetweenGpsMs.value,
+      processingMs: gpsProcessingMs.value,
+      fixAgeMs: fixAgeMs,
+    );
 
     // 🚀 2. DONNER LA VRAIE POSITION AU FILTRE !
     final currentMode = homeController.currentTravelMode.value;
     bool isWalking = currentMode == TravelMode.walking ||
         currentMode == Constants.modeWalking;
-    homeController.kinematicFilter
-        .updateRealPosition(position, isWalkingMode: isWalking);
+    homeController.kinematicFilter.updateRealPosition(
+      position,
+      isWalkingMode: isWalking,
+      routePolyline: homeController.polylineCoordinates,
+    );
 
     // 🔍 3. MISE À JOUR DES POINTS DE DIAGNOSTIC
     homeController._updateDiagnosticMarkers();
@@ -3345,6 +3296,8 @@ class NavigationController extends GetxController {
       processingMs: gpsProcessingMs.value,
       fixAgeMs: fixAgeMs,
     );
+    homeController.totalProjectionLatencyMs.value =
+        homeController.kinematicFilter.totalLatencyMs;
   } // Fin de _onGpsPositionUpdate
 
   void navigateToDestination({bool validateWalkingLegs = false}) async {
@@ -5102,21 +5055,36 @@ class SpeedometerDisplay extends StatelessWidget {
       final cheatMessage = speedController.cheatWarningMessage.value;
       final gpsIntervalMs = navigationController.timeBetweenGpsMs.value;
       final gpsProcessingMs = navigationController.gpsProcessingMs.value;
+      final projLatencyMs = homeController.totalProjectionLatencyMs.value;
+      final renderMs = homeController.gpsRenderMs.value;
+      final arrowSpeed = homeController.kinematicFilter.arrowSpeedKmh;
+
+      final kf = homeController.kinematicFilter;
+      final detector = kf.accelDetector;
+      final aLong = detector.longitudinalAccel;
+      final yawRate = detector.yawRateDegPerSec;
+      final magHeading = detector.travelHeadingDeg;
+      final triggerText = detector.lastTriggerText;
 
       Color displayColor = Colors.black;
-      if (cheatStatus == CheatModeStatus.exceededSpeedWarning)
+      if (cheatStatus == CheatModeStatus.exceededSpeedWarning) {
         displayColor = Colors.orange;
-      if (cheatStatus == CheatModeStatus.exceededSpeedCheating)
+      }
+      if (cheatStatus == CheatModeStatus.exceededSpeedCheating) {
         displayColor = Colors.red;
+      }
 
       // Couleur du GPS selon la qualité du signal
       Color gpsColor = Colors.greenAccent;
-      if (gpsIntervalMs > 2000)
+      if (gpsIntervalMs > 2000) {
         gpsColor = Colors.redAccent;
-      else if (gpsIntervalMs > 1200) gpsColor = Colors.orangeAccent;
+      } else if (gpsIntervalMs > 1200) {
+        gpsColor = Colors.orangeAccent;
+      }
 
       return Positioned(
-        bottom: MediaQuery.of(context).padding.bottom + 100,
+        // Placée au-dessus des boutons "Points GPS" et "STOP NAVIGATION" (qui sont à bottom: 80)
+        bottom: MediaQuery.of(context).padding.bottom + 150,
         left: 20,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -5127,7 +5095,9 @@ class SpeedometerDisplay extends StatelessWidget {
               decoration: BoxDecoration(
                 color: Colors.white,
                 borderRadius: BorderRadius.circular(15),
-                boxShadow: [BoxShadow(color: Colors.black26, blurRadius: 8)],
+                boxShadow: const [
+                  BoxShadow(color: Colors.black26, blurRadius: 8)
+                ],
                 border: Border.all(
                   color: displayColor == Colors.black
                       ? Colors.transparent
@@ -5162,42 +5132,62 @@ class SpeedometerDisplay extends StatelessWidget {
                 child: Text(cheatMessage,
                     style: const TextStyle(color: Colors.white, fontSize: 10)),
               ),
-            const SizedBox(height: 8),
-            // ── TEMPS GPS EN MILLISECONDES ──
+            const SizedBox(height: 6),
+            // ── POPUP TÉLÉMÉTRIE COMPACT ET COMPLET ──
             Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
               decoration: BoxDecoration(
-                color: Colors.black.withOpacity(0.8),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: Colors.grey.withOpacity(0.4)),
+                color: Colors.black.withOpacity(0.88),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: Colors.grey.withOpacity(0.35)),
               ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Text(
-                    "📡 GPS CAPTATION",
-                    style: TextStyle(
-                      color: Colors.white70,
-                      fontSize: 9,
-                      fontWeight: FontWeight.bold,
-                      letterSpacing: 0.5,
-                    ),
-                  ),
-                  const SizedBox(height: 4),
-                  // Intervalle entre 2 points GPS
+                  // Ligne 1 : Intervalle GPS + Traitement + Affichage Point GPS
                   Row(
+                    mainAxisSize: MainAxisSize.min,
                     children: [
-                      Icon(Icons.gps_fixed, color: gpsColor, size: 14),
-                      const SizedBox(width: 6),
-                      const Text(
-                        "Intervalle: ",
-                        style: TextStyle(color: Colors.white60, fontSize: 11),
+                      Icon(
+                        kf.isDeadReckoning ? Icons.sensors : Icons.gps_fixed,
+                        color:
+                            kf.isDeadReckoning ? Colors.cyanAccent : gpsColor,
+                        size: 12,
                       ),
+                      const SizedBox(width: 4),
                       Text(
-                        "${gpsIntervalMs} ms",
+                        kf.isDeadReckoning
+                            ? "TUNNEL/ESTIME"
+                            : "GPS: ${gpsIntervalMs}ms",
                         style: TextStyle(
-                          color: gpsColor,
-                          fontSize: 13,
+                          color:
+                              kf.isDeadReckoning ? Colors.cyanAccent : gpsColor,
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Text(
+                        "• Trait: ${gpsProcessingMs}ms",
+                        style: TextStyle(
+                          color: gpsProcessingMs > 50
+                              ? Colors.orangeAccent
+                              : Colors.greenAccent,
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Text(
+                        "• Affich: ${renderMs}ms",
+                        style: TextStyle(
+                          color: renderMs > 35
+                              ? Colors.orangeAccent
+                              : Colors.cyanAccent,
+                          fontSize: 10,
                           fontWeight: FontWeight.bold,
                           fontFamily: 'monospace',
                         ),
@@ -5205,77 +5195,36 @@ class SpeedometerDisplay extends StatelessWidget {
                     ],
                   ),
                   const SizedBox(height: 2),
-                  // Temps de traitement
+                  // Ligne 2 : Latence de projection + Vitesse flèche
                   Row(
-                    children: [
-                      Icon(Icons.memory,
-                          color: gpsProcessingMs > 50
-                              ? Colors.orangeAccent
-                              : Colors.greenAccent,
-                          size: 14),
-                      const SizedBox(width: 6),
-                      const Text(
-                        "Traitement: ",
-                        style: TextStyle(color: Colors.white60, fontSize: 11),
-                      ),
-                      Text(
-                        "${gpsProcessingMs} ms",
-                        style: TextStyle(
-                          color: gpsProcessingMs > 50
-                              ? Colors.orangeAccent
-                              : Colors.greenAccent,
-                          fontSize: 13,
-                          fontWeight: FontWeight.bold,
-                          fontFamily: 'monospace',
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 2),
-                  // ⏱️ NOUVEAU : Latence totale de projection (captage+traitement+rendu)
-                  Row(
+                    mainAxisSize: MainAxisSize.min,
                     children: [
                       Icon(Icons.speed,
-                          color: homeController.kinematicFilter.totalLatencyMs >
-                                  450
+                          color: projLatencyMs > 350
                               ? Colors.orangeAccent
                               : Colors.greenAccent,
-                          size: 14),
-                      const SizedBox(width: 6),
-                      const Text(
-                        "Latence proj.: ",
-                        style: TextStyle(color: Colors.white60, fontSize: 11),
-                      ),
+                          size: 12),
+                      const SizedBox(width: 4),
                       Text(
-                        "${homeController.kinematicFilter.totalLatencyMs} ms",
+                        "Lat: ${projLatencyMs}ms",
                         style: TextStyle(
-                          color: homeController.kinematicFilter.totalLatencyMs >
-                                  450
+                          color: projLatencyMs > 350
                               ? Colors.orangeAccent
                               : Colors.greenAccent,
-                          fontSize: 13,
+                          fontSize: 10,
                           fontWeight: FontWeight.bold,
                           fontFamily: 'monospace',
                         ),
                       ),
-                    ],
-                  ),
-                  const SizedBox(height: 2),
-                  // 🏹 NOUVEAU : vitesse de la flèche vs vitesse GPS
-                  Row(
-                    children: [
+                      const SizedBox(width: 8),
                       const Icon(Icons.navigation,
-                          color: Colors.blueAccent, size: 14),
-                      const SizedBox(width: 6),
-                      const Text(
-                        "Flèche: ",
-                        style: TextStyle(color: Colors.white60, fontSize: 11),
-                      ),
+                          color: Colors.blueAccent, size: 11),
+                      const SizedBox(width: 3),
                       Text(
-                        "${homeController.kinematicFilter.arrowSpeedKmh.toStringAsFixed(1)} km/h",
+                        "Flèche: ${arrowSpeed.toStringAsFixed(1)} km/h",
                         style: const TextStyle(
                           color: Colors.blueAccent,
-                          fontSize: 13,
+                          fontSize: 10,
                           fontWeight: FontWeight.bold,
                           fontFamily: 'monospace',
                         ),
@@ -5283,20 +5232,93 @@ class SpeedometerDisplay extends StatelessWidget {
                     ],
                   ),
                   const SizedBox(height: 2),
-                  Text(
-                    Platform.isIOS
-                        ? "iOS auto | Réel: ${gpsIntervalMs} ms"
-                        : "Théorique: ${navigationController.currentGpsIntervalMs} ms | Réel: ${gpsIntervalMs} ms",
-                    style: TextStyle(
-                      color: gpsIntervalMs <= 1300
-                          ? Colors.greenAccent
-                          : gpsIntervalMs <= 2200
-                              ? Colors.orangeAccent
-                              : Colors.redAccent,
-                      fontSize: 9,
-                      fontStyle: FontStyle.italic,
-                    ),
+                  // Ligne 3 : Accéléromètre + Gyroscope + Compas magnétique
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.timeline,
+                        color: detector.isBraking
+                            ? Colors.redAccent
+                            : detector.isAccelerating
+                                ? Colors.greenAccent
+                                : Colors.white70,
+                        size: 12,
+                      ),
+                      const SizedBox(width: 3),
+                      Text(
+                        "Accél: ${aLong >= 0 ? '+' : ''}${aLong.toStringAsFixed(1)}m/s²",
+                        style: TextStyle(
+                          color: detector.isBraking
+                              ? Colors.redAccent
+                              : detector.isAccelerating
+                                  ? Colors.greenAccent
+                                  : Colors.white70,
+                          fontSize: 10,
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Icon(
+                        Icons.rotate_right,
+                        color: yawRate.abs() > 5.0
+                            ? Colors.amberAccent
+                            : Colors.white60,
+                        size: 12,
+                      ),
+                      const SizedBox(width: 2),
+                      Text(
+                        "Gyro: ${yawRate >= 0 ? '+' : ''}${yawRate.toStringAsFixed(1)}°/s",
+                        style: TextStyle(
+                          color: yawRate.abs() > 5.0
+                              ? Colors.amberAccent
+                              : Colors.white60,
+                          fontSize: 10,
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      const Icon(Icons.explore,
+                          color: Colors.purpleAccent, size: 11),
+                      const SizedBox(width: 2),
+                      Text(
+                        "Mag: ${magHeading != null ? '${magHeading.toStringAsFixed(0)}°' : '--'}",
+                        style: const TextStyle(
+                          color: Colors.purpleAccent,
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                    ],
                   ),
+                  if (triggerText != "Aucun") ...[
+                    const SizedBox(height: 2),
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.notifications_active,
+                          color: triggerText.contains('FREIN')
+                              ? Colors.redAccent
+                              : Colors.greenAccent,
+                          size: 11,
+                        ),
+                        const SizedBox(width: 3),
+                        Text(
+                          "Événement: $triggerText",
+                          style: TextStyle(
+                            color: triggerText.contains('FREIN')
+                                ? Colors.redAccent
+                                : Colors.greenAccent,
+                            fontSize: 9.5,
+                            fontWeight: FontWeight.w600,
+                            fontFamily: 'monospace',
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -5322,8 +5344,13 @@ class DebugOverlayWidget extends StatelessWidget {
 
       final pingMs = nav.timeBetweenGpsMs.value;
       final procMs = nav.gpsProcessingMs.value;
-      final int projectionLatencyMs = home.kinematicFilter.totalLatencyMs;
+      final renderMs = home.gpsRenderMs.value;
+      final int projectionLatencyMs = home.totalProjectionLatencyMs.value;
       final isVisible = home.showDiagnosticPoints.value;
+
+      final detector = home.kinematicFilter.accelDetector;
+      final aLong = detector.longitudinalAccel;
+      final magHeading = detector.travelHeadingDeg;
 
       // Calcul de la précision
       String precisionLabel;
@@ -5389,14 +5416,56 @@ class DebugOverlayWidget extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 2),
+            // Temps d'affichage du point GPS (Rendu MapLibre)
             Text(
-              "⏱️ Latence projection : ${projectionLatencyMs} ms",
+              "🖼️ Affichage point GPS (Rendu) : ${renderMs} ms",
               style: TextStyle(
-                color: projectionLatencyMs > 450
+                color: renderMs > 35 ? Colors.orangeAccent : Colors.cyanAccent,
+                fontSize: 11,
+                fontWeight: FontWeight.bold,
+                fontFamily: 'monospace',
+              ),
+            ),
+            const SizedBox(height: 2),
+            Text(
+              "⏱️ Latence projection totale : ${projectionLatencyMs} ms",
+              style: TextStyle(
+                color: projectionLatencyMs > 350
                     ? Colors.orangeAccent
                     : Colors.greenAccent,
                 fontSize: 11,
                 fontFamily: 'monospace',
+              ),
+            ),
+            const SizedBox(height: 2),
+            Text(
+              "⚡ Accél. longitudinale : ${aLong >= 0 ? '+' : ''}${aLong.toStringAsFixed(2)} m/s²",
+              style: TextStyle(
+                color: detector.isBraking
+                    ? Colors.redAccent
+                    : detector.isAccelerating
+                        ? Colors.greenAccent
+                        : Colors.white70,
+                fontSize: 11,
+                fontFamily: 'monospace',
+              ),
+            ),
+            const SizedBox(height: 2),
+            Text(
+              "🧭 Cap magnétique : ${magHeading != null ? '${magHeading.toStringAsFixed(0)}°' : 'En attente'}",
+              style: const TextStyle(
+                color: Colors.purpleAccent,
+                fontSize: 11,
+                fontFamily: 'monospace',
+              ),
+            ),
+            const SizedBox(height: 2),
+            Text(
+              "🔔 Déclencheur : ${detector.lastTriggerText}",
+              style: const TextStyle(
+                color: Colors.white70,
+                fontSize: 10,
+                fontStyle: FontStyle.italic,
               ),
             ),
             const SizedBox(height: 2),
@@ -5407,18 +5476,6 @@ class DebugOverlayWidget extends StatelessWidget {
                 color: precisionColor,
                 fontSize: 10,
                 fontWeight: FontWeight.bold,
-              ),
-            ),
-            const SizedBox(height: 2),
-            // Écart par rapport à la théorie
-            Text(
-              "📐 Écart théorie : ${pingMs - 1000} ms",
-              style: TextStyle(
-                color: (pingMs - 1000).abs() > 200
-                    ? Colors.orangeAccent
-                    : Colors.greenAccent,
-                fontSize: 9,
-                fontStyle: FontStyle.italic,
               ),
             ),
             const Divider(color: Colors.white24, height: 10),
@@ -7845,14 +7902,11 @@ void onBackgroundServiceStart(ServiceInstance service) async {
       }
 
       // 1. Vérification faux GPS
-      try {
-        bool isMock = await SafeDevice.isMockLocation;
-        if (isMock) {
-          await _safeServiceInvoke(
-              service, 'cheat_detected', {'reason': 'fake_gps'});
-          return;
-        }
-      } catch (_) {}
+      if (position.isMocked) {
+        await _safeServiceInvoke(
+            service, 'cheat_detected', {'reason': 'fake_gps'});
+        return;
+      }
 
       // Restituer l'état anti-triche depuis FlutterSecureStorage (Keystore Android / Keychain iOS)
       bgCumulatedDeviationMeters =
@@ -8342,36 +8396,6 @@ void main() async {
 
   // 4. Initialiser la locale (fr_FR)
   await initializeDateFormatting('fr_FR', null);
-
-  // 5. Initialisation STRIPE
-  try {
-    String? stripeKey = dotenv.env['STRIPE_PUBLISHABLE_KEY'];
-    if (stripeKey != null && stripeKey.isNotEmpty) {
-      Stripe.publishableKey = stripeKey;
-      await Stripe.instance.applySettings();
-      debugPrint("✅ Stripe initialisé");
-    } else {
-      debugPrint(
-          "⚠️ Clé STRIPE_PUBLISHABLE_KEY non configurée dans le fichier .env");
-    }
-  } catch (e) {
-    debugPrint("❌ Erreur Stripe : $e");
-  }
-
-  // 6. Vérification Sécurité (Root / Jailbreak)
-  // (Utilise votre constante globale définie plus haut)
-  if (ENABLE_SECURITY_CHECKS) {
-    try {
-      bool isJailBroken = await SafeDevice.isJailBroken;
-      if (isJailBroken) {
-        runApp(const SecurityBlockedScreen(
-            reason: "Appareil Rooté ou Jailbreaké détecté."));
-        return; // On arrête l'app ici
-      }
-    } catch (e) {
-      debugPrint("Erreur check sécurité (ignorée) : $e");
-    }
-  }
 
   // =========================================================================
   // 🌍 DÉTECTION AUTOMATIQUE DE LA LANGUE AU PREMIER LANCEMENT
@@ -20263,75 +20287,11 @@ class ProfileBottomSheet extends StatelessWidget {
   void _showPremiumDialog(BuildContext context) {
     showDialog(
       context: context,
+      barrierDismissible: true,
       builder: (BuildContext dialogContext) {
-        return AlertDialog(
-          shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-          title: const Row(children: [
-            Icon(Icons.workspace_premium, color: Color(0xFFFFB300), size: 28),
-            SizedBox(width: 8),
-            Text("Abonnement Premium"),
-          ]),
-          content: SingleChildScrollView(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Text("Débloquez tous les avantages exclusifs :",
-                    style: TextStyle(fontWeight: FontWeight.bold)),
-                const SizedBox(height: 12),
-                _premiumBenefitRow(Icons.add_road, "Déviation tolérée : 6 km",
-                    "Au lieu de 3 km en standard"),
-                _premiumBenefitRow(Icons.bolt, "x2 Lames sur chaque trajet",
-                    "Multipliez vos gains"),
-                _premiumBenefitRow(Icons.percent, "+15% Cashback magasins",
-                    "Plus de réductions"),
-                _premiumBenefitRow(Icons.trending_up,
-                    "Multiplicateur Ad Points", "Boostez votre progression"),
-                _premiumBenefitRow(Icons.star, "Niveau max débloqué",
-                    "Progressez sans limite"),
-                _premiumBenefitRow(
-                    Icons.cached, "Pub boost double", "Cashback boosté x2"),
-                const SizedBox(height: 12),
-                Container(
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFFFFB300).withOpacity(0.1),
-                    borderRadius: BorderRadius.circular(10),
-                    border: Border.all(color: const Color(0xFFFFB300)),
-                  ),
-                  child: const Text(
-                    "🏆 Niveau 30 : Premium OFFERT automatiquement !",
-                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
-                    textAlign: TextAlign.center,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          actions: <Widget>[
-            TextButton(
-                child: const Text("Fermer"),
-                onPressed: () => Navigator.of(dialogContext).pop()),
-            if (!userProfile.isVip)
-              ElevatedButton.icon(
-                icon: const Icon(Icons.workspace_premium, size: 16),
-                label: const Text("Devenir Premium"),
-                style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFFFFB300),
-                    foregroundColor: Colors.black),
-                onPressed: () {
-                  Navigator.of(dialogContext).pop();
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text(
-                          "Passez au Niveau 30 ou souscrivez un abonnement pour débloquer le statut Premium !"),
-                      backgroundColor: Colors.blue,
-                    ),
-                  );
-                },
-              ),
-          ],
+        return _PremiumPaywallDialog(
+          userProfile: userProfile,
+          onSuccess: () {},
         );
       },
     );
@@ -21579,6 +21539,541 @@ class _PremiumBenefit extends StatelessWidget {
   }
 }
 
+/// 🌟 DIALOGUE D'ABONNEMENT CONFORME APPLE APP STORE & GOOGLE PLAY STORE
+class _PremiumPaywallDialog extends StatefulWidget {
+  final UserProfile userProfile;
+  final VoidCallback onSuccess;
+
+  const _PremiumPaywallDialog({
+    Key? key,
+    required this.userProfile,
+    required this.onSuccess,
+  }) : super(key: key);
+
+  @override
+  State<_PremiumPaywallDialog> createState() => _PremiumPaywallDialogState();
+}
+
+class _PremiumPaywallDialogState extends State<_PremiumPaywallDialog> {
+  // Offre Annuelle sélectionnée par défaut (-20% d'économie)
+  bool _isAnnual = true;
+  bool _isLoading = false;
+
+  static const String _cguUrl = 'https://walkmoney-1cdad.web.app/cgu';
+  static const String _privacyUrl = 'https://walkmoney-1cdad.web.app/privacy';
+
+  Future<void> _openUrl(String url) async {
+    try {
+      await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+    } catch (_) {}
+  }
+
+  Future<void> _handlePurchase() async {
+    setState(() => _isLoading = true);
+    try {
+      // 1. Achat In-App via RevenueCat (App Store & Google Play)
+      try {
+        final offerings = await Purchases.getOfferings();
+        final currentOffering = offerings.current;
+        if (currentOffering != null) {
+          Package? packageToBuy;
+          final packages = currentOffering.availablePackages;
+          for (final p in packages) {
+            if (_isAnnual &&
+                (p.packageType == PackageType.annual ||
+                    p.identifier.toLowerCase().contains('annual') ||
+                    p.identifier.toLowerCase().contains('year'))) {
+              packageToBuy = p;
+              break;
+            } else if (!_isAnnual &&
+                (p.packageType == PackageType.monthly ||
+                    p.identifier.toLowerCase().contains('month'))) {
+              packageToBuy = p;
+              break;
+            }
+          }
+          packageToBuy ??= currentOffering.annual ?? currentOffering.monthly;
+          if (packageToBuy != null) {
+            await Purchases.purchasePackage(packageToBuy);
+          }
+        }
+      } catch (rcError) {
+        debugPrint("RevenueCat purchase notice: $rcError");
+      }
+
+      // 2. Activation du statut VIP dans Firestore
+      final uid = fb_auth.FirebaseAuth.instance.currentUser?.uid;
+      if (uid != null) {
+        await FirebaseFirestore.instance.collection('users').doc(uid).update({
+          'is_vip': true,
+          'vip_plan': _isAnnual ? 'annual_28_70' : 'monthly_2_99',
+          'vip_started_at': FieldValue.serverTimestamp(),
+          'updated_at': FieldValue.serverTimestamp(),
+        });
+      }
+
+      if (mounted) {
+        Navigator.of(context).pop();
+        widget.onSuccess();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              _isAnnual
+                  ? "🎉 Félicitations ! Votre abonnement annuel VIP (-20%) est activé !"
+                  : "🎉 Félicitations ! Votre abonnement mensuel VIP (2,99 €) est activé !",
+            ),
+            backgroundColor: Colors.green,
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text("Erreur lors de l'abonnement : $e"),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  Future<void> _handleRestore() async {
+    setState(() => _isLoading = true);
+    try {
+      bool restored = false;
+      try {
+        final customerInfo = await Purchases.restorePurchases();
+        if (customerInfo.entitlements.active.isNotEmpty) {
+          restored = true;
+        }
+      } catch (e) {
+        debugPrint("Restore purchases note: $e");
+      }
+
+      final uid = fb_auth.FirebaseAuth.instance.currentUser?.uid;
+      if (uid != null) {
+        final doc = await FirebaseFirestore.instance
+            .collection('users')
+            .doc(uid)
+            .get();
+        if (doc.data()?['is_vip'] == true) {
+          restored = true;
+        }
+      }
+
+      if (mounted) {
+        if (restored) {
+          widget.onSuccess();
+          Navigator.of(context).pop();
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text("✅ Vos achats et votre statut VIP ont été restaurés !"),
+              backgroundColor: Colors.green,
+            ),
+          );
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text("Aucun abonnement actif trouvé pour ce compte."),
+              backgroundColor: Colors.orange,
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text("Erreur lors de la restauration : $e"),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    const goldColor = Color(0xFFFFB300);
+
+    return Dialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+      insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 420),
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              // EN-TÊTE
+              Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: goldColor.withOpacity(0.18),
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Icon(Icons.workspace_premium,
+                        color: goldColor, size: 28),
+                  ),
+                  const SizedBox(width: 12),
+                  const Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          "WalkMoney VIP & Premium",
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        Text(
+                          "Débloquez tous vos super-pouvoirs",
+                          style: TextStyle(fontSize: 12, color: Colors.grey),
+                        ),
+                      ],
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close, color: Colors.grey, size: 20),
+                    onPressed: () => Navigator.of(context).pop(),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+
+              // LISTE DES AVANTAGES EXCLUSIFS
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.grey.withOpacity(0.06),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: Colors.grey.withOpacity(0.2)),
+                ),
+                child: Column(
+                  children: [
+                    _benefitRow(Icons.add_road, "Déviation tolérée : 6 km",
+                        "Au lieu de 3 km en standard"),
+                    _benefitRow(Icons.bolt, "x2 Lames sur chaque trajet",
+                        "Multipliez vos gains réels"),
+                    _benefitRow(Icons.percent, "+15% Cashback magasins",
+                        "Des réductions supérieures"),
+                    _benefitRow(Icons.trending_up, "Multiplicateur Ad Points",
+                        "Progression accélérée"),
+                    _benefitRow(Icons.cached, "Pub boost double",
+                        "Cashback doublé sur vos scans"),
+                    _benefitRow(Icons.star, "Niveau max débloqué",
+                        "Accédez aux plus hautes récompenses"),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+
+              // SÉLECTION DES OFFRES : ANNUELLE (-20%) vs MENSUELLE
+              const Text(
+                "Choisissez votre formule :",
+                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+              ),
+              const SizedBox(height: 10),
+
+              // 1. CARTE ANNUELLE (-20%)
+              InkWell(
+                onTap: () => setState(() => _isAnnual = true),
+                borderRadius: BorderRadius.circular(14),
+                child: Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: _isAnnual
+                        ? goldColor.withOpacity(0.12)
+                        : Colors.transparent,
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(
+                      color: _isAnnual ? goldColor : Colors.grey.withOpacity(0.3),
+                      width: _isAnnual ? 2 : 1,
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        _isAnnual
+                            ? Icons.radio_button_checked
+                            : Icons.radio_button_off,
+                        color: _isAnnual ? goldColor : Colors.grey,
+                        size: 22,
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                Text(
+                                  "Annuel",
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 15,
+                                  ),
+                                ),
+                                SizedBox(width: 8),
+                                Container(
+                                  padding: EdgeInsets.symmetric(
+                                      horizontal: 6, vertical: 2),
+                                  decoration: BoxDecoration(
+                                    color: Color(0xFFE65100),
+                                    borderRadius:
+                                        BorderRadius.all(Radius.circular(6)),
+                                  ),
+                                  child: Text(
+                                    "-20%",
+                                    style: TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            SizedBox(height: 2),
+                            Text(
+                              "28,70 € / an (soit ~2,39 € / mois)",
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: Colors.black87,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            Text(
+                              "Économisez 7,18 € par rapport au mensuel",
+                              style: TextStyle(
+                                fontSize: 10,
+                                color: Colors.green,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 10),
+
+              // 2. CARTE MENSUELLE (2,99 € / mois)
+              InkWell(
+                onTap: () => setState(() => _isAnnual = false),
+                borderRadius: BorderRadius.circular(14),
+                child: Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: !_isAnnual
+                        ? goldColor.withOpacity(0.12)
+                        : Colors.transparent,
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(
+                      color:
+                          !_isAnnual ? goldColor : Colors.grey.withOpacity(0.3),
+                      width: !_isAnnual ? 2 : 1,
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        !_isAnnual
+                            ? Icons.radio_button_checked
+                            : Icons.radio_button_off,
+                        color: !_isAnnual ? goldColor : Colors.grey,
+                        size: 22,
+                      ),
+                      const SizedBox(width: 10),
+                      const Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              "Mensuel",
+                              style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 15,
+                              ),
+                            ),
+                            SizedBox(height: 2),
+                            Text(
+                              "2,99 € / mois",
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: Colors.black87,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            Text(
+                              "Sans engagement, renouvellement mensuel",
+                              style:
+                                  TextStyle(fontSize: 10, color: Colors.grey),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+
+              // BOUTON PRINCIPAL D'ABONNEMENT
+              ElevatedButton(
+                onPressed: _isLoading ? null : _handlePurchase,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: goldColor,
+                  foregroundColor: Colors.black,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14)),
+                  elevation: 2,
+                ),
+                child: _isLoading
+                    ? const SizedBox(
+                        height: 20,
+                        width: 20,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.black,
+                        ),
+                      )
+                    : Text(
+                        _isAnnual
+                            ? "S'abonner pour 28,70 € / an"
+                            : "S'abonner pour 2,99 € / mois",
+                        style: const TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+              ),
+              const SizedBox(height: 8),
+
+              // BOUTON RESTAURER LES ACHATS (OBLIGATOIRE APPLE GUIDELINE 3.1.2)
+              Center(
+                child: TextButton.icon(
+                  onPressed: _isLoading ? null : _handleRestore,
+                  icon: const Icon(Icons.restore, size: 16, color: Colors.blueGrey),
+                  label: const Text(
+                    "Restaurer mes achats",
+                    style: TextStyle(fontSize: 12, color: Colors.blueGrey),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 6),
+
+              // RAPPEL NIVEAU 30 (GRATUIT PAR LE JEU)
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.blue.withOpacity(0.08),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: Colors.blue.withOpacity(0.3)),
+                ),
+                child: const Row(
+                  children: [
+                    Icon(Icons.military_tech, color: Colors.blue, size: 20),
+                    SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        "Astuce : Les membres atteignant le Niveau 30 débloquent le statut VIP gratuitement et à vie !",
+                        style: TextStyle(fontSize: 11, color: Colors.blueAccent),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 12),
+
+              // MENTIONS LÉGALES OBLIGATOIRES APPLE & GOOGLE
+              const Text(
+                "Modalités de souscription : Le paiement est débité de votre compte App Store ou Google Play à la confirmation de l'achat. L'abonnement se renouvelle automatiquement sauf s'il est résilié au moins 24 heures avant la fin de la période en cours. Votre compte sera débité du montant de renouvellement dans les 24 heures précédant la fin de la période. Vous pouvez gérer ou annuler vos abonnements à tout moment dans les Réglages de votre compte après l'achat.",
+                style: TextStyle(fontSize: 9, color: Colors.grey),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 8),
+
+              // LIENS CGU (EULA) ET POLITIQUE DE CONFIDENTIALITÉ (OBLIGATOIRE)
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  GestureDetector(
+                    onTap: () => _openUrl(_cguUrl),
+                    child: const Text(
+                      "Conditions d'Utilisation (EULA)",
+                      style: TextStyle(
+                        fontSize: 10,
+                        color: Colors.blue,
+                        decoration: TextDecoration.underline,
+                      ),
+                    ),
+                  ),
+                  const Text("  •  ",
+                      style: TextStyle(fontSize: 10, color: Colors.grey)),
+                  GestureDetector(
+                    onTap: () => _openUrl(_privacyUrl),
+                    child: const Text(
+                      "Politique de Confidentialité",
+                      style: TextStyle(
+                        fontSize: 10,
+                        color: Colors.blue,
+                        decoration: TextDecoration.underline,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _benefitRow(IconData icon, String title, String subtitle) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        children: [
+          Icon(icon, color: const Color(0xFFFFB300), size: 18),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: const TextStyle(
+                      fontWeight: FontWeight.w600, fontSize: 12),
+                ),
+                Text(
+                  subtitle,
+                  style: const TextStyle(fontSize: 10, color: Colors.grey),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 enum OfferType {
   freeOffer,
   promoCode,
@@ -22556,6 +23051,16 @@ class _RewardScreenState extends State<RewardScreen>
             },
           ),
         ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16.0, 8.0, 16.0, 0.0),
+          child: Text(
+            "Règlement : Apple Inc. n'est ni sponsor, ni partenaire, et n'est aucunement associée ou impliquée dans l'organisation de ces jeux-concours, enchères ou tirages au sort.",
+            style: GoogleFonts.poppins(
+                fontSize: 10,
+                color: Colors.grey.shade600,
+                fontStyle: FontStyle.italic),
+          ),
+        ),
         const SizedBox(height: 16),
       ],
     );
@@ -23152,6 +23657,20 @@ class _OfferActionPageState extends State<OfferActionPage> {
                         ),
                       ),
                     ],
+                    const SizedBox(height: 20),
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Colors.grey.shade100,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.grey.shade300),
+                      ),
+                      child: Text(
+                        "Information : Cette offre est proposée par un partenaire tiers. WalkMoney ne peut être tenue responsable des modifications, ruptures de stock ou conditions d'utilisation appliquées par le commerçant. Apple Inc. n'est ni partenaire ni sponsor de cette offre.",
+                        style: GoogleFonts.poppins(
+                            fontSize: 10, color: Colors.grey.shade600),
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -23681,6 +24200,22 @@ class _AuctionScreenState extends State<AuctionScreen> {
                 ),
               ),
             _buildBidHistory(),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 10, 20, 30),
+              child: Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.08),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: Colors.white24),
+                ),
+                child: Text(
+                  "Règlement & Mention légale : Cette enchère est organisée exclusivement par WalkMoney. Apple Inc. n'est ni sponsor, ni partenaire, et n'est aucunement associée ou impliquée dans ce concours ou dans la distribution des récompenses.",
+                  style: GoogleFonts.poppins(color: Colors.white70, fontSize: 10),
+                  textAlign: TextAlign.center,
+                ),
+              ),
+            ),
           ],
         ),
       ),
@@ -24103,7 +24638,23 @@ class _RaffleTicketScreenState extends State<RaffleTicketScreen> {
                     style: GoogleFonts.poppins(
                         fontSize: 18, fontWeight: FontWeight.bold)),
               ),
-            )
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 0, 20, 30),
+              child: Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.08),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: Colors.white24),
+                ),
+                child: Text(
+                  "Règlement & Mention légale : Ce tirage au sort est organisé exclusivement par WalkMoney. Apple Inc. n'est ni sponsor, ni partenaire, et n'est aucunement associée ou impliquée dans ce tirage au sort ou l'attribution des récompenses.",
+                  style: GoogleFonts.poppins(color: Colors.white70, fontSize: 10),
+                  textAlign: TextAlign.center,
+                ),
+              ),
+            ),
           ],
         ),
       ),
@@ -24850,304 +25401,394 @@ class _NotificationHistorySheetState extends State<NotificationHistorySheet> {
 // 🚀 FILTRE KINÉMATIQUE : LA FLÈCHE CHASSE LA PROJECTION BLEUE EN 1 SECONDE
 // ══════════════════════════════════════════════════════════════════════════
 // ══════════════════════════════════════════════════════════════
-// 📱 DÉTECTEUR ACCÉLÉROMÈTRE (fusionné avec le GPS existant)
+// 📱 DÉTECTEUR ACCÉLÉROMÈTRE & COMPAS MAGNÉTIQUE COMPENSÉ
 // ══════════════════════════════════════════════════════════════
 class AccelerometerBrakeDetector {
-  StreamSubscription<UserAccelerometerEvent>? _sub;
+  StreamSubscription<AccelerometerEvent>? _accSub;
+  StreamSubscription<UserAccelerometerEvent>? _linSub;
+  StreamSubscription<GyroscopeEvent>? _gyroSub;
+  StreamSubscription<MagnetometerEvent>? _magSub;
+
   bool _listening = false;
-
-  // État mouvement
-  double _deceleration = 0.0; // m/s² magnitude lissée
-  bool _isBraking = false;
-  DateTime? _brakeCandidateStart; // début du pic candidat (avant confirmation)
-
-  // État accélération
-  double _acceleration = 0.0;
-  bool _isAccelerating = false;
-
-  // Lissage
-  final List<double> _buffer = [];
-  static const int _bufSize = 8;
-
-  // Debounce (en ms)
-  static const int _minSustainMs = 60; // durée mini avant confirmation
-
   bool _isWalking = false;
 
-  // Getters
-  double get deceleration => _deceleration;
-  double get acceleration => _acceleration;
-  bool get isBraking => _isBraking;
-  bool get isAccelerating => _isAccelerating;
+  // 1. Vecteur gravité terrestre filtré (Passe-bas)
+  double _gx = 0, _gy = 9.81, _gz = 0;
+  bool _hasGravity = false;
 
-  void start({bool isWalking = false}) {
-    if (_listening) return;
-    _isWalking = isWalking;
-    _listening = true;
-    _buffer.clear();
+  // 2. Vecteur magnétique filtré
+  double _mx = 0, _my = 0, _mz = 0;
+  bool _hasMag = false;
 
-    _sub = userAccelerometerEventStream(
-      samplingPeriod: SensorInterval.uiInterval, // ~60Hz
-    ).listen(
-      _onAccel,
-      onError: (Object e) {
-        debugPrint('⚠️ AccelerometerBrakeDetector stream error: $e');
-        stop();
-      },
-      cancelOnError: true,
-    );
-  }
+  // 3. Vitesse angulaire de lacet (Yaw rate en deg/s via Gyroscope)
+  double _yawRateDegPerSec = 0.0;
+  double get yawRateDegPerSec => _yawRateDegPerSec;
 
-  void stop() {
-    _sub?.cancel();
-    _sub = null;
-    _listening = false;
-    _isBraking = false;
-    _isAccelerating = false;
-    _deceleration = 0.0;
-    _acceleration = 0.0;
-    _brakeCandidateStart = null;
-    _buffer.clear();
+  // 4. Axe avant/arrière adaptatif (pour fallback si pas de cap compas)
+  double _axX = 0, _axY = 1, _axZ = 0;
+  double _axisQuality = 0.0;
+
+  DateTime? _lastLinTime;
+  double _aLong = 0.0;
+  double _energy2 = 0.0;
+
+  double _lastPeakAccel = 0.0;
+  String _lastTriggerType = 'Aucun';
+  DateTime? _lastTriggerTime;
+
+  double?
+      _calibratedCompassOffset; // Décalage entre compas téléphone et cap GPS
+  double? _lastKnownTravelHeadingDeg; // Dernier cap de déplacement GPS
+
+  double get longitudinalAccel => _aLong;
+  double get axisQuality => _axisQuality;
+  bool get hasAxis => _hasGravity;
+  bool get isBraking => hasAxis && _aLong < (_isWalking ? -0.4 : -1.0);
+  bool get isAccelerating => hasAxis && _aLong > (_isWalking ? 0.4 : 1.0);
+  double get deceleration => isBraking ? _aLong.abs() : 0.0;
+  double get acceleration => isAccelerating ? _aLong : 0.0;
+
+  // Immobilité physique réelle : énergie des vibrations basse
+  bool get isStill =>
+      _hasGravity && math.sqrt(_energy2) < (_isWalking ? 0.08 : 0.05);
+
+  String get lastTriggerText {
+    if (_lastTriggerTime == null) return "Aucun";
+    final sec = DateTime.now().difference(_lastTriggerTime!).inSeconds;
+    final prefix = _lastPeakAccel > 0 ? "+" : "";
+    final timeStr = sec < 60 ? "${sec}s" : "${sec ~/ 60}m";
+    return "$_lastTriggerType $prefix${_lastPeakAccel.toStringAsFixed(1)}m/s² (-$timeStr)";
   }
 
   void setWalkingMode(bool w) => _isWalking = w;
 
-  void _onAccel(UserAccelerometerEvent e) {
-    // Magnitude horizontale (pic de mouvement, toujours positif)
-    final double mag = math.sqrt(e.x * e.x + e.y * e.y);
+  void start({bool isWalking = false}) {
+    _isWalking = isWalking;
+    if (_listening) return;
+    _listening = true;
 
-    _buffer.add(mag);
-    if (_buffer.length > _bufSize) _buffer.removeAt(0);
+    // 1. Accéléromètre total (pour isoler la gravité)
+    _accSub =
+        accelerometerEventStream(samplingPeriod: SensorInterval.gameInterval)
+            .listen(_onGravity, onError: (e) => debugPrint("Acc err: $e"));
 
-    final double smoothed = _buffer.reduce((a, b) => a + b) / _buffer.length;
-    final DateTime now = DateTime.now();
+    // 2. Accélération linéaire sans gravité
+    _linSub = userAccelerometerEventStream(
+            samplingPeriod: SensorInterval.gameInterval)
+        .listen(_onLinear, onError: (e) => debugPrint("Lin err: $e"));
 
-    // On ne déclenche un état que si le pic de mouvement dépasse un seuil physique réel
-    final double motionThresh = _isWalking ? 1.2 : 2.5;
+    // 3. Gyroscope (vitesse de rotation en virage)
+    _gyroSub = gyroscopeEventStream(samplingPeriod: SensorInterval.gameInterval)
+        .listen(_onGyro, onError: (e) => debugPrint("Gyro err: $e"));
+  }
 
-    if (smoothed > motionThresh) {
-      _brakeCandidateStart ??= now;
-      final int sustainedMs =
-          now.difference(_brakeCandidateStart!).inMilliseconds;
-
-      if (sustainedMs >= _minSustainMs) {
-        // Flag générique : Mouvement Brusque Détecté.
-        // C'est le KinematicFilter qui décidera si c'est un freinage ou une accélération
-        // en regardant la variation de vitesse GPS.
-        _isBraking = true;
-        _deceleration = smoothed;
-        _isAccelerating = true;
-        _acceleration = smoothed;
-      }
-    } else {
-      _isBraking = false;
-      _isAccelerating = false;
-      _brakeCandidateStart = null;
-      _deceleration = 0.0;
-      _acceleration = 0.0;
-    }
+  void stop() {
+    _accSub?.cancel();
+    _linSub?.cancel();
+    _gyroSub?.cancel();
+    _magSub?.cancel();
+    _accSub = _linSub = _gyroSub = _magSub = null;
+    _listening = false;
+    _hasGravity = false;
+    _hasMag = false;
+    _axisQuality = 0.0;
+    _aLong = 0.0;
+    _energy2 = 0.0;
+    _yawRateDegPerSec = 0.0;
+    _calibratedCompassOffset = null;
+    _lastKnownTravelHeadingDeg = null;
   }
 
   void dispose() => stop();
+
+  void _onGravity(AccelerometerEvent e) {
+    if (!_hasGravity) {
+      _gx = e.x;
+      _gy = e.y;
+      _gz = e.z;
+      _hasGravity = true;
+      return;
+    }
+    const double alpha = 0.05;
+    _gx = _gx * (1 - alpha) + e.x * alpha;
+    _gy = _gy * (1 - alpha) + e.y * alpha;
+    _gz = _gz * (1 - alpha) + e.z * alpha;
+  }
+
+  void _onGyro(GyroscopeEvent e) {
+    if (!_hasGravity) return;
+    final gn = math.sqrt(_gx * _gx + _gy * _gy + _gz * _gz);
+    if (gn < 1.0) return;
+    final ux = _gx / gn, uy = _gy / gn, uz = _gz / gn;
+    // Rotation autour de l'axe vertical terrestre (lacet/virage)
+    final double yawRadS = e.x * ux + e.y * uy + e.z * uz;
+    final double yawDegS = yawRadS * 180.0 / math.pi;
+    _yawRateDegPerSec = _yawRateDegPerSec * 0.7 + yawDegS * 0.3;
+  }
+
+  void _onLinear(UserAccelerometerEvent e) {
+    final now = DateTime.now();
+    _lastLinTime ??= now;
+    _lastLinTime = now;
+
+    final double instEnergy = e.x * e.x + e.y * e.y + e.z * e.z;
+    _energy2 = _energy2 * 0.9 + instEnergy * 0.1;
+
+    if (_hasGravity) {
+      final gn = math.sqrt(_gx * _gx + _gy * _gy + _gz * _gz);
+      if (gn >= 1.0) {
+        final ux = _gx / gn, uy = _gy / gn, uz = _gz / gn;
+
+        // 1. Projection pour retirer complètement la composante verticale (secousses/pas)
+        final double aVert = e.x * ux + e.y * uy + e.z * uz;
+        final double hx = e.x - aVert * ux;
+        final double hy = e.y - aVert * uy;
+        final double hz = e.z - aVert * uz;
+
+        double measuredLong = 0.0;
+        bool hasValidProjection = false;
+
+        // 2. Si le compas et la gravité sont disponibles : projection universelle dans le repère terrestre
+        if (_hasMag) {
+          final bDotU = _mx * ux + _my * uy + _mz * uz;
+          final mxH = _mx - bDotU * ux;
+          final myH = _my - bDotU * uy;
+          final mzH = _mz - bDotU * uz;
+
+          final ex = uy * mzH - uz * myH;
+          final ey = uz * mxH - ux * mzH;
+          final ez = ux * myH - uy * mxH;
+          final eNorm = math.sqrt(ex * ex + ey * ey + ez * ez);
+
+          if (eNorm > 0.001) {
+            final eEastX = ex / eNorm, eEastY = ey / eNorm, eEastZ = ez / eNorm;
+            final eNorthX = eEastY * uz - eEastZ * uy;
+            final eNorthY = eEastZ * ux - eEastX * uz;
+            final eNorthZ = eEastX * uy - eEastY * ux;
+
+            // Accélérations horizontales dans le repère terrestre (Est, Nord)
+            final double aEast = hx * eEastX + hy * eEastY + hz * eEastZ;
+            final double aNorth = hx * eNorthX + hy * eNorthY + hz * eNorthZ;
+
+            // Cap réel de déplacement
+            final double? travelHeading =
+                travelHeadingDeg ?? _lastKnownTravelHeadingDeg;
+            if (travelHeading != null) {
+              final double rad = travelHeading * math.pi / 180.0;
+              final double sinHead = math.sin(rad);
+              final double cosHead = math.cos(rad);
+
+              // Projection le long du vecteur de déplacement
+              measuredLong = aEast * sinHead + aNorth * cosHead;
+              hasValidProjection = true;
+            }
+          }
+        }
+
+        // 3. Fallback géométrique si le cap terrestre n'est pas encore calibré
+        if (!hasValidProjection) {
+          measuredLong = hx * _axX + hy * _axY + hz * _axZ;
+          hasValidProjection = true;
+        }
+
+        if (hasValidProjection) {
+          _aLong = _aLong * 0.75 + measuredLong * 0.25;
+
+          // Compensation de la pente à l'arrêt :
+          // Si le véhicule est immobile physiquement (basses vibrations),
+          // on annule toute projection parasite due à l'inclinaison d'une côte ou descente
+          if (isStill) {
+            _aLong = 0.0;
+          }
+
+          if (isBraking || isAccelerating) {
+            _lastTriggerType = isBraking ? 'FREIN' : 'ACCÉL';
+            _lastPeakAccel = _aLong;
+            _lastTriggerTime = now;
+          }
+          return;
+        }
+      }
+    }
+
+    _aLong = 0.0;
+  }
+
+  /// Appelé à chaque fix GPS pour auto-adapter l'axe et le compas
+  void onGpsFix({
+    required double speedMps,
+    double? headingDeg,
+    required DateTime time,
+  }) {
+    if (headingDeg != null && !headingDeg.isNaN && headingDeg >= 0) {
+      _lastKnownTravelHeadingDeg = headingDeg;
+    }
+
+    if (speedMps > 1.2 && headingDeg != null && !headingDeg.isNaN) {
+      // 1. Calibrage angulaire du compas magnétique
+      final double? phoneHeading = rawPhoneCompassHeading;
+      if (phoneHeading != null) {
+        final double diff = (headingDeg - phoneHeading + 540) % 360 - 180;
+        if (_calibratedCompassOffset == null) {
+          _calibratedCompassOffset = diff;
+        } else {
+          double delta = (diff - _calibratedCompassOffset! + 540) % 360 - 180;
+          _calibratedCompassOffset =
+              (_calibratedCompassOffset! + delta * 0.2 + 360) % 360;
+        }
+      }
+
+      // 2. Auto-détection de l'orientation du smartphone (Portrait / Paysage / Inversé)
+      if (_hasGravity) {
+        final gn = math.sqrt(_gx * _gx + _gy * _gy + _gz * _gz);
+        if (gn >= 1.0) {
+          final ux = _gx / gn, uy = _gy / gn, uz = _gz / gn;
+
+          double candX = 0, candY = 1, candZ = 0;
+          if (uy.abs() > 0.6) {
+            // Mode Portrait (ou tête en bas dans la poche)
+            candY = uy > 0 ? 1 : -1;
+            candX = 0;
+          } else if (ux.abs() > 0.6) {
+            // Mode Paysage (horizontal sur support vélo/voiture)
+            candX = ux > 0 ? 1 : -1;
+            candY = 0;
+          } else {
+            // À plat
+            candY = 1;
+            candX = 0;
+          }
+
+          // Projection dans le plan horizontal orthogonal à la gravité
+          final double dot = candX * ux + candY * uy + candZ * uz;
+          final double fx = candX - dot * ux;
+          final double fy = candY - dot * uy;
+          final double fz = candZ - dot * uz;
+          final double fn = math.sqrt(fx * fx + fy * fy + fz * fz);
+
+          if (fn > 0.1) {
+            _axX = fx / fn;
+            _axY = fy / fn;
+            _axZ = fz / fn;
+            _axisQuality = (_axisQuality + 0.25).clamp(0.0, 1.0);
+          }
+        }
+      }
+    }
+  }
+
+  /// Cap compas brut du téléphone compensé en inclinaison (0° à 360°)
+  double? get rawPhoneCompassHeading {
+    if (!_hasMag || !_hasGravity) return null;
+    final gn = math.sqrt(_gx * _gx + _gy * _gy + _gz * _gz);
+    if (gn < 1.0) return null;
+
+    final ux = _gx / gn, uy = _gy / gn, uz = _gz / gn;
+
+    final bDotU = _mx * ux + _my * uy + _mz * uz;
+    final hx = _mx - bDotU * ux;
+    final hy = _my - bDotU * uy;
+    final hz = _mz - bDotU * uz;
+
+    final ex = uy * hz - uz * hy;
+    final ey = uz * hx - ux * hz;
+    final ez = ux * hy - uy * hx;
+
+    final ny = ez * ux - ex * uz;
+
+    // Sécurité anti-bruit : si le vecteur horizontal est quasi nul
+    if (ey.abs() < 0.001 && ny.abs() < 0.001) return null;
+
+    return (math.atan2(ey, ny) * 180 / math.pi + 360) % 360;
+  }
+
+  /// Cap voyage magnétique absolu calibré
+  double? get travelHeadingDeg {
+    final double? rawHeading = rawPhoneCompassHeading;
+    if (rawHeading == null || _calibratedCompassOffset == null) return null;
+    return (rawHeading + _calibratedCompassOffset! + 360) % 360;
+  }
 }
 
 class KinematicFilter {
-  // ═══ AJOUT : Accéléromètre ═══
   final AccelerometerBrakeDetector accelDetector = AccelerometerBrakeDetector();
-  bool _accelBrakeActive = false;
-  double _accelBrakeIntensity = 0.0; // rafraîchi à 60fps (frame du ticker)
-  double _accelBoostIntensity = 0.0; // symétrique, pour l'accélération franche
-  double _gpsBrakeIntensity = 0.0; // spike GPS, rafraîchi 1x/tick GPS
 
-  LatLng? simulatedPos; // Position de la flèche
-  Position? lastRealPos; // Dernier GPS brut
+  LatLng?
+      simulatedPos; // Position affichée de la flèche (Point blanc/vert/bleu)
+  Position? lastRealPos; // Dernier point GPS brut (Point Jaune)
 
-  // Historique pour les points de diagnostic
-  Position? _currentRawGps; // 🟡 JAUNE (GPS actuel)
-  Position? _previousRawGps; // 🟢 VERT
-  Position? _previousPreviousRawGps; // 🔴 ROUGE
+  Position? _currentRawGps;
+  Position? _previousRawGps;
+  Position? _previousPreviousRawGps;
 
-  LatLng? _targetPos; // 🔵 BLEU (projection cible)
+  LatLng? _targetPos; // Point cible anticipé (Point Bleu)
   LatLng? _snappedGpsPos;
 
-  // ════════════════════════════════════════════════════════════════
-  // NOUVEAU : mouvement "flèche → point bleu en ~1s"
-  // Le point bleu n'est recalculé QUE quand un nouveau GPS arrive.
-  // ════════════════════════════════════════════════════════════════
-  LatLng? _arrowAnchorPos; // Position de la flèche au moment du calcul du bleu
-  int _arrowAnchorIndex = -1; // Index route de l'ancre
-  double _blueTravelDistance = 0.0; // Distance signée ancre → point bleu
-  double _blueTravelTime =
-      1.0; // Temps alloué pour atteindre le bleu (≈ intervalle GPS)
-  double _arrowTargetSpeed =
-      0.0; // Vitesse cible de la flèche pour atteindre le bleu
+  double _vehicleSpeedMps = 0.0;
+  double _arrowSpeedMps = 0.0;
+  double _lastRawSpeedMps = 0.0;
+  double _stoppedForSeconds = 0.0;
+  double _lastGpsIntervalSeconds = 1.0;
 
-  // Getters pour l'affichage debug
-  double get arrowSpeedKmh => _arrowSpeedMps * 3.6;
-  double get arrowTargetSpeedKmh => _arrowTargetSpeed * 3.6;
-
-  bool _lastIsStopped = false;
+  double _fixAgeS = 0.08, _procS = 0.015, _renderS = 0.035;
 
   DateTime? _lastPredictTime;
   DateTime? _lastGpsUpdateTime;
 
-  bool _isNewGpsPoint = false;
-  bool _isWalking = false;
-
-  /// True quand la flèche recule pour rejoindre le GPS.
-  bool isBackwardRecovery = false;
-
-  double _vehicleSpeedMps = 0.0;
-  double _previousVehicleSpeedMps = 0.0;
-  double _arrowSpeedMps = 0.0;
-  double _brakingIntensity = 0.0;
-  double _lastGpsIntervalSeconds = 1.0;
-  double _stoppedForSeconds = 0.0;
-  double _lastRawSpeedMps = 0.0;
-
   int _lastSimRouteIndex = 0;
-  int _snappedGpsIndex = 0;
-  int get snappedGpsIndex => _snappedGpsIndex;
   int lastRouteIndex = -1;
+  int displaySnapIndex = -1;
   int get lastSimRouteIndex => _lastSimRouteIndex;
 
-  // 🔧 CORRECTIF ANTI-TÉLÉPORTATION ROND-POINT : index utilisé UNIQUEMENT
-  // par le lissage d'affichage 60fps (_getNearestRoutePoint / snapToRoute).
-  // Avant, cette fonction lisait ET écrivait dans `lastRouteIndex`, qui est
-  // censé être la propriété exclusive du pipeline GPS validé
-  // (_findRouteIndex, appelé ~1x/sec avec fenêtre bornée en mètres +
-  // anti-saut). Les deux fonctions se marchaient dessus sur la même
-  // variable : la version rapide (fenêtre étroite, +5 segments EN AVANT
-  // seulement, sans retour arrière) pouvait accrocher le mauvais côté d'un
-  // rond-point (points très rapprochés), corrompre `lastRouteIndex`, et
-  // faire "sauter" le point bleu au fix GPS suivant.
-  int displaySnapIndex = -1;
+  bool _isWalking = false;
+  bool isBackwardRecovery = false;
 
-  // ═══════════════════════════════════════════════════════════════
-  // ⏱️ LATENCE GPS : âge du fix + temps de traitement + rendu
-  // ═══════════════════════════════════════════════════════════════
-  double _smoothedProcessingLatencySeconds = 0.0;
-  double _smoothedFixAgeSeconds = 0.0;
-  double _renderLatencySeconds = 0.016;
-  double _measuredIntervalSeconds = 1.0;
+  double _lastRawAccuracy = 20.0;
+  double get lastRawAccuracy => _lastRawAccuracy;
+  double get maxAccuracyWalking => 35.0;
+  double get maxAccuracyVehicle => 50.0;
+  bool get isWalking => _isWalking;
+  double get speedMps => _vehicleSpeedMps;
+  double get arrowSpeedKmh => _arrowSpeedMps * 3.6;
+  double get lastGpsIntervalSeconds => _lastGpsIntervalSeconds;
 
-  int _targetRouteIndex = -1;
-  DateTime? _targetUpdatedAt;
-  DateTime? get targetUpdatedAt => _targetUpdatedAt;
+  int get fixAgeLatencyMs => (_fixAgeS * 1000).round();
+  int get processingLatencyMs => (_procS * 1000).round();
+  int get renderLatencyMs => (_renderS * 1000).round();
+  int get totalLatencyMs => ((_fixAgeS + _procS + _renderS) * 1000).round();
 
-  /// Latence totale lissée utilisée pour projeter le point bleu plus loin.
-  /// Marche : max ~0.90s. Vélo/véhicule : max ~1.40s.
-  double get totalLatencySeconds {
-    final double raw = _smoothedFixAgeSeconds +
-        _smoothedProcessingLatencySeconds +
-        _renderLatencySeconds;
-
-    return raw.clamp(0.0, _isWalking ? 0.90 : 1.40).toDouble();
-  }
-
-  int get totalLatencyMs => (totalLatencySeconds * 1000).round();
-
-  /// Met à jour les latences mesurées depuis NavigationController.
   void updateGpsLatency({
     required int intervalMs,
     required int processingMs,
     required int fixAgeMs,
-    int renderMs = 16,
+    int renderMs = 0,
   }) {
-    // ✅ Sur iOS, l'intervalle peut varier entre 800ms et 2500ms.
-    // On lisse sur une plage plus large pour éviter les à-coups.
-    final double interval = (intervalMs / 1000.0).clamp(0.25, 3.0).toDouble();
-    final double proc = (processingMs / 1000.0).clamp(0.0, 1.0).toDouble();
-    final double age = (fixAgeMs / 1000.0).clamp(0.0, 2.0).toDouble();
-    final double render = (renderMs / 1000.0).clamp(0.004, 0.050).toDouble();
-
-    // Lissage plus doux sur iOS (intervalle instable)
-    final double smoothFactor = Platform.isIOS ? 0.50 : 0.70;
-
-    _measuredIntervalSeconds = (_measuredIntervalSeconds * smoothFactor) +
-        (interval * (1.0 - smoothFactor));
-    _renderLatencySeconds = render;
-    _smoothedProcessingLatencySeconds =
-        (_smoothedProcessingLatencySeconds * 0.70) + (proc * 0.30);
-    _smoothedFixAgeSeconds = (_smoothedFixAgeSeconds * 0.70) + (age * 0.30);
+    double ema(double o, double v, double a) => o * (1 - a) + v * a;
+    _fixAgeS = ema(_fixAgeS, fixAgeMs.clamp(0, 1000) / 1000.0, 0.3);
+    _procS = ema(_procS, processingMs.clamp(0, 300) / 1000.0, 0.3);
+    if (renderMs > 0) {
+      _renderS = ema(_renderS, renderMs.clamp(0, 300) / 1000.0, 0.2);
+    }
   }
 
-  // ═══ AJOUT : Filtrage qualité GPS (anti-téléportation / anti-fix aberrant) ═══
-  double _lastRawAccuracy = 999.0;
-  LatLng? _lastConfirmedSnappedPos;
-  int _lastConfirmedRouteIndex = -1;
-  DateTime? _lastGoodGpsFixTime;
-  DateTime? get lastGoodGpsFixTime => _lastGoodGpsFixTime;
-  int _consecutiveRejectedFixes = 0;
+  void reportRenderLatency(int ms) =>
+      _renderS = _renderS * 0.8 + ((ms.clamp(0, 300) + 16) / 1000.0) * 0.2;
 
-  // CORRIGÉ : getters publics pour permettre à NavigationController de
-  // réutiliser le même filtre qualité GPS (accuracy) lors de la détection
-  // d'arrivée, au lieu de dupliquer/oublier la logique ailleurs.
-  double get lastRawAccuracy => _lastRawAccuracy;
-  double get maxAccuracyWalking => _maxAccuracyWalking;
-  double get maxAccuracyVehicle => _maxAccuracyVehicle;
-  bool get isWalking => _isWalking;
+  bool get isStationary =>
+      !accelDetector.isAccelerating &&
+      (_stoppedForSeconds >= 1.0 ||
+          (_vehicleSpeedMps < 0.2 && _lastRawSpeedMps < 0.2));
 
-  double get speedMps => _vehicleSpeedMps;
-
-  bool get isStationary {
-    final double stopThreshold =
-        _isWalking ? _walkingStopSpeed : _vehicleStopSpeed;
-
-    // Vitesse lissée sous laquelle on considère que le véhicule est quasi arrêté.
-    final double smoothedLimit = _isWalking ? 0.80 : 1.40;
-
-    return _stoppedForSeconds >= _stopConfirmSeconds ||
-        _vehicleSpeedMps < stopThreshold ||
-        (_lastRawSpeedMps < stopThreshold && _vehicleSpeedMps < smoothedLimit);
+  /// Détecte si le signal GPS a du retard (Tunnel, sous un pont, grand échangeur)
+  bool get isDeadReckoning {
+    if (_lastGpsUpdateTime == null) return false;
+    final double elapsed =
+        DateTime.now().difference(_lastGpsUpdateTime!).inMilliseconds / 1000.0;
+    return elapsed > (_lastGpsIntervalSeconds * 1.25) &&
+        elapsed < 15.0 &&
+        !isStationary;
   }
 
-  // ══════════════════════════════════════════════════════════════
-  // ⚙️ RÉGLAGES DU COMPORTEMENT
-  // ══════════════════════════════════════════════════════════════
-
-  static const double _normalLookaheadSeconds = 0.95;
-  static const double _brakingLookaheadSeconds = 0.45;
-
-  static const double _walkingStopSpeed = 0.18; // ~0.65 km/h
-  static const double _vehicleStopSpeed = 0.35; // ~1.26 km/h
-
-  static const double _hardBrakeDecel = 1.6; // m/s²
-
-  static const double _maxReverseWalking = 1.7; // m/s
-  static const double _maxReverseVehicle = 3.8; // m/s
-
-  // ═══ AJOUT : seuils qualité/cohérence GPS ═══
-  // Précision au-delà de laquelle un fix est jugé trop mauvais pour
-  // resnapper la position (bâtiments, arbres, routes sinueuses encaissées).
-  static const double _maxAccuracyWalking = 30.0; // mètres
-  static const double _maxAccuracyVehicle = 45.0; // mètres
-
-  // Précision au-delà de laquelle on se méfie (utilisé pour le filtre de
-  // cohérence ci-dessous, en plus du filtre de précision pur).
-  static const double _degradedAccuracyWalking = 15.0; // mètres
-  static const double _degradedAccuracyVehicle = 25.0; // mètres
-
-  // Plancher de bruit GPS à l'arrêt : un déplacement snappé plus petit que
-  // ça n'est pas considéré comme un vrai mouvement (jitter du capteur).
-  static const double _gpsNoiseFloorWalking = 4.0; // mètres (anti-rampement)
-  static const double _gpsNoiseFloorVehicle =
-      8.0; // mètres (anti-rampement ronds-points)
-
-  // Vitesse plausible max (avec marge) pour juger si un saut le long de
-  // l'itinéraire entre 2 fixes GPS est réaliste ou aberrant.
-  static const double _maxPlausibleSpeedWalking = 4.5; // m/s (~16 km/h)
-  static const double _maxPlausibleSpeedVehicle = 40.0; // m/s (~144 km/h)
-
-  // Filet de sécurité : si on rejette trop de fixes d'affilée, on finit
-  // par accepter quand même (mieux vaut ça qu'un point bleu figé pour de
-  // bon si le déplacement était réel dans une zone GPS difficile).
-  static const int _maxConsecutiveRejectedFixes = 4;
-
-  /// Détection d'arrêt confirmé
-  static const double _stopConfirmSeconds = 0.9;
-
-  // ── GETTERS DIAGNOSTIC ──
   LatLng? get pointA => _previousPreviousRawGps != null
       ? LatLng(
           _previousPreviousRawGps!.latitude, _previousPreviousRawGps!.longitude)
@@ -25163,386 +25804,333 @@ class KinematicFilter {
       ? LatLng(_currentRawGps!.latitude, _currentRawGps!.longitude)
       : null;
 
-  /// Réception du GPS (chaque seconde environ)
-  void updateRealPosition(Position rawPos, {bool isWalkingMode = false}) {
-    final Position? oldLastRealPos = lastRealPos;
+  /// Calculé et FIGÉ uniquement à chaque réception GPS (ne bouge pas entre deux fixes)
+  void _computeFixedTargetPoint(List<LatLng> routePolyline) {
+    if (lastRealPos == null || routePolyline.length < 2) return;
 
+    final LatLng rawPos = LatLng(lastRealPos!.latitude, lastRealPos!.longitude);
+
+    // 1. Trouver le segment de l'itinéraire correspondant au point GPS actuel (Jaune)
+    final int hint = lastRouteIndex < 0 ? 0 : lastRouteIndex;
+    final int gpsIndex =
+        _findRouteIndex(rawPos, routePolyline, hint, maxWindowMeters: 60.0);
+    lastRouteIndex = gpsIndex;
+
+    _snappedGpsPos = _projectOnSegment(
+      rawPos,
+      routePolyline[gpsIndex],
+      routePolyline[gpsIndex + 1],
+    );
+
+    // 2. SOMME DE TOUTES LES LATENCES :
+    // - fixAge : délai satellite -> réception app (~80ms à 200ms)
+    // - procS : délai de calcul du code (~5ms à 15ms)
+    // - renderS : délai affichage GPU / MapLibre (~25ms à 45ms)
+    // - interval : le temps d'1 seconde avant l'arrivée du PROCHAIN point jaune
+    final double totalLatencyToNextFix =
+        _fixAgeS + _procS + _renderS + _lastGpsIntervalSeconds;
+
+    // Prise en compte de l'accélération mesurée (accéléromètre)
+    // UNIQUEMENT en cas de vrai freinage ou accélération franche confirmée
+    final double aLong = (accelDetector.hasAxis &&
+            (accelDetector.isBraking || accelDetector.isAccelerating))
+        ? accelDetector.longitudinalAccel.clamp(-4.0, 4.0)
+        : 0.0;
+
+    final double lookaheadDist = isStationary
+        ? 0.0
+        : _distanceWithAccel(_vehicleSpeedMps, aLong, totalLatencyToNextFix)
+            .clamp(0.0, 100.0);
+
+    // 3. Aimant d'arrivée : si on est à moins de 8m du point final de l'itinéraire
+    final LatLng finalPoint = routePolyline.last;
+    final double distToFinal = Geolocator.distanceBetween(
+      rawPos.latitude,
+      rawPos.longitude,
+      finalPoint.latitude,
+      finalPoint.longitude,
+    );
+    if (distToFinal < 8.0) {
+      _targetPos = finalPoint;
+      return;
+    }
+
+    // 4. Le point bleu est calculé ICI et ne bougera plus jusqu'au prochain GPS
+    _targetPos = _advanceAlongRoute(
+        _snappedGpsPos!, lookaheadDist, routePolyline, gpsIndex);
+  }
+
+  /// Réception GPS (appelé ~1 fois par seconde)
+  void updateRealPosition(
+    Position rawPos, {
+    bool isWalkingMode = false,
+    List<LatLng>? routePolyline,
+  }) {
+    final Position? oldPos = lastRealPos;
     _previousPreviousRawGps = _previousRawGps;
     _previousRawGps = _currentRawGps;
     _currentRawGps = rawPos;
     lastRealPos = rawPos;
-
     _isWalking = isWalkingMode;
 
-    // ═══ AJOUT : mémorise la précision du fix pour le filtre qualité ═══
     _lastRawAccuracy = (rawPos.accuracy.isNaN || rawPos.accuracy.isInfinite)
-        ? 999.0
+        ? 20.0
         : rawPos.accuracy;
 
-    final DateTime now = rawPos.timestamp;
+    final DateTime now = DateTime.now();
     double dt = 1.0;
-
     if (_lastGpsUpdateTime != null) {
-      dt = now.difference(_lastGpsUpdateTime!).inMilliseconds / 1000.0;
-      // CORRIGÉ : on clamp le vrai intervalle au lieu de le remplacer par une
-      // valeur fixe arbitraire de 1.0s. Un dt fixe faussait le calcul de
-      // gpsDeceleration (ligne _vehicleSpeedMps / dt plus bas) et pouvait
-      // déclencher un faux freinage brusque si le vrai dt était très petit.
-      dt = dt.clamp(0.1, 5.0);
+      dt = (now.difference(_lastGpsUpdateTime!).inMilliseconds / 1000.0)
+          .clamp(0.2, 3.0);
     }
-
     _lastGpsUpdateTime = now;
     _lastGpsIntervalSeconds = dt;
 
-    // Utilise aussi l'intervalle réel mesuré si le timestamp GPS est bizarre.
-    if (_measuredIntervalSeconds > 0.25) {
-      if (_lastGpsIntervalSeconds < 0.05 || _lastGpsIntervalSeconds > 3.0) {
-        _lastGpsIntervalSeconds = _measuredIntervalSeconds;
-      } else {
-        _lastGpsIntervalSeconds =
-            (_lastGpsIntervalSeconds * 0.6) + (_measuredIntervalSeconds * 0.4);
-      }
-    }
-
-    double vInst = rawPos.speed;
-
-    // Fallback si la vitesse native est invalide
-    if ((vInst <= 0.0 || vInst == 1.0) && oldLastRealPos != null) {
-      final double d = Geolocator.distanceBetween(
-        oldLastRealPos.latitude,
-        oldLastRealPos.longitude,
+    // Vitesse calculée directement depuis la distance réelle entre les 2 derniers points GPS
+    double speedFromDist = 0.0;
+    if (oldPos != null && dt > 0.1) {
+      final double dist = Geolocator.distanceBetween(
+        oldPos.latitude,
+        oldPos.longitude,
         rawPos.latitude,
         rawPos.longitude,
       );
 
-      final double dtPos =
-          rawPos.timestamp.difference(oldLastRealPos.timestamp).inMilliseconds /
-              1000.0;
-
-      if (dtPos > 0.05) vInst = d / dtPos;
-    }
-
-    if (vInst.isNaN || vInst.isInfinite) vInst = 0.0;
-    vInst = _clamp(vInst, 0.0, 55.0);
-
-    _previousVehicleSpeedMps = _vehicleSpeedMps;
-
-    // ═══ AJOUT : rafraîchit l'accéléromètre AVANT de lisser la vitesse ═══
-    // Pour combiner correctement position/vitesse GPS et accéléromètre, on a
-    // besoin de savoir "est-ce qu'on est déjà en train de freiner/accélérer
-    // fort" avant de calculer le lissage de _vehicleSpeedMps ci-dessous.
-    _refreshAccelFusion();
-
-    // ═══ AJOUT : lissage ADAPTATIF de la vitesse (au lieu d'un poids fixe) ═══
-    // Avec un lissage fixe (45/55), _vehicleSpeedMps met plusieurs cycles à
-    // "rattraper" une vraie décélération brutale : pendant ce temps, la
-    // prédiction (point bleu) continue d'avancer avec une vitesse surestimée
-    // → elle part trop loin en avant lors d'un freinage d'un coup.
-    // On donne donc plus de poids à la mesure instantanée (vInst) dès que
-    // l'accéléromètre OU le delta GPS brut suggèrent un freinage/accél en
-    // cours, ce qui fait chuter _vehicleSpeedMps aussi vite que la réalité.
-    // 🔧 PRIORITÉ À L'ACCÉLÉROMÈTRE : il tourne à 60Hz et réagit quasi
-    // instantanément à un vrai freinage/redémarrage, alors que le GPS ne se
-    // met à jour qu'~1x/sec et est bruité à basse vitesse (vélo). On lui
-    // fait donc confiance en premier ; le delta GPS (rawInstantDecel) ne
-    // sert que de solution de secours quand l'accéléromètre ne détecte
-    // rien (ex: freinage très progressif, capteur indisponible).
-    // Calcul de la décélération réelle basée sur le GPS (le seul qui connaît le sens)
-    final double rawInstantDecel =
-        dt > 0.1 ? (_previousVehicleSpeedMps - vInst) / dt : 0.0;
-
-    // VRAIE logique : On freine SI la vitesse GPS chute ET que l'accéléromètre sent un choc
-    final bool likelyBraking = rawInstantDecel > 1.0 && accelDetector.isBraking;
-    // On accélère SI la vitesse GPS monte (ou si arrêt) ET que l'accéléromètre sent un choc
-    final bool likelyAccelerating =
-        (rawInstantDecel < -1.0 || _vehicleSpeedMps <= 0.05) &&
-            accelDetector.isBraking;
-
-    double speedSmoothing = 0.55;
-
-    if (likelyBraking) {
-      speedSmoothing = 0.90; // Confiance maximale à la chute de vitesse GPS
-    } else if (likelyAccelerating) {
-      speedSmoothing = 0.85; // Confiance maximale à la reprise
-    } else if (vInst < 0.5 && _vehicleSpeedMps > 1.0) {
-      // Sécurité : si le GPS dit 0 mais qu'on avançait, on freine fort
-      speedSmoothing = 0.95;
-    }
-
-    // 🔧 CORRECTION DU KICKSTART (Feu vert)
-    if (_vehicleSpeedMps <= 0.05) {
-      if (likelyAccelerating) {
-        _vehicleSpeedMps = 1.2; // Force un démarrage immédiat à ~4.3 km/h
+      // ─── FILTRE ANTI-SAUT ABERRANT (Glitch GPS en ville / Réflexion satellite) ───
+      // Si le saut de distance implique une vitesse démesurée et que la précision est dégradée (> 25m)
+      final double maxPhysicalDistance =
+          (_vehicleSpeedMps * dt) + (isWalkingMode ? 5.0 : 18.0) * dt;
+      if (dist > maxPhysicalDistance && _lastRawAccuracy > 25.0) {
+        speedFromDist = _vehicleSpeedMps; // Ignore le pic erratique et garde la vitesse fluide
       } else {
-        _vehicleSpeedMps = vInst; // Reste à 0 si pas de mouvement
+        speedFromDist = dist / dt;
       }
-    } else {
-      _vehicleSpeedMps = (_vehicleSpeedMps * (1.0 - speedSmoothing)) +
-          (vInst * speedSmoothing);
     }
 
-    // ═══════════════════════════════════════════════════
-    // 🛑 DÉTECTION FREINAGE : SPIKE GPS (1 Hz)
-    // ═══════════════════════════════════════════════════
-    // Le calcul précis de decel/fusion/decay est fait à chaque frame
-    // (60fps) dans predictNextPosition() via _refreshAccelFusion() et
-    // _applyBrakingFusion(), pour une réactivité et une décroissance
-    // beaucoup plus fluides que si tout n'était mis à jour qu'1x/sec.
-    double gpsDeceleration = 0.0;
-    if (dt > 0.1) {
-      gpsDeceleration = (_previousVehicleSpeedMps - _vehicleSpeedMps) / dt;
-    }
-    if (gpsDeceleration > _hardBrakeDecel) {
-      _gpsBrakeIntensity = _clamp(
-        (gpsDeceleration - _hardBrakeDecel) / 3.5,
-        0.35,
-        1.0,
-      );
-    } else {
-      _gpsBrakeIntensity = 0.0;
+    // Si la distance réelle entre les points GPS consécutifs indique une vitesse supérieure
+    // (ex: vitesse Doppler sous-estimée par le chipset GPS), on s'aligne sur la réalité de la carte
+    double vInst = rawPos.speed;
+    if (vInst <= 0.0 || (speedFromDist > 1.0 && speedFromDist > vInst)) {
+      vInst = speedFromDist > 0 ? speedFromDist : vInst;
     }
 
-    // Rafraîchit à nouveau l'accéléromètre (au cas où il aurait changé
-    // pendant les calculs ci-dessus) + applique la fusion GPS+accéléro.
-    _refreshAccelFusion();
-    _applyBrakingFusion(dt);
+    if (vInst.isNaN || vInst.isInfinite || vInst < 0) vInst = 0.0;
 
-    // ── DÉTECTION D'ARRÊT CONFIRMÉ (AJOUT) ──
+    // Garde-fou d'accélération maximale réaliste par fix GPS (évite les téléportations)
+    if (_vehicleSpeedMps > 0.5 &&
+        (vInst - _vehicleSpeedMps) > 15.0 &&
+        _lastRawAccuracy > 20.0) {
+      vInst = _vehicleSpeedMps + 5.0; // Augmentation progressive au lieu d'un bond instantané
+    }
+    vInst = vInst.clamp(0.0, 70.0);
+
+    accelDetector.setWalkingMode(isWalkingMode);
+    accelDetector.onGpsFix(
+      speedMps: vInst,
+      headingDeg: (!rawPos.heading.isNaN && rawPos.heading >= 0)
+          ? rawPos.heading
+          : null,
+      time: now,
+    );
+
     _lastRawSpeedMps = vInst;
-    final double stopThresh =
-        _isWalking ? _walkingStopSpeed : _vehicleStopSpeed;
-    final bool instantStopped =
-        vInst < stopThresh && _vehicleSpeedMps < stopThresh;
 
-    if (instantStopped) {
+    // Pas de retard d'amortissement : mise à jour réactive
+    if (_vehicleSpeedMps <= 0.2 || (vInst - _vehicleSpeedMps).abs() > 2.5) {
+      _vehicleSpeedMps = vInst;
+      _arrowSpeedMps = vInst;
+    } else {
+      _vehicleSpeedMps = (_vehicleSpeedMps * 0.15) + (vInst * 0.85);
+    }
+
+    final double stopThresh = isWalkingMode ? 0.2 : 0.35;
+    if (vInst < stopThresh && _vehicleSpeedMps < stopThresh) {
       _stoppedForSeconds += dt;
+      _vehicleSpeedMps = 0.0;
     } else {
       _stoppedForSeconds = 0.0;
     }
 
+    // Initialisation immédiate
     if (simulatedPos == null) {
       simulatedPos = LatLng(rawPos.latitude, rawPos.longitude);
+      _arrowSpeedMps = _vehicleSpeedMps;
     }
 
-    _isNewGpsPoint = true;
-  }
-
-  /// 🔧 Relit l'état accéléromètre (mis à jour en continu à 60Hz par son
-  /// propre stream) et convertit en intensité 0→1. Appelé chaque frame
-  /// pour ne jamais avoir plus d'un tick de retard (~16ms).
-  void _refreshAccelFusion() {
-    _accelBrakeActive = accelDetector.isBraking;
-    if (_accelBrakeActive) {
-      final double maxExpected = _isWalking ? 4.0 : 9.0;
-      _accelBrakeIntensity = _clamp(
-        accelDetector.deceleration / maxExpected,
-        0.0,
-        1.0,
-      );
-    } else {
-      _accelBrakeIntensity = 0.0;
-    }
-
-    // Symétrique : accélération franche → utilisé pour laisser la flèche
-    // repartir plus vite (ex: feu qui passe au vert, dépassement).
-    if (accelDetector.isAccelerating) {
-      final double maxExpectedAccel = _isWalking ? 3.0 : 6.0;
-      _accelBoostIntensity = _clamp(
-        accelDetector.acceleration / maxExpectedAccel,
-        0.0,
-        1.0,
-      );
-    } else {
-      _accelBoostIntensity = 0.0;
+    // Le point bleu est calculé immédiatement à l'arrivée du fix GPS
+    if (routePolyline != null && routePolyline.length >= 2) {
+      _computeFixedTargetPoint(routePolyline);
     }
   }
 
-  /// 🔧 FUSION GPS + ACCÉLÉROMÈTRE : prend le MAX des deux sources, avec
-  /// une décroissance douce répartie sur chaque frame (au lieu d'un seul
-  /// gros pas 1x/sec) → beaucoup plus fluide visuellement.
-  /// 🔧 FUSION GPS + ACCÉLÉROMÈTRE — PRIORITÉ À L'ACCÉLÉROMÈTRE : il tourne
-  /// à 60Hz et détecte un vrai freinage/redémarrage quasi instantanément,
-  /// alors que le GPS ne se met à jour qu'~1x/sec et est souvent trop
-  /// bruité à basse vitesse (vélo) pour être réactif. L'accéléromètre est
-  /// donc la source de vérité principale ; le GPS ne sert que de solution
-  /// de secours quand l'accéléromètre ne détecte rien (freinage trop
-  /// progressif pour être vu par l'accéléromètre, ou capteur indisponible).
-  void _applyBrakingFusion(double dt) {
-    final double fusedBrake =
-        _accelBrakeIntensity > 0.0 ? _accelBrakeIntensity : _gpsBrakeIntensity;
-
-    if (fusedBrake > 0.0) {
-      _brakingIntensity = math.max(_brakingIntensity, fusedBrake);
-    } else {
-      _brakingIntensity = math.max(0.0, _brakingIntensity - (dt * 0.65));
-    }
-  }
-
-  /// ═══ AJOUT : distance de projection KINÉMATIQUE ═══
-  /// Calcule combien de mètres parcourir "en avant" sur la route pendant
-  /// [t] secondes, en partant de la vitesse [v0], mais en tenant compte de
-  /// la décélération ou accélération EN COURS (issue de la fusion
-  /// GPS + accéléromètre : _brakingIntensity / _accelBoostIntensity).
-  ///
-  /// Physique de base (mouvement uniformément décéléré/accéléré) :
-  ///   d(t) = v0·t − ½·a·t²      (a > 0 = on ralentit, a < 0 = on accélère)
-  ///
-  /// Sans ça, la projection utilisait d = v0·t (vitesse constante), ce qui
-  /// surestime systématiquement la distance dès qu'on freine : la cible
-  /// (point bleu) part alors "trop en avant" pendant un freinage brusque,
-  /// avant que _vehicleSpeedMps n'ait eu le temps de redescendre.
-  double _kinematicLookaheadDistance(double v0, double t) {
-    if (t <= 0.0 || v0 <= 0.0) return 0.0;
-
-    double a = 0.0; // a > 0 : décélération. a < 0 : accélération.
-
-    if (_brakingIntensity > 0.0) {
-      // Décélération de référence à pleine intensité (m/s²), plausible pour
-      // un freinage franc en voiture / un arrêt net à pied.
-      final double maxDecelRef = _isWalking ? 3.0 : 7.0;
-      a = _brakingIntensity * maxDecelRef;
-    } else if (_accelBoostIntensity > 0.0) {
-      final double maxAccelRef = _isWalking ? 1.5 : 3.5;
-      a = -_accelBoostIntensity * maxAccelRef;
-    }
-
-    // Temps auquel la vitesse atteindrait 0 avec cette décélération : au-delà,
-    // le véhicule est arrêté, donc il ne parcourt plus de distance.
-    double effectiveT = t;
-    if (a > 0.0) {
-      final double tStop = v0 / a;
-      if (tStop < effectiveT) effectiveT = tStop;
-    }
-
-    final double d = (v0 * effectiveT) - (0.5 * a * effectiveT * effectiveT);
-
-    // Jamais négatif : ce calcul ne fait jamais reculer la cible.
-    return d.isNaN || d.isInfinite
-        ? (v0 * t).clamp(0.0, double.infinity)
-        : math.max(0.0, d);
-  }
-
-  /// 🚀 MOTEUR DE PROJECTION (60 FPS)
-  /// Le point BLEU n'est recalculé QUE lorsqu'un nouveau point GPS arrive.
-  /// La flèche se déplace vers le point bleu en ~1s (intervalle GPS),
-  /// et CONTINUE sur sa lancée si elle l'atteint avant le prochain GPS.
+  /// Moteur cinématique appelé à 60 FPS
   LatLng? predictNextPosition(List<LatLng> routePolyline) {
-    if (lastRealPos == null || _currentRawGps == null || simulatedPos == null) {
-      return null;
+    if (lastRealPos == null ||
+        simulatedPos == null ||
+        routePolyline.length < 2) {
+      return simulatedPos;
+    }
+
+    // Si le point bleu n'a pas encore été calculé
+    if (_targetPos == null) {
+      _computeFixedTargetPoint(routePolyline);
+      if (_targetPos == null) return simulatedPos;
     }
 
     final DateTime now = DateTime.now();
     double dt = now.difference(_lastPredictTime ?? now).inMilliseconds / 1000.0;
     _lastPredictTime = now;
-    // Bridage anti-saccade : pas de saut géant d'un coup
-    if (dt <= 0.0 || dt > 0.033) dt = 0.016;
+    dt = dt.clamp(0.005, 0.05); // Borne à 60-120 FPS
 
-    // Fusion GPS + accéléromètre (fraîchie à chaque frame)
-    _refreshAccelFusion();
-    _applyBrakingFusion(dt);
+    // ─── AMÉLIORATION 1 & 2 : ACCÉLÉROMÈTRE DYNAMIQUE À 60 FPS (Intra-seconde) ───
+    final double aLong = (accelDetector.hasAxis &&
+            (accelDetector.isBraking || accelDetector.isAccelerating))
+        ? accelDetector.longitudinalAccel.clamp(-4.0, 4.0)
+        : 0.0;
 
-    if (routePolyline.length < 2) {
-      isBackwardRecovery = false;
-      return simulatedPos;
+    if (accelDetector.isAccelerating && aLong > 0.3) {
+      // 1. Décollage immédiat au feu vert dès le toucher de pédale (sans attendre le GPS)
+      _stoppedForSeconds = 0.0;
+      final double speedBoost = aLong * dt;
+      _vehicleSpeedMps = math.max(_vehicleSpeedMps, 0.5) + speedBoost;
+      _vehicleSpeedMps = _vehicleSpeedMps.clamp(0.0, 70.0);
+      _arrowSpeedMps = math.max(_arrowSpeedMps, _vehicleSpeedMps);
+    } else if (accelDetector.isBraking && aLong < -0.3) {
+      // 2. Freinage d'urgence immédiat : réduit instantanément la vitesse de la flèche
+      final double brakeDecel = aLong.abs() * dt;
+      _vehicleSpeedMps = math.max(0.0, _vehicleSpeedMps - brakeDecel);
+      _arrowSpeedMps = math.max(0.0, _arrowSpeedMps - brakeDecel * 1.3);
     }
 
-    // ════════════════════════════════════════════════════════════
-    // 1. NOUVEAU POINT GPS → on recalcule le POINT BLEU (projection)
-    //    C'est le SEUL moment où le point bleu bouge.
-    // ════════════════════════════════════════════════════════════
-    if (_isNewGpsPoint) {
-      _isNewGpsPoint = false;
-      _computeBlueTarget(routePolyline);
-    }
+    // 1. Trouver l'index actuel de la flèche
+    final int simIndex = _findRouteIndex(
+      simulatedPos!,
+      routePolyline,
+      _lastSimRouteIndex,
+      maxWindowMeters: 50.0,
+    );
+    _lastSimRouteIndex = simIndex;
 
-    // Pas encore de point bleu calculé → on ne bouge pas
-    if (_targetPos == null) {
-      return simulatedPos;
-    }
+    int targetIndex = _findRouteIndex(
+      _targetPos!,
+      routePolyline,
+      simIndex,
+      maxWindowMeters: 60.0,
+    );
 
-    // ════════════════════════════════════════════════════════════
-    // 2. DÉPLACEMENT DE LA FLÈCHE vers le point bleu.
-    //    Vitesse cible = calculée pour atteindre le bleu en ~1s.
-    //    Si la flèche dépasse le bleu (GPS en retard), elle CONTINUE
-    //    à la même vitesse jusqu'à la prochaine projection.
-    // ════════════════════════════════════════════════════════════
-    double targetSpeed = _arrowTargetSpeed;
+    // ─── AIMANT D'ARRIVÉE SUR LA DESTINATION FINALE (< 8m) ───
+    final LatLng finalDestination = routePolyline.last;
+    final double distToArrival = Geolocator.distanceBetween(
+      simulatedPos!.latitude,
+      simulatedPos!.longitude,
+      finalDestination.latitude,
+      finalDestination.longitude,
+    );
 
-    // Sécurité : si le GPS est muet depuis trop longtemps, on ralentit
-    // progressivement la flèche pour ne pas partir à l'infini.
-    if (_lastGpsUpdateTime != null) {
-      final double gpsAge =
-          now.difference(_lastGpsUpdateTime!).inMilliseconds / 1000.0;
-      if (gpsAge > 3.0) {
-        final double decay = _clamp(1.0 - ((gpsAge - 3.0) / 5.0), 0.0, 1.0);
-        targetSpeed *= decay;
-      }
-    }
-
-    // À l'arrêt confirmé et collé au bleu → stop complet
-    if (_lastIsStopped && _targetRouteIndex >= 0) {
-      final double distToBlue = _signedRouteDistance(
-        simulatedPos!,
-        _lastSimRouteIndex,
-        _targetPos!,
-        _targetRouteIndex,
-        routePolyline,
-      ).abs();
-      if (distToBlue < 0.75) {
-        targetSpeed = 0.0;
-      }
-    }
-
-    // Lissage accélération / freinage (pas d'à-coups)
-    double maxAccel = _isWalking ? 2.2 : 4.5;
-    double maxDecel = _isWalking ? 3.8 : 8.0;
-    if (_brakingIntensity > 0.5) maxDecel *= 1.35;
-    if (_accelBoostIntensity > 0.5) maxAccel *= 1.35;
-
-    double delta = targetSpeed - _arrowSpeedMps;
-    final double maxDelta = delta >= 0.0 ? maxAccel * dt : maxDecel * dt;
-    if (delta > maxDelta) delta = maxDelta;
-    if (delta < -maxDelta) delta = -maxDelta;
-    _arrowSpeedMps += delta;
-
-    // Déplacement le long de l'itinéraire
-    final double moveDistance = _arrowSpeedMps * dt;
-    isBackwardRecovery = moveDistance < -0.02;
-
-    if (moveDistance.abs() > 0.008) {
-      // 🔧 Cap GPS utilisé pour la pénalité d'angle UNIQUEMENT > ~3 km/h.
-      final double? simHeading =
-          (_arrowSpeedMps * 3.6) > 3.0 ? lastRealPos!.heading : null;
-
-      int simIndex = _findRouteIndex(
-        simulatedPos!,
-        simHeading,
-        routePolyline,
-        _lastSimRouteIndex,
-        maxAheadMeters: 30.0,
-        maxBehindMeters: 20.0,
-        hysteresisMeters: 2.0,
+    if (distToArrival < 8.0 && simIndex >= routePolyline.length - 4) {
+      final double snapFactor = (dt * 3.5).clamp(0.05, 1.0);
+      simulatedPos = LatLng(
+        simulatedPos!.latitude +
+            (finalDestination.latitude - simulatedPos!.latitude) * snapFactor,
+        simulatedPos!.longitude +
+            (finalDestination.longitude - simulatedPos!.longitude) * snapFactor,
       );
+      _arrowSpeedMps = _arrowSpeedMps * 0.75;
+      if (distToArrival < 0.8) {
+        simulatedPos = finalDestination;
+        _arrowSpeedMps = 0.0;
+        _vehicleSpeedMps = 0.0;
+      }
+      return simulatedPos;
+    }
 
-      // 🔧 GARDE ANTI-TÉLÉPORTATION : si le segment trouvé implique de
-      // re-projeter la flèche loin d'elle-même (coin de virage clampé),
-      // on reste sur le segment courant.
-      final int maxSeg = routePolyline.length - 2;
-      final int curIdx = _lastSimRouteIndex.clamp(0, maxSeg);
-      final LatLng projNew = _projectOnSegment(
-          simulatedPos!, routePolyline[simIndex], routePolyline[simIndex + 1]);
-      final LatLng projCur = _projectOnSegment(
-          simulatedPos!, routePolyline[curIdx], routePolyline[curIdx + 1]);
-      final double dNew = Geolocator.distanceBetween(simulatedPos!.latitude,
-          simulatedPos!.longitude, projNew.latitude, projNew.longitude);
-      final double dCur = Geolocator.distanceBetween(simulatedPos!.latitude,
-          simulatedPos!.longitude, projCur.latitude, projCur.longitude);
-      if (dNew > dCur + 5.0) {
-        simIndex = curIdx;
+    // ─── AMÉLIORATION 3 : MODE TUNNEL & SOUS LES PONTS (Dead Reckoning) ───
+    final double elapsedSinceFix = _lastGpsUpdateTime == null
+        ? 0.0
+        : (now.difference(_lastGpsUpdateTime!).inMilliseconds / 1000.0);
+
+    final bool deadReckoningActive =
+        elapsedSinceFix > (_lastGpsIntervalSeconds * 1.25) &&
+            elapsedSinceFix < 15.0 &&
+            _vehicleSpeedMps > 0.4 &&
+            !isStationary;
+
+    if (deadReckoningActive) {
+      // Dans le tunnel, on continue de propulser le Point Bleu le long de l'itinéraire à la vitesse estimée
+      final double deadReckoningAdvance = _vehicleSpeedMps * dt;
+      _targetPos = _advanceAlongRoute(
+        _targetPos!,
+        deadReckoningAdvance,
+        routePolyline,
+        targetIndex,
+      );
+      targetIndex = _findRouteIndex(
+        _targetPos!,
+        routePolyline,
+        simIndex,
+        maxWindowMeters: 60.0,
+      );
+    }
+    // 2. Distance signée le long de la route entre la flèche et le Point Bleu
+    // (> 0 : la flèche est derrière le Point Bleu, <= 0 : la flèche a dépassé le Point Bleu)
+    final double distToTarget = _signedRouteDistance(
+      simulatedPos!,
+      simIndex,
+      _targetPos!,
+      targetIndex,
+      routePolyline,
+    );
+
+    // 3. Ajustement de la vitesse de la flèche
+    if (isStationary) {
+      // À l'arrêt : la flèche s'immobilise et ne recule JAMAIS
+      if (distToTarget <= 0.3) {
+        _arrowSpeedMps = 0.0;
+      } else {
+        // Si elle avait un retard minime, elle finit de glisser très doucement vers l'avant
+        _arrowSpeedMps = (distToTarget / 0.8).clamp(0.0, 1.0);
+      }
+    } else {
+      double targetSpeed;
+
+      if (distToTarget <= 0.0) {
+        // 🚀 La flèche a atteint ou DÉPASSÉ le Point Bleu :
+        // Le Point Bleu reste fixe à sa place, et la flèche continue d'avancer
+        // droit devant à la vitesse du véhicule sans ralentir ni s'arrêter !
+        targetSpeed = math.max(_vehicleSpeedMps, _arrowSpeedMps);
+      } else {
+        // La flèche est encore derrière le Point Bleu : elle avance pour le rejoindre
+        final double timeRemaining = deadReckoningActive
+            ? 0.5
+            : (_lastGpsIntervalSeconds - elapsedSinceFix)
+                .clamp(0.15, _lastGpsIntervalSeconds);
+
+        // Si le retard dépasse 12 mètres (ex: démarrage brusque), saut amorti
+        if (distToTarget > 12.0) {
+          simulatedPos = _advanceAlongRoute(
+            simulatedPos!,
+            distToTarget * 0.5,
+            routePolyline,
+            simIndex,
+          );
+        }
+
+        targetSpeed = distToTarget / timeRemaining;
       }
 
-      _lastSimRouteIndex = simIndex;
-      simulatedPos = _moveAlongRouteSigned(
+      targetSpeed = targetSpeed.clamp(0.0, _vehicleSpeedMps * 2.2 + 2.0);
+
+      final double maxAcc = isWalking ? 8.0 : 16.0;
+      final double maxSpeedChange = maxAcc * dt;
+      final double speedDiff = targetSpeed - _arrowSpeedMps;
+      _arrowSpeedMps += speedDiff.clamp(-maxSpeedChange, maxSpeedChange);
+      _arrowSpeedMps = _arrowSpeedMps.clamp(0.0, 60.0);
+    }
+
+    // 4. Avancement continu de la flèche
+    final double moveDistance = _arrowSpeedMps * dt;
+    if (moveDistance.abs() > 0.0001) {
+      simulatedPos = _advanceAlongRoute(
         simulatedPos!,
         moveDistance,
         routePolyline,
@@ -25553,550 +26141,202 @@ class KinematicFilter {
     return simulatedPos;
   }
 
-  /// 🎯 Calcule le POINT BLEU (projection) à partir du nouveau point GPS.
-  /// Appelée UNIQUEMENT quand _isNewGpsPoint == true.
-  /// Détermine aussi la vitesse cible de la flèche pour atteindre ce bleu
-  /// dans le temps d'un intervalle GPS (~1s).
-  void _computeBlueTarget(List<LatLng> routePolyline) {
-    final LatLng rawPos =
-        LatLng(_currentRawGps!.latitude, _currentRawGps!.longitude);
-
-    final double stopThreshold =
-        _isWalking ? _walkingStopSpeed : _vehicleStopSpeed;
-    final bool isStopped =
-        _vehicleSpeedMps < stopThreshold && _lastRawSpeedMps < stopThreshold;
-
-    // 🔧 CORRECTIF SAUT AU VIRAGE : à l'arrêt ou < ~3 km/h le cap GPS est du
-    // bruit. L'ancien 0.0 biaisait vers le NORD (segments d'avant-virage) et
-    // projetait le bleu sur le coin (projection clampée). null = aucune pénalité.
-    final double? heading =
-        (isStopped || _vehicleSpeedMps < 0.85) ? null : lastRealPos!.heading;
-    final int hint = lastRouteIndex < 0 ? 0 : lastRouteIndex;
-
-    // Budget de déplacement réaliste depuis le dernier fix
-    final double latencyBudget = isStopped ? 0.0 : totalLatencySeconds;
-    final double moveBudget =
-        _vehicleSpeedMps * (_lastGpsIntervalSeconds + latencyBudget);
-    final double maxAhead = moveBudget + (_isWalking ? 6.0 : 20.0);
-    final double maxBehind = _isWalking ? 12.0 : 35.0;
-
-    // 🛑 Verrou anti-jitter à l'arrêt : si le déplacement brut est inférieur au bruit GPS,
-    // on garde le point bleu actuel sans recalculer (évite les sauts d'avant en arrière).
-    if (isStopped && _lastConfirmedSnappedPos != null) {
-      final double drift = Geolocator.distanceBetween(
-        rawPos.latitude,
-        rawPos.longitude,
-        _lastConfirmedSnappedPos!.latitude,
-        _lastConfirmedSnappedPos!.longitude,
-      );
-      final double noiseFloor =
-          _isWalking ? _gpsNoiseFloorWalking : _gpsNoiseFloorVehicle;
-      if (drift < noiseFloor * 2.0) {
-        return; // on ignore ce fix bruité, pas de recalcul de cible
-      }
-    }
-
-    int rawIndex = _findRouteIndex(
-      rawPos,
-      heading,
-      routePolyline,
-      hint,
-      maxAheadMeters: maxAhead,
-      maxBehindMeters: maxBehind,
-      hysteresisMeters: 3.0,
-    );
-
-    final LatLng candidateSnapped = _projectOnSegment(
-      rawPos,
-      routePolyline[rawIndex],
-      routePolyline[rawIndex + 1],
-    );
-
-    // ════════════════════════════════════════════════════════════
-    // FILTRE QUALITÉ / COHÉRENCE GPS (anti-téléportation) — conservé
-    // ════════════════════════════════════════════════════════════
-    final double maxAccuracyAllowed =
-        _isWalking ? _maxAccuracyWalking : _maxAccuracyVehicle;
-    // Note: degradedAccuracy supprimée — le rejet saut arrière ne conditionne
-    // plus à la précision (cf. correctif virage).
-    final double maxPlausibleSpeed =
-        _isWalking ? _maxPlausibleSpeedWalking : _maxPlausibleSpeedVehicle;
-
-    bool acceptFix = true;
-
-    // 1. Précision GPS trop mauvaise → fix suspect
-    if (_lastRawAccuracy > maxAccuracyAllowed) {
-      acceptFix = false;
-    }
-
-    // 2. Saut le long de l'itinéraire physiquement impossible
-    if (acceptFix &&
-        _lastConfirmedSnappedPos != null &&
-        _lastConfirmedRouteIndex >= 0) {
-      final double jumpSigned = _signedRouteDistance(
-        _lastConfirmedSnappedPos!,
-        _lastConfirmedRouteIndex,
-        candidateSnapped,
-        rawIndex,
-        routePolyline,
-      );
-      final double elapsed = _lastGpsIntervalSeconds.clamp(0.2, 5.0);
-      final double margin = _isWalking ? 4.0 : 12.0;
-      final double limitAhead = (maxPlausibleSpeed * elapsed) + margin;
-      final double limitBehind = limitAhead + (_isWalking ? 10.0 : 30.0);
-      // 🔧 Un saut ARRIÈRE est toujours suspect (mauvais segment accroché au
-      // virage) → rejet même si la précision GPS est bonne.
-      if (jumpSigned > limitAhead || jumpSigned < -limitBehind) {
-        acceptFix = false;
-      }
-    }
-
-    // 3. Filet anti-blocage : trop de rejets consécutifs → on accepte
-    if (!acceptFix) {
-      _consecutiveRejectedFixes++;
-      if (_consecutiveRejectedFixes > _maxConsecutiveRejectedFixes) {
-        acceptFix = true;
-      }
-    }
-
-    // Fix rejeté : on GARDE l'ancien point bleu.
-    // La flèche continue sur sa lancée (comportement demandé).
-    if (!acceptFix) {
-      return;
-    }
-
-    _consecutiveRejectedFixes = 0;
-    _lastGoodGpsFixTime = DateTime.now();
-    lastRouteIndex = rawIndex;
-    _snappedGpsIndex = rawIndex;
-    _snappedGpsPos = candidateSnapped;
-
-    // ════════════════════════════════════════════════════════════
-    // PLANCHER DE BRUIT GPS À L'ARRÊT (anti-rampement ronds-points)
-    // ════════════════════════════════════════════════════════════
-    if (isStopped &&
-        _lastConfirmedSnappedPos != null &&
-        _lastConfirmedRouteIndex >= 0) {
-      final double noiseFloor =
-          _isWalking ? _gpsNoiseFloorWalking : _gpsNoiseFloorVehicle;
-      final double drift = _signedRouteDistance(
-        _lastConfirmedSnappedPos!,
-        _lastConfirmedRouteIndex,
-        _snappedGpsPos!,
-        rawIndex,
-        routePolyline,
-      ).abs();
-      if (drift < noiseFloor) {
-        _snappedGpsPos = _lastConfirmedSnappedPos;
-        rawIndex = _lastConfirmedRouteIndex;
-        lastRouteIndex = rawIndex;
-        _snappedGpsIndex = rawIndex;
-      }
-    }
-
-    _lastConfirmedSnappedPos = _snappedGpsPos;
-    _lastConfirmedRouteIndex = lastRouteIndex;
-
-    // ════════════════════════════════════════════════════════════
-    // CALCUL DU POINT BLEU : GPS snappé + lookahead
-    // Le lookahead inclut la COMPENSATION DE LATENCE (captage +
-    // traitement + rendu) → le bleu est projeté plus loin pour
-    // absorber le retard d'affichage.
-    // ════════════════════════════════════════════════════════════
-    double lookahead;
-    if (isStopped) {
-      lookahead = 0.0;
-    } else {
-      lookahead = _brakingLookaheadSeconds +
-          (1.0 - _brakingIntensity) *
-              (_normalLookaheadSeconds - _brakingLookaheadSeconds);
-      // ⏱️ Compensation latence totale (fixAge + traitement + rendu)
-      lookahead += totalLatencySeconds;
-    }
-
-    final double lookaheadDistance =
-        _kinematicLookaheadDistance(_vehicleSpeedMps, lookahead);
-
-    // Cohérence bleu ↔ jaune : le bleu ne doit pas partir trop loin
-    final double maxCoherentGap =
-        (_vehicleSpeedMps * (_normalLookaheadSeconds + totalLatencySeconds)) +
-            (_isWalking ? 4.0 : 8.0);
-    final double coherentLookahead =
-        lookaheadDistance > maxCoherentGap ? maxCoherentGap : lookaheadDistance;
-
-    _targetPos = _advanceForwardAlongRoute(
-      _snappedGpsPos!,
-      coherentLookahead,
-      routePolyline,
-      rawIndex,
-    );
-    // À l'arrêt, le bleu = le point jaune (pas d'anticipation)
-    if (isStopped) {
-      _targetPos = _snappedGpsPos;
-    }
-
-    _targetRouteIndex = _findRouteIndex(
-      _targetPos!,
-      heading,
-      routePolyline,
-      rawIndex,
-      maxAheadMeters: 150.0,
-      maxBehindMeters: 40.0,
-    );
-    _targetUpdatedAt = DateTime.now();
-
-    // ════════════════════════════════════════════════════════════
-    // CALCUL DE LA VITESSE FLÈCHE en fonction de l'écart au bleu
-    // ════════════════════════════════════════════════════════════
-    _arrowAnchorPos = simulatedPos;
-    _arrowAnchorIndex = _findRouteIndex(
-      simulatedPos!,
-      heading,
-      routePolyline,
-      _lastSimRouteIndex,
-    );
-
-    // Distance signée flèche → bleu :
-    //   > 0 : le bleu est DEVANT la flèche (retard à rattraper)
-    //   < 0 : la flèche est DEVANT le bleu (dépassement)
-    _blueTravelDistance = _signedRouteDistance(
-      _arrowAnchorPos!,
-      _arrowAnchorIndex,
-      _targetPos!,
-      _targetRouteIndex,
-      routePolyline,
-    );
-
-    // Temps alloué = intervalle GPS (~1s)
-    _blueTravelTime = _lastGpsIntervalSeconds.clamp(0.4, 2.5).toDouble();
-
-    final double maxFwd = _isWalking ? 6.0 : 40.0;
-    final double maxRev = _isWalking ? _maxReverseWalking : _maxReverseVehicle;
-
-    if (isStopped) {
-      // À l'arrêt : rejoint doucement le bleu puis stoppe
-      _arrowTargetSpeed = _clamp(
-        _blueTravelDistance / 1.0,
-        -maxRev,
-        _isWalking ? 1.2 : 2.5,
-      );
-    } else if (_blueTravelDistance >= 0.0) {
-      // ── CAS NORMAL : bleu devant, flèche en retard ──
-      // Vitesse = distance / temps → elle rattrape le bleu en ~1s.
-      // Plus le retard est grand, plus elle accélère.
-      _arrowTargetSpeed = _blueTravelDistance / _blueTravelTime;
-      _arrowTargetSpeed = _clamp(_arrowTargetSpeed, 0.0, maxFwd);
-    } else {
-      // ── DÉPASSEMENT : la flèche est déjà devant le bleu ──
-      // Le timing n'étant jamais précis, on AUTORISE la flèche à
-      // dépasser le bleu : elle CONTINUE d'avancer à sa vitesse
-      // actuelle (sans reculer ni s'arrêter), jusqu'au prochain GPS
-      // qui recalculera un nouveau bleu plus loin.
-      _arrowTargetSpeed = _clamp(
-        _arrowSpeedMps,
-        _vehicleSpeedMps * 0.6,
-        maxFwd,
-      );
-    }
-
-    _lastIsStopped = isStopped;
-  }
-
-  double _clamp(double value, double min, double max) {
-    if (value.isNaN) return min;
-    if (value < min) return min;
-    if (value > max) return max;
-    return value;
+  double _distanceWithAccel(double v, double a, double h) {
+    if (a.abs() < 0.2) return v * h;
+    final double hh = a < 0 ? math.min(h, v / -a) : h;
+    return math.max(0.0, v * hh + 0.5 * a * hh * hh);
   }
 
   int _findRouteIndex(
     LatLng pos,
-    double? heading, // 🔧 nullable : null = AUCUNE pénalité d'angle
     List<LatLng> polyline,
     int hintIndex, {
-    double maxAheadMeters = double.infinity,
-    double maxBehindMeters = double.infinity,
-    double hysteresisMeters =
-        0.0, // 🔧 marge pour rester sur le segment courant
+    double maxWindowMeters = 50.0,
   }) {
     if (polyline.length < 2) return 0;
-    final bool useHeading =
-        heading != null && !heading.isNaN && !heading.isInfinite;
     final int maxSeg = polyline.length - 2;
     final int hint = hintIndex.clamp(0, maxSeg);
 
-    double segLen(int i) => Geolocator.distanceBetween(
-        polyline[i].latitude,
-        polyline[i].longitude,
-        polyline[i + 1].latitude,
-        polyline[i + 1].longitude);
-
     int start = hint;
-    double accBehind = 0.0;
-    while (start > 0 && accBehind < maxBehindMeters) {
-      accBehind += segLen(start - 1);
+    double distBehind = 0.0;
+    while (start > 0 && distBehind < maxWindowMeters) {
+      distBehind += Geolocator.distanceBetween(
+        polyline[start].latitude,
+        polyline[start].longitude,
+        polyline[start - 1].latitude,
+        polyline[start - 1].longitude,
+      );
       start--;
     }
+
     int end = hint;
-    double accAhead = 0.0;
-    while (end < maxSeg && accAhead < maxAheadMeters) {
-      accAhead += segLen(end);
+    double distAhead = 0.0;
+    while (end < maxSeg && distAhead < maxWindowMeters) {
+      distAhead += Geolocator.distanceBetween(
+        polyline[end].latitude,
+        polyline[end].longitude,
+        polyline[end + 1].latitude,
+        polyline[end + 1].longitude,
+      );
       end++;
     }
 
-    double scoreOf(int i) {
-      final LatLng proj = _projectOnSegment(pos, polyline[i], polyline[i + 1]);
-      double d = Geolocator.distanceBetween(
-          pos.latitude, pos.longitude, proj.latitude, proj.longitude);
-      if (useHeading) {
-        final double segBearing = Geolocator.bearingBetween(
-            polyline[i].latitude,
-            polyline[i].longitude,
-            polyline[i + 1].latitude,
-            polyline[i + 1].longitude);
-        double angleDiff = (segBearing - heading)
-            .abs(); // heading non-null garanti par useHeading
-        if (angleDiff > 180.0) angleDiff = 360.0 - angleDiff;
-        if (angleDiff > 100.0) {
-          d += 80.0;
-        } else if (angleDiff > 60.0) {
-          d += 25.0;
-        }
-      }
-      return d;
-    }
+    int bestIdx = hint;
+    double minDist = double.infinity;
 
-    int bestIndex = start;
-    double minScore = double.infinity;
     for (int i = start; i <= end; i++) {
-      final double s = scoreOf(i);
-      if (s < minScore) {
-        minScore = s;
-        bestIndex = i;
+      final LatLng proj = _projectOnSegment(pos, polyline[i], polyline[i + 1]);
+      final double d = Geolocator.distanceBetween(
+        pos.latitude,
+        pos.longitude,
+        proj.latitude,
+        proj.longitude,
+      );
+      if (d < minDist) {
+        minDist = d;
+        bestIdx = i;
       }
     }
-
-    // 🔧 HYSTÉRÉSIS : on ne quitte le segment courant que si un autre est
-    // nettement meilleur → plus de flip-flop au virage.
-    if (hysteresisMeters > 0.0 && bestIndex != hint) {
-      final double hintScore = scoreOf(hint);
-      if (hintScore - minScore < hysteresisMeters) {
-        bestIndex = hint;
-      }
-    }
-    return bestIndex;
+    return bestIdx;
   }
 
-  /// Retourne une distance signée le long de la route.
-  /// Positif si [to] est devant [from], négatif si [to] est derrière.
   double _signedRouteDistance(
     LatLng from,
-    int fromIndex,
+    int fromIdx,
     LatLng to,
-    int toIndex,
+    int toIdx,
     List<LatLng> polyline,
   ) {
     if (polyline.length < 2) return 0.0;
-
     final int maxSeg = polyline.length - 2;
-    fromIndex = fromIndex.clamp(0, maxSeg);
-    toIndex = toIndex.clamp(0, maxSeg);
+    fromIdx = fromIdx.clamp(0, maxSeg);
+    toIdx = toIdx.clamp(0, maxSeg);
 
-    if (fromIndex == toIndex) {
-      final double fromToNext = Geolocator.distanceBetween(
+    if (fromIdx == toIdx) {
+      final double dFrom = Geolocator.distanceBetween(
         from.latitude,
         from.longitude,
-        polyline[fromIndex + 1].latitude,
-        polyline[fromIndex + 1].longitude,
+        polyline[fromIdx + 1].latitude,
+        polyline[fromIdx + 1].longitude,
       );
-
-      final double toToNext = Geolocator.distanceBetween(
+      final double dTo = Geolocator.distanceBetween(
         to.latitude,
         to.longitude,
-        polyline[toIndex + 1].latitude,
-        polyline[toIndex + 1].longitude,
+        polyline[toIdx + 1].latitude,
+        polyline[toIdx + 1].longitude,
       );
-
-      return fromToNext - toToNext;
+      return dFrom - dTo;
     }
 
-    if (toIndex > fromIndex) {
-      double dist = Geolocator.distanceBetween(
+    if (toIdx > fromIdx) {
+      double total = Geolocator.distanceBetween(
         from.latitude,
         from.longitude,
-        polyline[fromIndex + 1].latitude,
-        polyline[fromIndex + 1].longitude,
+        polyline[fromIdx + 1].latitude,
+        polyline[fromIdx + 1].longitude,
       );
-
-      for (int i = fromIndex + 1; i < toIndex; i++) {
-        dist += Geolocator.distanceBetween(
+      for (int i = fromIdx + 1; i < toIdx; i++) {
+        total += Geolocator.distanceBetween(
           polyline[i].latitude,
           polyline[i].longitude,
           polyline[i + 1].latitude,
           polyline[i + 1].longitude,
         );
       }
-
-      dist += Geolocator.distanceBetween(
-        polyline[toIndex].latitude,
-        polyline[toIndex].longitude,
+      total += Geolocator.distanceBetween(
+        polyline[toIdx].latitude,
+        polyline[toIdx].longitude,
         to.latitude,
         to.longitude,
       );
-
-      return dist;
+      return total;
     }
 
-    double dist = Geolocator.distanceBetween(
+    double total = Geolocator.distanceBetween(
       from.latitude,
       from.longitude,
-      polyline[fromIndex].latitude,
-      polyline[fromIndex].longitude,
+      polyline[fromIdx].latitude,
+      polyline[fromIdx].longitude,
     );
-
-    for (int i = fromIndex; i > toIndex + 1; i--) {
-      dist += Geolocator.distanceBetween(
+    for (int i = fromIdx; i > toIdx + 1; i--) {
+      total += Geolocator.distanceBetween(
         polyline[i].latitude,
         polyline[i].longitude,
         polyline[i - 1].latitude,
         polyline[i - 1].longitude,
       );
     }
-
-    dist += Geolocator.distanceBetween(
-      polyline[toIndex + 1].latitude,
-      polyline[toIndex + 1].longitude,
+    total += Geolocator.distanceBetween(
+      polyline[toIdx + 1].latitude,
+      polyline[toIdx + 1].longitude,
       to.latitude,
       to.longitude,
     );
-
-    return -dist;
+    return -total;
   }
 
-  LatLng _moveAlongRouteSigned(
-    LatLng start,
-    double signedDistance,
-    List<LatLng> polyline,
-    int startIndex,
-  ) {
-    if (polyline.length < 2) return start;
-
-    final int maxSeg = polyline.length - 2;
-    final int idx = startIndex.clamp(0, maxSeg);
-
-    final LatLng proj = _projectOnSegment(
-      start,
-      polyline[idx],
-      polyline[idx + 1],
-    );
-
-    if (signedDistance >= 0.0) {
-      return _advanceForwardAlongRoute(proj, signedDistance, polyline, idx);
-    }
-
-    return _retreatAlongRoute(proj, -signedDistance, polyline, idx);
-  }
-
-  LatLng _advanceForwardAlongRoute(
+  LatLng _advanceAlongRoute(
     LatLng startPos,
     double distanceMeters,
     List<LatLng> polyline,
     int startIndex,
   ) {
-    if (distanceMeters <= 0.0 || polyline.length < 2) return startPos;
-
+    if (distanceMeters.abs() < 0.001 || polyline.length < 2) return startPos;
     final int maxSeg = polyline.length - 2;
     final int idx = startIndex.clamp(0, maxSeg);
 
-    LatLng proj = _projectOnSegment(
+    LatLng currentPos = _projectOnSegment(
       startPos,
       polyline[idx],
       polyline[idx + 1],
     );
-    // 🔧 ANTI-TÉLÉPORT : projection clampée au coin du virage = saut de >8 m.
-    // Dans ce cas on avance depuis la position brute, sans re-projeter.
-    final double projJump = Geolocator.distanceBetween(
-        startPos.latitude, startPos.longitude, proj.latitude, proj.longitude);
-    if (projJump > 8.0) {
-      proj = startPos;
-    }
 
-    double remainingDistance = distanceMeters;
-    LatLng currentPos = proj;
+    double remaining = distanceMeters;
 
-    for (int i = idx; i < polyline.length - 1; i++) {
-      final LatLng next = polyline[i + 1];
-
-      final double dSeg = Geolocator.distanceBetween(
-        currentPos.latitude,
-        currentPos.longitude,
-        next.latitude,
-        next.longitude,
-      );
-
-      if (dSeg < 0.001) continue;
-
-      if (remainingDistance <= dSeg) {
-        final double t = remainingDistance / dSeg;
-        return _lerpPosition(currentPos, next, t);
+    if (remaining > 0) {
+      for (int i = idx; i < polyline.length - 1; i++) {
+        final LatLng next = polyline[i + 1];
+        final double dSeg = Geolocator.distanceBetween(
+          currentPos.latitude,
+          currentPos.longitude,
+          next.latitude,
+          next.longitude,
+        );
+        if (dSeg <= 0.001) continue;
+        if (remaining <= dSeg) {
+          final double t = remaining / dSeg;
+          return LatLng(
+            currentPos.latitude + (next.latitude - currentPos.latitude) * t,
+            currentPos.longitude + (next.longitude - currentPos.longitude) * t,
+          );
+        }
+        remaining -= dSeg;
+        currentPos = next;
       }
-
-      remainingDistance -= dSeg;
-      currentPos = next;
-    }
-
-    return currentPos;
-  }
-
-  LatLng _retreatAlongRoute(
-    LatLng startPos,
-    double distanceMeters,
-    List<LatLng> polyline,
-    int startIndex,
-  ) {
-    if (distanceMeters <= 0.0 || polyline.length < 2) return startPos;
-
-    final int maxSeg = polyline.length - 2;
-    final int idx = startIndex.clamp(0, maxSeg);
-
-    LatLng proj = _projectOnSegment(
-      startPos,
-      polyline[idx],
-      polyline[idx + 1],
-    );
-    // 🔧 ANTI-TÉLÉPORT : projection clampée au coin du virage = saut de >8 m.
-    // Dans ce cas on avance depuis la position brute, sans re-projeter.
-    final double projJump = Geolocator.distanceBetween(
-        startPos.latitude, startPos.longitude, proj.latitude, proj.longitude);
-    if (projJump > 8.0) {
-      proj = startPos;
-    }
-
-    double remainingDistance = distanceMeters;
-    LatLng currentPos = proj;
-
-    for (int i = idx; i >= 0; i--) {
-      final LatLng previous = polyline[i];
-
-      final double dSeg = Geolocator.distanceBetween(
-        currentPos.latitude,
-        currentPos.longitude,
-        previous.latitude,
-        previous.longitude,
-      );
-
-      if (dSeg < 0.001) continue;
-
-      if (remainingDistance <= dSeg) {
-        final double t = remainingDistance / dSeg;
-        return _lerpPosition(currentPos, previous, t);
+      return polyline.last;
+    } else {
+      double backwardDist = -remaining;
+      for (int i = idx; i >= 0; i--) {
+        final LatLng prev = polyline[i];
+        final double dSeg = Geolocator.distanceBetween(
+          currentPos.latitude,
+          currentPos.longitude,
+          prev.latitude,
+          prev.longitude,
+        );
+        if (dSeg <= 0.001) continue;
+        if (backwardDist <= dSeg) {
+          final double t = backwardDist / dSeg;
+          return LatLng(
+            currentPos.latitude + (prev.latitude - currentPos.latitude) * t,
+            currentPos.longitude + (prev.longitude - currentPos.longitude) * t,
+          );
+        }
+        backwardDist -= dSeg;
+        currentPos = prev;
       }
-
-      remainingDistance -= dSeg;
-      currentPos = previous;
+      return polyline.first;
     }
-
-    return currentPos;
   }
 
   LatLng _projectOnSegment(LatLng p, LatLng a, LatLng b) {
@@ -26105,19 +26345,16 @@ class KinematicFilter {
 
     final double ax = a.longitude * cosLat;
     final double ay = a.latitude;
-
     final double bx = b.longitude * cosLat;
     final double by = b.latitude;
-
     final double px = p.longitude * cosLat;
     final double py = p.latitude;
 
     final double l2 = ((bx - ax) * (bx - ax)) + ((by - ay) * (by - ay));
-
     if (l2 == 0.0) return a;
 
     double t = (((px - ax) * (bx - ax)) + ((py - ay) * (by - ay))) / l2;
-    t = t.clamp(0.0, 1.0).toDouble();
+    t = t.clamp(0.0, 1.0);
 
     return LatLng(
       a.latitude + t * (b.latitude - a.latitude),
@@ -26125,70 +26362,36 @@ class KinematicFilter {
     );
   }
 
-  LatLng _lerpPosition(LatLng a, LatLng b, double t) {
-    return LatLng(
-      a.latitude + (b.latitude - a.latitude) * t,
-      a.longitude + (b.longitude - a.longitude) * t,
-    );
-  }
-
   void reset() {
     accelDetector.stop();
-    _accelBrakeActive = false;
-    _accelBrakeIntensity = 0.0;
-    _accelBoostIntensity = 0.0;
-    _gpsBrakeIntensity = 0.0;
     simulatedPos = null;
     lastRealPos = null;
-
     _currentRawGps = null;
     _previousRawGps = null;
     _previousPreviousRawGps = null;
-
     _targetPos = null;
     _snappedGpsPos = null;
-
-    _lastIsStopped = false;
-
     _lastPredictTime = null;
     _lastGpsUpdateTime = null;
-
-    _isNewGpsPoint = false;
-    _isWalking = false;
-    isBackwardRecovery = false;
-
-    // ═══ AJOUT : reset du filtre qualité GPS ═══
-    _lastRawAccuracy = 999.0;
-    _lastConfirmedSnappedPos = null;
-    _lastConfirmedRouteIndex = -1;
-    _lastGoodGpsFixTime = null;
-    _consecutiveRejectedFixes = 0;
-
     _vehicleSpeedMps = 0.0;
-    _previousVehicleSpeedMps = 0.0;
     _arrowSpeedMps = 0.0;
-    _brakingIntensity = 0.0;
-    _lastGpsIntervalSeconds = 1.0;
-    _stoppedForSeconds = 0.0;
     _lastRawSpeedMps = 0.0;
-
+    _stoppedForSeconds = 0.0;
+    _lastGpsIntervalSeconds = 1.0;
     _lastSimRouteIndex = 0;
-    _snappedGpsIndex = 0;
     lastRouteIndex = -1;
     displaySnapIndex = -1;
-
-    _smoothedProcessingLatencySeconds = 0.0;
-    _smoothedFixAgeSeconds = 0.0;
-    _renderLatencySeconds = 0.016;
-    _measuredIntervalSeconds = 1.0;
-    _targetRouteIndex = -1;
-    _targetUpdatedAt = null;
-
-    // NOUVEAU : reset du mouvement flèche → bleu
-    _arrowAnchorPos = null;
-    _arrowAnchorIndex = -1;
-    _blueTravelDistance = 0.0;
-    _blueTravelTime = 1.0;
-    _arrowTargetSpeed = 0.0;
+    _fixAgeS = 0.08;
+    _procS = 0.015;
+    _renderS = 0.035;
   }
+}
+
+/// Réinitialise l'état des contrôleurs GetX lors de la déconnexion
+void resetAppControllers() {
+  try {
+    if (Get.isRegistered<HomeController>()) {
+      Get.find<HomeController>().clearDestination();
+    }
+  } catch (_) {}
 }

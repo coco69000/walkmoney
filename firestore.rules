@@ -20,10 +20,23 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // ── PROFIL UTILISATEUR ──────────────────────────────────────────────────
+    // ── PROFILS PUBLICS (Pour le classement - données anonymisées et minimales) ──
+    match /public_profiles/{userId} {
+      allow read: if isAuthenticated();
+      allow create: if isOwner(userId);
+      allow update: if isOwner(userId) && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+        'is_vip',
+        'lame_points',
+        'total_lame_earned',
+        'role'
+      ]);
+      allow delete: if isOwner(userId) || isAdmin();
+    }
+
+    // ── PROFIL UTILISATEUR (Données privées: email, domicile, travail, Lames) ──
     match /users/{userId} {
-      // Lecture : Publique (permet l'affichage du classement et des profils publics sans blocage d'authentification)
-      allow read: if true;
+      // Lecture : STRICTEMENT restreinte au propriétaire (protection RGPD du domicile et de l'e-mail)
+      allow read: if isOwner(userId) || isAdmin();
       
       // Création : Seulement par le propriétaire à l'inscription (avec validation anti-usurpation)
       allow create: if isOwner(userId)
@@ -32,34 +45,25 @@ service cloud.firestore {
         && (!('is_vip' in request.resource.data) || request.resource.data.is_vip == false)
         && (!('role' in request.resource.data) || request.resource.data.role == 'user');
 
-      // Mise à jour :
-      // 1. Le propriétaire peut modifier son profil SAUF les champs d'autorité serveur
-      // 2. OU un autre utilisateur authentifié peut UNIQUEMENT envoyer/accepter des demandes d'amis
-      allow update: if (
-        isOwner(userId) && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
-          'lame_points',
-          'total_lame_earned',
-          'is_vip',
-          'role',
-          'current_level',
-          'next_level_boost',
-          'unlocked_badges',
-          'consecutive_logins',
-          'ad_points',
-          'store_boosts',
-          'stripe_customer_id',
-          'stripe_subscription_id',
-          'stripe_subscription_item_id'
-        ])
-      ) || (
-        isAuthenticated() && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-          'friend_requests_received',
-          'friend_requests_sent',
-          'friend_ids'
-        ])
-      );
+      // Mise à jour : STRICTEMENT par le propriétaire (les relations d'amis sont gérées par Cloud Functions sécurisées)
+      allow update: if isOwner(userId) && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+        'lame_points',
+        'total_lame_earned',
+        'is_vip',
+        'role',
+        'current_level',
+        'next_level_boost',
+        'unlocked_badges',
+        'consecutive_logins',
+        'ad_points',
+        'store_boosts',
+        'stripe_customer_id',
+        'stripe_subscription_id',
+        'stripe_subscription_item_id'
+      ]);
 
-      allow delete: if isAdmin();
+      // Suppression du compte (RGPD Art. 17) par le propriétaire ou l'admin
+      allow delete: if isOwner(userId) || isAdmin();
 
       // ── SOUS-COLLECTIONS UTILISATEUR ──────────────────────────────────────
 
@@ -91,6 +95,8 @@ service cloud.firestore {
       allow read: if isOwner(userId) || isAdmin();
       // Permet au client de rafraîchir les timestamps de défis locaux, mais interdit de modifier les totaux/points
       allow create, update: if isOwner(userId) && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+        'ad_points',
+        'store_boosts',
         'total_lame_earned',
         'total_trips',
         'total_distance_meters',
@@ -114,7 +120,12 @@ service cloud.firestore {
         docId.matches('^' + request.auth.uid + '_.*') ||
         isAdmin()
       );
-      allow create, update: if isAuthenticated() && request.resource.data.user_id == request.auth.uid;
+      // Le client peut initier ou progresser, mais seul le serveur (validateTrip) peut valider la récompense
+      allow create, update: if isAuthenticated() 
+        && request.resource.data.user_id == request.auth.uid
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['reward_already_credited'])
+            || request.resource.data.reward_already_credited == false)
+        && (!('status' in request.resource.data) || request.resource.data.status != 'rewardClaimed' || (resource != null && resource.data.status == 'rewardClaimed'));
       allow delete: if isAdmin();
     }
 
@@ -191,6 +202,18 @@ service cloud.firestore {
 
     match /admin_logs/{logId} {
       allow read, write: if isAdmin();
+    }
+
+    // ── GESTION DE L'UNICITÉ DES PSEUDOS (Item 67) ───────────────────────────
+    match /usernames/{username} {
+      allow read: if true;
+      allow create: if isAuthenticated() && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // ── EMAILS TRANSACTIONNELS (Item 59 : Accès serveur exclusif) ────────────
+    match /mail/{mailId} {
+      allow read, write: if false;
     }
   }
 }

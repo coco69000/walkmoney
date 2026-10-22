@@ -31,17 +31,14 @@
 		<string>EcoNav a besoin du suivi continu de votre position en arrière-plan pour valider vos déplacements et vos défis.</string>
 		<key>NSLocationAlwaysUsageDescription</key>
 		<string>EcoNav a besoin de votre position même fermée pour suivre vos trajets.</string>
-
 		<!-- 2. CAPTEURS DE MOUVEMENT / FITNESS (Accéléromètre & Anti-triche) -->
 		<key>NSMotionUsageDescription</key>
 		<string>EcoNav utilise les capteurs de mouvement pour détecter précisément vos accélérations et freinages.</string>
-
 		<!-- 3. APPAREIL PHOTO & GALERIE (Scan de tickets de caisse & OCR) -->
 		<key>NSCameraUsageDescription</key>
 		<string>EcoNav a besoin de la caméra pour scanner vos tickets de caisse et valider votre cashback.</string>
 		<key>NSPhotoLibraryUsageDescription</key>
 		<string>EcoNav a besoin d'accéder à vos photos pour soumettre des preuves d'achats.</string>
-
 		<!-- 4. MODES ARRIÈRE-PLAN ACTIVÉS -->
 		<key>UIBackgroundModes</key>
 		<array>
@@ -49,7 +46,6 @@
 			<string>fetch</string>
 			<string>processing</string>
 		</array>
-
 		<!-- 5. LIENS EXTERNES (url_launcher / Stripe) -->
 		<key>LSApplicationQueriesSchemes</key>
 		<array>
@@ -83,5 +79,15 @@
 		<true/>
 		<key>UIStatusBarHidden</key>
 		<false/>
+		<!-- ID de test officiel AdMob iOS -->
+		<key>GADApplicationIdentifier</key>
+		<string>ca-app-pub-3940256099942544~1458602516</string>
+		<key>SKAdNetworkItems</key>
+		<array>
+			<dict>
+				<key>SKAdNetworkIdentifier</key>
+				<string>cstr6suwn9.skadnetwork</string>
+			</dict>
+		</array>
 	</dict>
 </plist>

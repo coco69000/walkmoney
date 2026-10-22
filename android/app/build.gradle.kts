@@ -1,3 +1,6 @@
+import java.util.Properties
+import java.io.FileInputStream
+
 plugins {
     id("com.android.application")
     // START: FlutterFire Configuration
@@ -7,10 +10,12 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
-// Correction du conflit de classes entre Google Maps et Google Navigation
-configurations.all {
-    exclude(group = "com.google.android.gms", module = "play-services-maps")
+val keystorePropertiesFile = rootProject.file("key.properties")
+val keystoreProperties = Properties()
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(FileInputStream(keystorePropertiesFile))
 }
+
 
 android {
     namespace = "com.parrel.walkmoney"
@@ -18,7 +23,7 @@ android {
     // Flutter secure storage et composants récents requièrent compileSdk 37
     compileSdk = 37
 
-    ndkVersion = "28.1.13356709"
+    ndkVersion = "28.2.13676358"
 
     compileOptions {
         // ACTIVATION INDISPENSABLE pour Google Navigation
@@ -42,14 +47,27 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+
+        multiDexEnabled = true
+    }
+
+    signingConfigs {
+        create("release") {
+            keyAlias = keystoreProperties["keyAlias"] as String?
+            keyPassword = keystoreProperties["keyPassword"] as String?
+            storeFile = keystoreProperties["storeFile"]?.let {
+                val f = file(it)
+                if (f.exists()) f else rootProject.file(it)
+            }
+            storePassword = keystoreProperties["storePassword"] as String?
+        }
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = false
-            isShrinkResources = false
-
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("release")
+            isMinifyEnabled = true
+            isShrinkResources = true
 
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -65,6 +83,6 @@ flutter {
 
 dependencies {
     // Cette dépendance permet d'utiliser Java 8+ sur les versions d'Android plus anciennes
-    // Requis par com.google.android.libraries.navigation:navigation:7.3.0
-    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs_nio:2.1.4")
+    implementation("com.google.android.material:material:1.11.0")
 }
